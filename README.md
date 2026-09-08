@@ -61,7 +61,7 @@ container and volume is named `mssql-ducklake-*` and the port is 7433, so it liv
 SQL Servers on the same machine:
 
 ```bash
-cp .env.example .env        # once; the port, the sa password and the database name live here
+cp -n .env.example .env     # once; the port, the sa password and the database name live here
 make docker-up              # start, wait for healthy, create the catalog database
 make test-integration       # the server-backed suite; `make test` skips it (require-env)
 make docker-down            # stop, keeping the data volume

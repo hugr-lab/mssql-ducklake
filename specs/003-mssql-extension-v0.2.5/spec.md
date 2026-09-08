@@ -78,8 +78,9 @@ The reference is duckdb-postgres, which has the same constraint (one connection 
 one active COPY per connection). Its optimizer extension counts postgres scans per catalog in the
 plan; when there is more than one and separate connections cannot be used, every such scan gets
 `requires_materialization`, and `InitGlobal` drains the whole result into a `ColumnDataCollection`
-before returning, with `MaxThreads() = 1` (`postgres_optimizer.cpp:80-96`,
-`postgres_scanner.cpp:298-306, 373-396`). mssql-extension's spec 066 (branch
+before returning, with `MaxThreads() = 1` (duckdb-postgres at `fffcb35`, 2026-09-02, the copy
+duckdb-acl's build vendors: `src/storage/postgres_optimizer.cpp:78-96`,
+`src/postgres_scanner.cpp:298-306, 373-396`). mssql-extension's spec 066 (branch
 `spec/065-dml-pushdown-recon`, `specs/066-own-scan-materialization/spec.md`) already adopts this
 mechanism — D1: `requires_materialization` on the bind data, drain in `TableScanInitGlobal`,
 `MaxThreads = 1`, a plan-walk helper — for the *sink* cases (INSERT/CTAS/UPDATE/DELETE reading

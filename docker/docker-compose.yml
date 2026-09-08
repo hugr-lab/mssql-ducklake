@@ -28,7 +28,8 @@ services:
       # the catalog server shares a machine with a duckdb build (CI) or an IDE; cap its buffer pool
       - MSSQL_MEMORY_LIMIT_MB=2048
     ports:
-      - "${MSSQL_DUCKLAKE_PORT:-7433}:1433"
+      # loopback only: a test server with a committed sa password has no business on the LAN
+      - "127.0.0.1:${MSSQL_DUCKLAKE_PORT:-7433}:1433"
     volumes:
       - sqlserver-data:/var/opt/mssql
     healthcheck:
