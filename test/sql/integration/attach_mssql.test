@@ -1,5 +1,5 @@
 # name: test/sql/integration/attach_mssql.test
-# description: A DuckLake catalog in SQL Server: initialize, load, re-attach (specs/002, step 1)
+# description: A DuckLake catalog in SQL Server: initialize, load, re-attach (specs/002)
 # group: [mssql_ducklake_integration]
 
 # The server-backed suite: `make docker-up` + `make test-integration` provide the connection string
@@ -17,7 +17,14 @@ statement ok
 ATTACH '${MSSQL_DUCKLAKE_TEST_DSN}' AS srv (TYPE mssql);
 
 # a fresh catalog per run: the lake below must be a NEW DuckLake (its data path is this run's test
-# directory, and an existing catalog pins the path it was created with)
+# directory, and an existing catalog pins the path it was created with). The reset drops every
+# ducklake% table in the DSN's database - only in a database the init script marked as the test
+# environment (docker/init/sqlserver.sql), never in one the DSN reached by mistake
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT 1 AS marker FROM sys.tables WHERE name = ''mssql_ducklake_test_env''');
+----
+1
+
 statement ok
 SELECT mssql_exec('srv', '
 DECLARE @sql NVARCHAR(MAX) = N'''';

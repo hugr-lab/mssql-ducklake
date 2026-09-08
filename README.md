@@ -25,9 +25,9 @@ exactly as stock, plus SQL Server as a metadata catalog.
 > extension for that prefix.
 
 **Status: experimental.** The embedded-ducklake scaffold, gates and CI are in place, and an ATTACH
-already initializes (and re-opens) a DuckLake catalog in SQL Server; DDL and DML on the lake wait
-for the SQL Server metadata manager, which is being implemented — see [`specs/`](specs/README.md)
-for the design. If this
+already initializes (and re-opens) a DuckLake catalog in SQL Server. DDL and DML on the lake are
+blocked on two fixes in the mssql extension ([spec 003](specs/003-mssql-extension-v0.2.5/spec.md),
+v0.2.5) and then on the SQL Server metadata manager — see [`specs/`](specs/README.md). If this
 extension finds users, the manager is intended to be contributed upstream to DuckLake (the postgres
 metadata manager is the in-tree precedent), after which this extension becomes unnecessary.
 
@@ -56,17 +56,21 @@ scripts/ci/smoke_load.sh
 ### Integration tests (SQL Server in docker)
 
 `test/sql/integration/` runs against a real SQL Server holding the DuckLake catalog. The
-environment is `docker/docker-compose.yml`; every container and volume is named `mssql-ducklake-*`
-and the port is 7433, so it lives beside other SQL Servers on the same machine:
+environment is `docker/docker-compose.yml` (image pinned like the rest of the stack); every
+container and volume is named `mssql-ducklake-*` and the port is 7433, so it lives beside other
+SQL Servers on the same machine:
 
 ```bash
-cp .env.example .env        # once; the port and the sa password live here
-make docker-up              # start, wait for healthy, create the lake_meta database
+cp .env.example .env        # once; the port, the sa password and the database name live here
+make docker-up              # start, wait for healthy, create the catalog database
 make test-integration       # the server-backed suite; `make test` skips it (require-env)
-make docker-down            # stop (add `-v` by hand to drop the data volume)
+make docker-down            # stop, keeping the data volume
+docker compose -f docker/docker-compose.yml down -v     # ...and drop it
 ```
 
-CI runs the same suite on its Linux job with a SQL Server service container.
+The tests reset that database (every `ducklake%` table) on each run; the init plants a marker table
+in it, and a run refuses to reset a database without the marker. CI's Linux job uses the same
+compose file and targets.
 
 ### Connection strings
 

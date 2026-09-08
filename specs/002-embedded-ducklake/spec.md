@@ -9,7 +9,7 @@
 
 `mssql_ducklake` **compiles ducklake in** — the whole untouched pinned source — and adds a
 `MSSQLMetadataManager` beside the built-in postgres/sqlite ones, so
-`ATTACH 'ducklake:mssql://…'` keeps the DuckLake catalog in SQL Server through the `mssql`
+`ATTACH 'ducklake:mssql:…'` keeps the DuckLake catalog in SQL Server through the `mssql`
 extension. One image means the manager registry is ours by construction; the price is **mutual
 exclusion with stock ducklake**. Shipped as an experimental extension on released DuckDB (v1.5.5)
 through the community repository; an upstream PR of the manager into ducklake is a separate track,
