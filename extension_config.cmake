@@ -2,8 +2,8 @@
 
 # The bridge itself. DONT_LINK on purpose: statically linked extensions load at database startup,
 # and the bridge's Load fails by contract when ducklake/mssql are absent (specs/001) - every test
-# database would die at open. As a loadable it is loaded exactly like production loads it:
-# `require mssql_ducklake` in a test, `LOAD mssql_ducklake` by a user.
+# database would die at open. As a loadable it is loaded exactly like production loads it: an
+# explicit LOAD, after both sides.
 duckdb_extension_load(mssql_ducklake
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
     DONT_LINK
@@ -19,8 +19,9 @@ duckdb_extension_load(ducklake
 )
 
 # mssql stays a loadable (DONT_LINK): production pairs the bridge with the distributed artifact, so
-# the tests do too - `require mssql` picks it up from the build directory. The pin is the release
-# tag built against duckdb v1.5.5; its openssl/simdutf arrive through the merged vcpkg manifest.
+# the tests do too - loaded by build path (`LOAD '__BUILD_DIRECTORY__/extension/mssql/...'`). The
+# pin is the release tag built against duckdb v1.5.5; its openssl/simdutf arrive through the merged
+# vcpkg manifest.
 duckdb_extension_load(mssql
     DONT_LINK
     GIT_URL https://github.com/hugr-lab/mssql-extension

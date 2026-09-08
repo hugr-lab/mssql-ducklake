@@ -93,8 +93,11 @@ refuses, DuckLake behavior is exactly what it was without the bridge.
 
 ## Testing
 
-- `test/sql/mssql_ducklake.test`: `require ducklake` + `require mssql` + `require mssql_ducklake`
-  (production load order), then the version function answers.
+- `test/sql/mssql_ducklake.test`: production load order — `require ducklake` (static), then mssql
+  and the bridge by build path (`LOAD '__BUILD_DIRECTORY__/…'`, the runner's pattern for DONT_LINK
+  loadables) — and the version function answers.
+- `test/sql/deps_gate.test`: the refusal itself, with autoload pinned off — no sides → the error
+  names ducklake; ducklake only → it names mssql; both → the same LOAD succeeds.
 - `scripts/ci/smoke_load.sh`: the built loadable, copied out of tree, (a) loads beside mssql and
   answers, (b) *refuses with the gate's own message* when mssql is absent — a missing-symbol failure
   or crash would surface here instead.

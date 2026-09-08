@@ -94,7 +94,7 @@ jobs:
       - name: Unit suites
         run: |
           build/release/test/unittest 'test/sql/*' 2>&1 | tee suite.log
-          scripts/ci/assert_ran.sh suite.log 1 1
+          scripts/ci/assert_ran.sh suite.log 2 6
 
       - name: Upload extension artifact
         if: github.event_name != 'pull_request'
@@ -156,7 +156,7 @@ jobs:
       - name: Unit suites
         run: |
           build/release/test/unittest 'test/sql/*' 2>&1 | tee suite.log
-          scripts/ci/assert_ran.sh suite.log 1 1
+          scripts/ci/assert_ran.sh suite.log 2 6
 
       - name: Upload extension artifact
         uses: actions/upload-artifact@v7

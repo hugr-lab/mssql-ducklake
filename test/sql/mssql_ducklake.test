@@ -2,14 +2,17 @@
 # description: The bridge loads when both sides are present (specs/001)
 # group: [mssql_ducklake]
 
-# Load order is the production order: the bridge's Load requires both sides already loaded (or
-# autoloadable). ducklake is statically linked into the test shell; mssql is the loadable built
-# beside it from the pinned release.
+# Load order is the production order: the bridge's Load requires both sides already loaded.
+# ducklake is statically linked into the test shell; mssql is a DONT_LINK loadable, which the
+# default test runner does not resolve by name - load it by its build path, duckdb's own pattern
+# for loadable-extension tests.
 require ducklake
 
-require mssql
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';
 
-require mssql_ducklake
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
 
 query I
 SELECT mssql_ducklake_version() IS NOT NULL;

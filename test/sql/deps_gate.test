@@ -1,0 +1,29 @@
+# name: test/sql/deps_gate.test
+# description: The bridge refuses to load without its two sides (specs/001)
+# group: [mssql_ducklake]
+
+# autoload could quietly satisfy the gate when a local extension repo is configured (e.g. a
+# LOCAL_EXTENSION_REPO run); pin it off so this file tests the refusal itself
+statement ok
+SET autoload_known_extensions = false;
+
+# nothing loaded at all: the gate names ducklake first
+statement error
+LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
+----
+<REGEX>:.*mssql_ducklake is a bridge.*'ducklake' is not.*
+
+# with ducklake up, the gate moves on to mssql
+require ducklake
+
+statement error
+LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
+----
+<REGEX>:.*mssql_ducklake is a bridge.*'mssql' is not.*
+
+# both sides up: the same LOAD now succeeds
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';

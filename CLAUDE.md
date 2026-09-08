@@ -49,8 +49,11 @@ build/release/test/unittest 'test/sql/*'     # sqllogictest suite
 scripts/ci/smoke_load.sh                     # the loadable, out of tree: loads beside mssql, refuses without it
 ```
 
-Tests follow duckdb's sqllogictest format. Load order in tests is the production order:
-`require ducklake`, `require mssql`, then `require mssql_ducklake`.
+Tests follow duckdb's sqllogictest format. `require <ext>` resolves only statically linked
+extensions (ducklake) and duckdb's AUTOLOADABLE list - a DONT_LINK loadable (mssql, the bridge) is
+loaded by its build path instead, duckdb's own pattern:
+`LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';`. Load order in tests is the
+production order: ducklake, mssql, then the bridge.
 
 ## Format
 
