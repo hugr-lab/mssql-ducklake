@@ -12,6 +12,12 @@ LOAD mssql_ducklake;
 ATTACH 'ducklake:mssql:Server=host,1433;Database=lake_meta;User Id=…;Password=…' AS lake (DATA_PATH 's3://…');
 ```
 
+**mssql v0.2.5 or newer is required** — older versions answer DuckDB's `main` when DuckLake asks the
+catalog for its default schema, and the ATTACH above fails with `Schema 'main' not found in MSSQL
+database`. Until [community-extensions#2676](https://github.com/duckdb/community-extensions/pull/2676)
+lands, `INSTALL mssql FROM community` still gives v0.2.4; with that version, add
+`METADATA_SCHEMA 'dbo'` to the ATTACH.
+
 The extension carries the complete, unmodified DuckLake source at a pinned release and registers a
 `MSSQLMetadataManager` beside the built-in postgres/sqlite ones — so everything DuckLake does
 (snapshots, time travel, inlining, maintenance functions, `ducklake:postgres:` catalogs too) works
@@ -25,9 +31,12 @@ exactly as stock, plus SQL Server as a metadata catalog.
 
 **Status: experimental.** The embedded-ducklake scaffold, gates and CI are in place. With mssql
 v0.2.5 ([spec 003](specs/003-mssql-extension-v0.2.5/spec.md)) an ATTACH initializes and re-opens a
-DuckLake catalog in SQL Server, and DDL plus inlined inserts already work through DuckLake's generic
-manager; commits that write data files, UPDATE and DELETE wait for the SQL Server metadata manager
-(its server-side commit batch), which is being implemented — see [`specs/`](specs/README.md). If this
+DuckLake catalog in SQL Server, and through DuckLake's own generic manager a table's **first** write
+commits — `CREATE TABLE`, then one insert, inlined or file-backed. Every later write to that table
+fails: the commit batch updates the table's statistics row, that UPDATE takes DuckDB's DML path, and
+the mssql extension requires a primary key for it. Removing that path is the first job of the SQL
+Server metadata manager (its `Execute` passthrough sends the batch as raw T-SQL), which is being
+implemented — see [`specs/`](specs/README.md). If this
 extension finds users, the manager is intended to be contributed upstream to DuckLake (the postgres
 metadata manager is the in-tree precedent), after which this extension becomes unnecessary.
 
@@ -82,7 +91,9 @@ type spelled out, because DuckDB deliberately does not treat `mssql://` as a pre
 ATTACH 'ducklake:mssql://user:pass@host:1433/lake_meta' AS lake (DATA_PATH 's3://…', META_TYPE 'mssql');
 ```
 
-The catalog tables live in the connection's default schema (`dbo`); `METADATA_SCHEMA` picks another.
+The catalog tables land in `dbo`, which is what mssql v0.2.5 answers as the catalog's default schema
+— a constant, not the login's own default. A login whose default schema is something else, or which
+may only write elsewhere, still needs `METADATA_SCHEMA` naming that schema.
 
 ## License
 

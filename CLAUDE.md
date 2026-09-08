@@ -83,9 +83,11 @@ extensions (parquet here) and duckdb's AUTOLOADABLE list — a `DONT_LINK` loada
 it and the test silently SKIPS. Load those by build path:
 `LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';`. In a gate test,
 `SET autoload_known_extensions = false;` first. The static test shell loads static extensions
-lazily — `require parquet` before a lake writes data files. `require-env MSSQL_DUCKLAKE_TEST_DSN`
-gates the server-backed files: the Linux CI job provides it (service container) and forbids the
-skip. CI's `scripts/ci/assert_ran.sh` floor keeps a silently-skipped suite from passing. A `.test`
+lazily — `require parquet` before ANY insert into a lake, inlined or not: both insert planners bind
+parquet's copy function at plan time, before inlining is decided. `require-env
+MSSQL_DUCKLAKE_TEST_DSN` gates the server-backed files: the Linux CI job provides it (it starts the
+same `docker/docker-compose.yml` server and runs `make docker-up` + `make test-integration`) and
+forbids the skip. CI's `scripts/ci/assert_ran.sh` floor keeps a silently-skipped suite from passing. A `.test`
 file's `# group:` must equal its directory name (`[sql]`, `[integration]`) — duckdb's `format.py`
 rewrites anything else and the distribution's format check fails on it.
 
@@ -130,13 +132,17 @@ rewrites anything else and the distribution's format check fails on it.
   serves postgres-cataloged and mssql-cataloged lakes in the same process.
 - **Attach syntax**: `ducklake:mssql:<ADO connection string>` — duckdb strips `mssql:` as an
   extension prefix, but deliberately not `mssql://`, so the URI form needs `META_TYPE 'mssql'`.
-  The catalog lands in `dbo` (mssql ≥ v0.2.5 answers its real default schema; spec 003).
-- **What the generic manager gets on a live server with mssql v0.2.5** (2026-09-08): ATTACH
-  initializes/re-opens the catalog, CREATE TABLE, inlined INSERT, SELECT, snapshots, time travel
-  all work (v0.2.5 materializes multi-scan plans on the transaction's pinned connection, spec 003).
-  A commit that writes a data file, UPDATE and DELETE fail: the commit batch carries an UPDATE of
-  `ducklake_table_stats`, runs through duckdb's DML path, and mssql's UPDATE/DELETE needs a PK —
-  exactly what the manager's Execute passthrough removes (research note §4; spec 004).
+  The catalog lands in `dbo` — the constant mssql ≥ v0.2.5 answers as the catalog's default schema
+  (not the login's own; a login defaulting elsewhere still passes `METADATA_SCHEMA`). Older mssql
+  answers duckdb's `main` and the attach fails; the pin is v0.2.5 for that reason (spec 003).
+- **Where the generic manager stops, with mssql v0.2.5** (verified 2026-09-08): ATTACH
+  initializes/re-opens the catalog, and a table's FIRST write commits — CREATE TABLE plus one
+  insert, inlined (2 rows) or file-backed (100 rows → parquet); a DELETE against a file-backed
+  table commits too (it writes a delete file, no stats row). Every LATER write to that table fails:
+  once stats exist the commit batch UPDATEs `ducklake_table_stats`, that UPDATE takes duckdb's DML
+  path, and mssql needs a PK for it. A DELETE of an inlined row fails the same way on
+  `ducklake_inlined_data_<t>_<v>`. Exactly what the manager's Execute passthrough removes (research
+  note §4; spec 004). Pinned by `statement error` in the integration test.
 - **`mssql_scan()` on the pinned connection**: v0.2.5 materializes only *catalog* scans; a plan
   mixing `mssql_scan()` with a catalog scan, or two `mssql_scan()`s, inside a transaction still
   fails (verified). The fix (mssql-extension #314) arrives with the duckdb 2.0 line; not a

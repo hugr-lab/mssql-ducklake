@@ -95,9 +95,10 @@ mutually exclusive with the stock extension.
   same compose on CI's Linux job; gated on `MSSQL_DUCKLAKE_TEST_DSN`, which `make test-integration`
   exports and CI forbids skipping) — initialize a new catalog in `dbo`, CREATE TABLE, an inlined
   insert, read back through the lake and through `mssql_scan`, re-attach the existing catalog,
-  time travel, the data-path pin.
-- TODO (with the manager, spec 004): data-file commits, UPDATE/DELETE, the inlining type matrix
-  against SQL Server; bench vs the postgres backend.
+  time travel, the data-path pin, and — as a `statement error` — the boundary the generic manager
+  stops at, a table's second write.
+- TODO (with the manager, spec 004): the second write to a table (which is where UPDATE, DELETE and
+  further inserts all land), the inlining type matrix against SQL Server; bench vs postgres.
 
 ## Alternatives considered
 
@@ -125,9 +126,11 @@ mutually exclusive with the stock extension.
      (`LEFT_DELIM_JOIN` over `ducklake_view`/`ducklake_tag`) keep two mssql scans open on the one
      connection pinned to the transaction — the mssql scan runs its batch at source
      initialization, and the second source finds it streaming ("connection not in Idle state").
-     Plain joins pass, the same query passes in autocommit. So the manager routes its reads
-     through `mssql_scan` (one server-side statement, one result set each), not only the hot
-     ones; an mssql-extension change (lazy or draining scan start on a pinned connection) is the
-     complementary half — spec 003 makes it the primary one.
+     Plain joins pass, the same query passes in autocommit. Fixed in mssql v0.2.5 as spec 003's R2,
+     which is the primary half: the extension materializes such plans, and the manager does NOT
+     need to route its reads through `mssql_scan` to be correct. It may not, either — v0.2.5
+     materializes catalog scans only, so an `mssql_scan()` has to be the sole source of its query
+     (spec 003, "What v0.2.5 does not cover"). Routing the hot reads through it stays a
+     performance choice, one query at a time.
 - Community submission (experimental), with the honest embeds-ducklake description.
 - The upstream-PR track, opened when usage justifies it.
