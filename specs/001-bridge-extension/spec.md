@@ -1,6 +1,6 @@
 # Spec 001: the bridge extension — DuckLake metadata catalog on SQL Server
 
-- **Status**: accepted (scaffold implemented; manager registration pending)
+- **Status**: superseded by [002](../002-embedded-ducklake/spec.md) — the premise (a reachable registry in a loaded stock ducklake) is false; see 002 for the verified findings
 - **Date**: 2026-09-08
 - **Author**: VGSML
 

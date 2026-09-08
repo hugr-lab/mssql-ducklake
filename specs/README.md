@@ -36,4 +36,5 @@ specs are the shareable distillation of that work.
 
 | Spec | Title | Status |
 | --- | --- | --- |
-| [001](001-bridge-extension/spec.md) | the bridge extension — DuckLake metadata on SQL Server | accepted |
+| [001](001-bridge-extension/spec.md) | the bridge extension — DuckLake metadata on SQL Server | superseded by 002 |
+| [002](002-embedded-ducklake/spec.md) | the standalone extension — embedded ducklake + mssql manager | accepted |

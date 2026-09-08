@@ -23,13 +23,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # the project standard is duckdb's pinned formatter (scripts/format.py: clang_format==11.0.1);
-      # the runner's default clang-format is newer and reflows the code differently
+      # the runner's default clang-format is newer and reflows the code differently - and a bare
+      # `pip install` left the system binary first in PATH, so the pinned one is called by full path
       - name: Install duckdb's pinned clang-format
-        run: pip install clang_format==11.0.1
+        run: |
+          python3 -m venv /tmp/cf
+          /tmp/cf/bin/pip install clang_format==11.0.1
+          /tmp/cf/bin/clang-format --version
       - name: clang-format check
         run: |
           find src \( -name '*.cpp' -o -name '*.hpp' \) -print0 \
-            | xargs -0 clang-format --dry-run --Werror
+            | xargs -0 /tmp/cf/bin/clang-format --dry-run --Werror
       - name: yamllint
         run: |
           pip install yamllint

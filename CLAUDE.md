@@ -1,53 +1,57 @@
 # mssql-ducklake — Development Guidelines
 
-A **bridge extension** for DuckDB: it registers a `MSSQLMetadataManager` into DuckLake's
-metadata-manager registry, so `ATTACH 'ducklake:mssql://…'` keeps the DuckLake catalog in Microsoft
-SQL Server through the `mssql` extension. Neither side changes — `mssql` ships as today with no
-ducklake code or build coupling, `ducklake` stays untouched upstream source. Loading the bridge IS
-the registration; by contract it **fails fast** when `ducklake` or `mssql` is not loaded.
+**DuckLake on SQL Server, batteries included.** This extension **compiles ducklake in** — the whole
+untouched pinned source — and adds a `MSSQLMetadataManager` beside the built-in postgres/sqlite
+ones, so `ATTACH 'ducklake:mssql://…'` keeps the DuckLake catalog in SQL Server through the `mssql`
+extension. One image means the manager registry is ours by construction; the price is **mutual
+exclusion with stock ducklake** (same functions, same ATTACH prefix — one or the other, never
+both). `mssql` itself ships as today, untouched; nothing here links it (the manager only generates
+SQL, resolved at runtime through `mssql_exec`/`mssql_scan`).
 
-Read **[specs/001-bridge-extension/spec.md](specs/001-bridge-extension/spec.md)** for the core
-model. Deeper research/thinking lives in a local `design/` folder (gitignored) — start with
-`design/001-ducklake-mssql-metadata/RESEARCH.md` (the founding research: registry, linkage model,
-the full manager plan).
+Read **[specs/002-embedded-ducklake/spec.md](specs/002-embedded-ducklake/spec.md)** for the core
+model — including why the bridge design of spec 001 was physically impossible (compile-time hidden
+symbols; the verified findings are in there). Deeper research lives in the local, gitignored
+`design/` folder — start with `design/001-ducklake-mssql-metadata/RESEARCH.md` (registry, linkage
+model, the full manager plan §7: transpiler, keys + filtered indexes, server-side commit).
 
 ## Technology
 
 - **Language**: C++17 (DuckDB extension standard).
-- **DuckDB**: pinned to the **latest release line**, never `main` — the bridge pairs at runtime with
-  *distributed* artifacts of ducklake and mssql, and a loadable extension statically embeds duckdb
-  (exact-version match required). All pins ride one line and are bumped **together, in one commit**:
+- **Pins** — one release line, bumped together in one commit:
 
   | Piece | Where | Pin |
   | --- | --- | --- |
   | duckdb | submodule `duckdb/` | tag `v1.5.5` |
-  | ducklake | submodule `ducklake/` (build-only dep) | branch `v1.5-variegata` (SHA in the submodule) |
-  | mssql | `extension_config.cmake` (test loadable) | tag `v0.2.4` (built against duckdb v1.5.5) |
+  | ducklake | submodule `ducklake/` (EMBEDDED — compiled into the extension) | branch `v1.5-variegata` (SHA in the submodule) |
+  | mssql | `extension_config.cmake` (runtime pair, test loadable) | tag `v0.2.4` |
   | extension-ci-tools | submodule `extension-ci-tools/` | branch `v1.5.5` |
   | CI reusable workflows | `.github/workflows/distribution.yml` | `@v1.5.5`, `duckdb_version: v1.5.5` |
 
-  On a bump: re-verify the ducklake seams the manager overrides (the vtable is the ABI), and
-  re-audit the T-SQL transpiler's closed statement list against the new ducklake (research note §8).
-- **Dependencies**: none of our own; the build's vcpkg deps arrive through the **merged manifests**
-  of the loaded extensions (roaring from ducklake, openssl/simdutf from mssql).
-- **Platforms**: Linux, macOS, Windows; **no wasm** (the loadable path is dlopen/dlsym, mssql is raw
-  TDS sockets).
+  **Vendoring rule**: the ducklake submodule bumps on OUR schedule (manager work never waits for a
+  ducklake release), and ducklake fixes reach users only with our bump — so bumps stay cheap and
+  frequent. A bump = re-audit of the T-SQL transpiler's closed statement list (research note §8) +
+  the full test/smoke run.
+- **Dependencies**: `roaring` (ducklake's deletion vectors) in our `vcpkg.json`; mssql's
+  openssl/simdutf arrive through the merged vcpkg manifests.
+- **Platforms**: Linux, macOS, Windows; **no wasm** (mssql is raw TDS sockets).
 
 ## Project structure
 
 ```text
 src/
-  mssql_ducklake_extension.cpp   # entry: the deps gate; (spec 002+) version gate + registration
-  include/                       # mssql_ducklake_extension.hpp
-ducklake/                        # submodule, BUILD-ONLY dep: headers + base impls the manager overrides
-extension_config.cmake           # what the duckdb build loads: bridge (DONT_LINK), ducklake (static),
-                                 #   mssql (DONT_LINK loadable @ release tag)
+  mssql_ducklake_extension.cpp   # entry: exclusion gate (stock ducklake), mssql deps gate,
+                                 #   ducklake_duckdb_cpp_init chain, Register("mssql") via call_once
+  mssql_metadata_manager.cpp     # the SQL Server metadata manager (specs/003+ fill the phases)
+  include/                       # mssql_ducklake_extension.hpp, mssql_metadata_manager.hpp
+ducklake/                        # submodule, EMBEDDED: add_subdirectory(ducklake/src) supplies
+                                 #   ALL_OBJECT_FILES; never modified, never loaded separately
+extension_config.cmake           # loads: this extension (DONT_LINK) + mssql (DONT_LINK @ release tag)
 test/sql/
-  mssql_ducklake.test            # the happy path in production load order
-  deps_gate.test                 # the refusal itself: no sides / one side / both
-scripts/ci/                      # smoke_load.sh, assert_ran.sh, prune_vcpkg_cache.sh
+  mssql_ducklake.test            # embedded surface + a full local-file lake cycle (no server)
+  deps_gate.test                 # the mssql refusal, then success beside mssql
+scripts/ci/                      # smoke_load.sh (incl. the stock-ducklake exclusion), assert_ran.sh, ...
 specs/                           # one lightweight spec per feature, NNN-slug/spec.md (see specs/README.md)
-design/                          # LOCAL, gitignored: numbered research topics NNN-topic/ (our scratch)
+design/                          # LOCAL, gitignored: numbered research topics NNN-topic/
 ```
 
 ## Commands
@@ -55,103 +59,88 @@ design/                          # LOCAL, gitignored: numbered research topics N
 ```sh
 git submodule update --init --recursive
 make vcpkg-setup                    # once (or point VCPKG_TOOLCHAIN_PATH at a sibling repo's vcpkg)
-GEN=ninja make                      # release build: duckdb CLI + unittest + ducklake (static)
-                                    #   + mssql & the bridge (loadables)
-GEN=ninja make debug                # debug build
+GEN=ninja make                      # release: duckdb CLI + unittest + mssql & this extension (loadables)
+GEN=ninja make debug
 
 build/release/test/unittest 'test/sql/*'    # the sqllogictest suite (what CI runs)
-scripts/ci/smoke_load.sh                    # the loadable OUT of tree: loads beside mssql,
-                                            #   refuses without it with the gate's own message
+scripts/ci/smoke_load.sh                    # out-of-tree CLI: local-file lake round trip, both gates
 find src \( -name '*.cpp' -o -name '*.hpp' \) | xargs clang-format -i   # pin: clang_format==11.0.1 (pip)
 ```
 
 Build outputs: CLI `build/release/duckdb`, loadables
 `build/release/extension/{mssql_ducklake,mssql}/…​.duckdb_extension`, test binary
-`build/release/test/unittest`, and a local extension repository under `build/release/repository/`.
+`build/release/test/unittest`.
 
-**Test-runner loading rules** (they bit us once): sqllogictest's `require <ext>` resolves only
-statically linked extensions and duckdb's AUTOLOADABLE list — a `DONT_LINK` loadable is invisible to
-it and the test silently SKIPS. Load those by build path instead:
-`LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';` (the runner substitutes the
-token and allows unsigned). In a negative/gate test, `SET autoload_known_extensions = false;` first,
-so a configured local repo cannot quietly satisfy the dependency under test. CI's
-`scripts/ci/assert_ran.sh` floor exists precisely so a silently-skipped suite can never pass.
+**Test-runner loading rules** (they bit us once): `require <ext>` resolves only statically linked
+extensions (parquet here) and duckdb's AUTOLOADABLE list — a `DONT_LINK` loadable is invisible to
+it and the test silently SKIPS. Load those by build path:
+`LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';`. In a gate test,
+`SET autoload_known_extensions = false;` first. The static test shell loads static extensions
+lazily — `require parquet` before a lake writes data files. CI's `scripts/ci/assert_ran.sh` floor
+keeps a silently-skipped suite from passing.
 
 ## Code style
 
-- Follow DuckDB's conventions: tabs for indentation, ≤120 columns, `[u]int(8..64)_t` and `idx_t`,
+- DuckDB's conventions: tabs for indentation, ≤120 columns, `[u]int(8..64)_t` and `idx_t`,
   `unique_ptr`/`optional_ptr`/`reference`, never raw pointers or `const_cast`, braces always, short
-  comments. Run `clang-format` (the repo `.clang-format`, formatter pin 11.0.1) before committing.
+  comments. `clang-format` (formatter pin 11.0.1) before committing.
 - Names: files `snake_case`, types `PascalCase`, functions `PascalCase`, variables `snake_case`.
-- Prefer sqllogictest (`test/sql/*.test`) over C++ tests. Every feature lands with tests.
+- Prefer sqllogictest; every feature lands with tests. The embedded ducklake sources are NEVER
+  edited — anything ducklake-shaped we need goes through manager virtuals or waits for a bump.
 
 ## Key concepts
 
-- **The linkage model is the whole problem** (spec 001, verified empirically): a loadable extension
-  statically embeds duckdb — and would embed ducklake — into itself, with everything but its entry
-  point hidden. A manager compiled into another extension registers into a **dead copy** of the
-  registry; the real `Create()` runs in ducklake's image and reads ducklake's map. Stock ducklake
-  exports exactly one symbol, so its registry is unreachable by linking and `dlsym` alike.
-- **Load of the bridge = registration**, three steps: (1) deps gate — `ExtensionIsLoaded` /
-  `TryAutoLoadExtension` for ducklake and mssql, `MissingExtensionException` naming the fix;
-  (2) version gate — the loaded ducklake's `extension_version` must equal the build-against version
-  (the cross-image surface is a C++ vtable); (3) registration — direct
-  `DuckLakeMetadataManager::Register` in a static build, `dlopen(RTLD_NOLOAD)`+`dlsym` of the
-  *exported* `Register` in a loadable build. `call_once`; never from a static initializer.
-- **The manager only generates SQL** — like the postgres manager it never links its scanner; the
-  generated `mssql_exec('…', sql)` / `mssql_scan` calls resolve at runtime. That is why the bridge
-  needs no mssql code and mssql needs no bridge code.
-- **Execute-passthrough kills the PK problem**: every ducklake write (the commit batch, inlined-data
-  flush, expire/cleanup) flows through one `Execute` seam; passed through as raw T-SQL server-side,
+- **Why embedded** (spec 002): a loaded stock ducklake's manager registry is unreachable from any
+  other image — `CXX_VISIBILITY_PRESET hidden` is applied at compile time to every loadable, so
+  `Register` isn't even in the symbol table, and every channel (dlsym, dynamic_lookup, global
+  scope, GetProcAddress) is closed. The "dead copy" problem inverts when the copy is the ONLY one:
+  `Create()` runs in our image and reads our registry.
+- **Load order of the gates**: stock-ducklake exclusion → mssql deps check →
+  `ducklake_duckdb_cpp_init(loader)` (full ducklake surface, native names) →
+  `DuckLakeMetadataManager::Register("mssql", …)` under `std::call_once` (process-global map,
+  per-instance Load, duplicate Register throws).
+- **The autoload trap**: `ATTACH 'ducklake:…'` before our LOAD autoloads STOCK ducklake by prefix.
+  This extension is loaded explicitly first; after that the prefix is taken and no autoload fires.
+- **The manager only generates SQL** — like the postgres manager (the in-tree precedent) it never
+  links its scanner; `mssql_exec('…', sql)` resolves at runtime.
+- **Execute-passthrough kills the PK problem**: every ducklake write (commit batch, inlined flush,
+  expire/cleanup) flows through one `Execute` seam; passed through as raw T-SQL server-side,
   duckdb's DML path (rowid/PK) is never involved — mssql's PK-required UPDATE/DELETE limitation
-  vanishes for ducklake, without touching either repo.
-- **Inlining is in scope, not disabled**: DuckLake inlines small inserts into catalog tables by
-  default (limit 10); the manager owns the inlined-table DDL/types via the type hooks
-  (`TypeIsNativelySupported`/`GetColumnTypeInternal`/`CastColumnToTarget`/…). The type matrix and
-  edge cases (FLOAT NaN, TIMESTAMP_NS, HUGEINT, STRUCT) are in the research note §5.
-- **Performance target: ≥ postgres backend.** Phase 1 = parity (Execute passthrough of the batched
-  commit, `GetLatestSnapshotQuery` via `mssql_scan`, own `InitializeDuckLake` T-SQL with PKs +
-  filtered indexes, `MaxIdentifierLength=128`, `SupportsAppender=false`). Phase 2 = beat it with a
-  quack-style server-side `ducklake_commit` procedure — data-only commits in one round trip with
-  server-side retry, which postgres does not have. Research note §7 is the plan.
-- **Load the bridge before the first `ducklake:mssql:` ATTACH** — otherwise the generic manager
-  silently creates a schema without our keys/indexes/procedure; Load should detect and warn.
-- **Fail closed, degrade honestly**: when the gate refuses (missing side, version mismatch, symbol
-  unreachable — e.g. stock ducklake), DuckLake behaves exactly as it would without the bridge.
+  never applies to the lake catalog.
+- **Inlining is in scope**: DuckLake inlines small inserts into catalog tables (default limit 10);
+  the manager owns the inlined-table DDL/types via the type hooks. The matrix and edge cases
+  (FLOAT NaN, TIMESTAMP_NS, HUGEINT, STRUCT) are in the research note §5.
+- **Performance target: ≥ postgres backend.** Phase 1 parity (Execute passthrough,
+  `GetLatestSnapshotQuery` via `mssql_scan`, own `InitializeDuckLake` with PKs + filtered
+  `WHERE end_snapshot IS NULL` indexes, `MaxIdentifierLength=128`, `SupportsAppender=false`);
+  phase 2 beats it with a server-side `ducklake_commit` T-SQL procedure — data-only commits in one
+  round trip with server-side retry. Research note §7 is the plan; both phases are entirely ours
+  (no upstream involved).
+- **Both lakes at once**: `ducklake:postgres:` works through the embedded copy too — one extension
+  serves postgres-cataloged and mssql-cataloged lakes in the same process.
 
 ## Distribution
 
-- **Now (duckdb v1.5.5)**: through the **community extensions repository** — v1.5.5 has no external
-  extension repositories, so `INSTALL mssql_ducklake FROM community` (and `INSTALL mssql FROM
-  community`) is the channel; ducklake comes from the official repo. The loadable bridge pairs with
-  a ducklake build that *exports* its registration symbol — untouched upstream plus one linker line
-  — shipped as a release artifact of this repo and loaded explicitly; with stock ducklake the bridge
-  refuses at its gate. A static (bundled) build needs no export.
-- **With duckdb 2.0**: external extension repositories with per-repo keys land
-  (`CREATE EXTENSION REPOSITORY hugr …` / `INSTALL … FROM hugr`); the hugr repository then serves
-  all three (paired ducklake included) and becomes the primary channel. The README's bootstrap
-  reflects whichever is current.
+Experimental, through the **community extensions repository** on released DuckDB (v1.5.5). The
+description is honest: embeds ducklake at a named pin, mutually exclusive with the stock ducklake
+extension. The upstream track — a PR contributing the manager in-tree to ducklake (postgres-manager
+precedent) — is taken up if the extension finds users; after such a merge this extension becomes a
+deprecation shim.
 
 ## Working process — per-feature specs
 
-We do **not** run full spec-kit. Instead, each feature gets one lightweight spec under `specs/` (see
-**[specs/README.md](specs/README.md)**):
-
-1. Before (or alongside) implementing a feature, create `specs/NNN-slug/spec.md` from
-   `specs/TEMPLATE.md` — problem, design, enforcement/security, tests, alternatives.
-2. Implement with tests; keep the spec updated; set its status to `implemented` when done.
-3. Reference the spec in the commit/PR.
-
-Keep specs short and honest. When a decision changes, update the spec or supersede it with a new
-one. `design/` (gitignored) is our scratch space for the research behind a spec. Do not commit
-`design/`; do not push without being asked.
+We do **not** run full spec-kit. Each feature gets one lightweight spec under `specs/` (see
+**[specs/README.md](specs/README.md)**): write it before or alongside the work from
+`specs/TEMPLATE.md`, implement with tests, keep it current, supersede rather than rewrite history.
+`design/` (gitignored) is the research scratch behind the specs. Do not commit `design/`; do not
+push without being asked.
 
 ## Reference repos (local)
 
-- `~/projects/hugr-lab/mssql-extension` — the mssql side: `mssql_exec`/`mssql_scan` (transaction
+- `~/projects/hugr-lab/mssql-extension` — the runtime pair: `mssql_exec`/`mssql_scan` (transaction
   pinning), type codecs (`src/codec/`), DML/PK constraints.
-- `~/projects/duckdb/ducklake` — upstream ducklake clone; the manager surface is
-  `src/include/storage/ducklake_metadata_manager.hpp`, the perf references are
-  `src/metadata_manager/{postgres,quack}_metadata_manager.cpp` (parity and ceiling, respectively).
+- `~/projects/duckdb/ducklake` — upstream ducklake clone (main); the embedded pin lives in the
+  `ducklake/` submodule here. Manager surface: `src/include/storage/ducklake_metadata_manager.hpp`;
+  perf references: `src/metadata_manager/{postgres,quack}_metadata_manager.cpp`.
 - `~/projects/hugr-lab/duckdb-acl` — sibling extension repo whose build/CI/process conventions this
   repo follows.

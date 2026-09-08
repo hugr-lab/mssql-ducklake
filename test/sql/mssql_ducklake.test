@@ -1,13 +1,13 @@
 # name: test/sql/mssql_ducklake.test
-# description: The bridge loads when both sides are present (specs/001)
+# description: The embedded ducklake works end to end through this extension (specs/002)
 # group: [mssql_ducklake]
 
-# Load order is the production order: the bridge's Load requires both sides already loaded.
-# ducklake is statically linked into the test shell; mssql is a DONT_LINK loadable, which the
-# default test runner does not resolve by name - load it by its build path, duckdb's own pattern
-# for loadable-extension tests.
-require ducklake
+# ducklake writes its data files through parquet; statically linked, but the test runner loads
+# static extensions lazily - `require` brings it up
+require parquet
 
+# Production load order: mssql first (the runtime pair), then the extension. Both are DONT_LINK
+# loadables, invisible to `require` - loaded by build path, the runner's pattern.
 statement ok
 LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';
 
@@ -18,3 +18,34 @@ query I
 SELECT mssql_ducklake_version() IS NOT NULL;
 ----
 true
+
+# the embedded ducklake registered its full surface
+query I
+SELECT count(*) > 10 FROM duckdb_functions() WHERE function_name LIKE 'ducklake_%';
+----
+true
+
+# a full lake cycle with the metadata in a local duckdb file - no server needed, and every bit of
+# it (ATTACH prefix, catalog, snapshots, parquet data files) runs through the embedded copy
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/meta.ducklake' AS lake (DATA_PATH '__TEST_DIR__/lake_files');
+
+statement ok
+CREATE TABLE lake.t(i INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO lake.t VALUES (1, 'a'), (2, 'b');
+
+query II
+SELECT * FROM lake.t ORDER BY i;
+----
+1	a
+2	b
+
+query I
+SELECT count(*) >= 1 FROM ducklake_snapshots('lake');
+----
+true
+
+statement ok
+DETACH lake;

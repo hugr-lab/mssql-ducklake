@@ -7,27 +7,24 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "mssql_metadata_manager.hpp"
+#include "storage/ducklake_metadata_manager.hpp"
 
-// The bridge extension (specs/001): it contributes a DuckLake metadata manager for SQL Server, so a
-// stock `ducklake` and a stock `mssql` can pair up without either repository changing. Loading the
-// bridge IS the registration - there is nothing to call afterwards, and there is nothing here for a
-// user who has not loaded both sides, so Load fails fast with the reason instead of deferring a
-// worse error to the first ATTACH 'ducklake:mssql:...'.
+#include <mutex>
+
+// DuckLake on SQL Server, batteries included (specs/002): this extension COMPILES DUCKLAKE IN -
+// the whole untouched pinned source - and adds the mssql metadata manager beside the built-in
+// postgres/sqlite ones. One image means the manager registry is ours by construction; the price is
+// mutual exclusion with a stock ducklake, whose registry lives behind hidden symbols in its own
+// image and whose surface (functions, the `ducklake` ATTACH prefix) would collide with the copy in
+// here. Load order matters: load this extension BEFORE the first `ATTACH 'ducklake:...'`, or
+// duckdb's autoloading resolves the prefix to stock ducklake first.
+
+// ducklake's own entry point, compiled into this image (ducklake/src/ducklake_extension.cpp)
+extern "C" void ducklake_duckdb_cpp_init(duckdb::ExtensionLoader &loader);
 
 namespace duckdb {
 namespace {
-
-void RequireDependency(DatabaseInstance &db, const string &name, const string &why) {
-	if (db.ExtensionIsLoaded(name)) {
-		return;
-	}
-	if (ExtensionHelper::TryAutoLoadExtension(db, name)) {
-		return;
-	}
-	throw MissingExtensionException("mssql_ducklake is a bridge between the ducklake and mssql extensions and needs "
-	                                "both loaded; '%s' is not (%s). Run: INSTALL %s; LOAD %s; LOAD mssql_ducklake;",
-	                                name, why, name, name);
-}
 
 void MssqlDucklakeVersionFun(DataChunk &args, ExpressionState &state, Vector &result) {
 	result.Reference(Value(MssqlDucklakeExtension().Version()));
@@ -35,14 +32,34 @@ void MssqlDucklakeVersionFun(DataChunk &args, ExpressionState &state, Vector &re
 
 void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
-	RequireDependency(db, "ducklake", "it owns the metadata-manager registry the bridge registers into");
-	RequireDependency(db, "mssql", "the manager's generated SQL runs through mssql_exec/mssql_scan");
 
-	// TODO(specs/001): version-gate against the loaded ducklake, then register MSSQLMetadataManager
-	// into ducklake's registry - a direct DuckLakeMetadataManager::Register call in a static build,
-	// dlsym into the loaded ducklake image in a loadable one.
+	// the embedded copy cannot coexist with a loaded stock ducklake: same function names, same
+	// ATTACH prefix, and each image reads its own manager registry
+	if (db.ExtensionIsLoaded("ducklake")) {
+		throw InvalidInputException(
+		    "mssql_ducklake embeds ducklake and cannot be loaded together with the ducklake extension. "
+		    "Use one of the two: LOAD mssql_ducklake (DuckLake incl. SQL Server catalogs) or LOAD ducklake "
+		    "(stock, no SQL Server catalog support).");
+	}
 
-	loader.SetDescription("DuckLake metadata catalog on SQL Server (bridge between ducklake and mssql)");
+	// the manager's generated SQL runs through mssql_exec/mssql_scan, so the other half of the pair
+	// must be around before the first ducklake:mssql attach - fail here, with the fix, not there
+	if (!db.ExtensionIsLoaded("mssql") && !ExtensionHelper::TryAutoLoadExtension(db, "mssql")) {
+		throw MissingExtensionException("mssql_ducklake needs the mssql extension (the metadata manager's SQL runs "
+		                                "through mssql_exec/mssql_scan). Run: INSTALL mssql FROM community; LOAD "
+		                                "mssql; and then LOAD mssql_ducklake;");
+	}
+
+	// the full ducklake surface: the `ducklake` ATTACH prefix, ducklake_* functions, secret type,
+	// settings - registered by ducklake's own init, same image
+	ducklake_duckdb_cpp_init(loader);
+
+	// the registry is process-global while Load runs per database instance; a second Register of
+	// the same key throws by design
+	static std::once_flag register_once;
+	std::call_once(register_once, [] { DuckLakeMetadataManager::Register("mssql", MSSQLMetadataManager::Create); });
+
+	loader.SetDescription("DuckLake with SQL Server metadata catalog support (embeds ducklake)");
 	loader.RegisterFunction(
 	    ScalarFunction("mssql_ducklake_version", {}, LogicalType::VARCHAR, MssqlDucklakeVersionFun));
 }

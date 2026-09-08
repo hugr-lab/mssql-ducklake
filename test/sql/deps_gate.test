@@ -1,29 +1,24 @@
 # name: test/sql/deps_gate.test
-# description: The bridge refuses to load without its two sides (specs/001)
+# description: The load gates: mssql required, stock ducklake excluded (specs/002)
 # group: [mssql_ducklake]
 
-# autoload could quietly satisfy the gate when a local extension repo is configured (e.g. a
+# autoload could quietly satisfy the mssql check when a local extension repo is configured (e.g. a
 # LOCAL_EXTENSION_REPO run); pin it off so this file tests the refusal itself
 statement ok
 SET autoload_known_extensions = false;
 
-# nothing loaded at all: the gate names ducklake first
+# without mssql the load refuses, naming the fix
 statement error
 LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
 ----
-<REGEX>:.*mssql_ducklake is a bridge.*'ducklake' is not.*
+<REGEX>:.*mssql_ducklake needs the mssql extension.*
 
-# with ducklake up, the gate moves on to mssql
-require ducklake
-
-statement error
-LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
-----
-<REGEX>:.*mssql_ducklake is a bridge.*'mssql' is not.*
-
-# both sides up: the same LOAD now succeeds
+# with mssql up, the same LOAD succeeds
 statement ok
 LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';
 
 statement ok
 LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
+
+# the stock-ducklake exclusion gate cannot run offline (no stock artifact in this build);
+# scripts/ci/smoke_load.sh covers it with INSTALL ducklake from the official repository
