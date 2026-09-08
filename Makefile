@@ -81,3 +81,7 @@ vcpkg-setup:
 # roaring/openssl/simdutf at configure - `make tidy-check` then works there and here.
 tidy-check: vcpkg-setup $(EXTENSION_CONFIG_STEP)
 tidy-check: EXT_DEBUG_FLAGS += $(VCPKG_MANIFEST_FLAGS)
+# make hands a target's variables down to its prerequisites, and the manifest step is the one that
+# CREATES the manifest the flag points at (vcpkg would fail reading it) - pin the prerequisites to the
+# plain value (3.81, the macOS make, has no `private`)
+vcpkg-setup $(EXTENSION_CONFIG_STEP) extension_configuration_default: EXT_DEBUG_FLAGS := $(EXT_DEBUG_FLAGS)
