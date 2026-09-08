@@ -74,7 +74,10 @@ vcpkg-setup:
 	@test -d vcpkg || git clone https://github.com/microsoft/vcpkg.git vcpkg
 	./vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
-# ci-tools' tidy-check configures cmake with the toolchain and the merged-manifest flags but depends on
-# neither; the code-quality workflow that runs it sets up no vcpkg. Give the target what the flags
-# assume (a bootstrapped vcpkg, the merged vcpkg.json) so `make tidy-check` works there and here.
+# ci-tools' tidy-check configures cmake with the vcpkg toolchain but, unlike release/debug, without
+# the merged-manifest flag and without depending on the steps that make either exist; the
+# code-quality workflow that runs it sets up no vcpkg. Give the target a bootstrapped vcpkg, the
+# merged vcpkg.json, and the manifest flag (via the target's EXT_DEBUG_FLAGS) so vcpkg installs
+# roaring/openssl/simdutf at configure - `make tidy-check` then works there and here.
 tidy-check: vcpkg-setup $(EXTENSION_CONFIG_STEP)
+tidy-check: EXT_DEBUG_FLAGS += $(VCPKG_MANIFEST_FLAGS)
