@@ -38,4 +38,4 @@ specs are the shareable distillation of that work.
 | --- | --- | --- |
 | [001](001-bridge-extension/spec.md) | the bridge extension — DuckLake metadata on SQL Server | superseded by 002 |
 | [002](002-embedded-ducklake/spec.md) | the standalone extension — embedded ducklake + mssql manager | accepted |
-| [003](003-mssql-extension-v0.2.5/spec.md) | mssql-extension v0.2.5 — what the manager needs from the runtime pair | accepted (handed to mssql-extension) |
+| [003](003-mssql-extension-v0.2.5/spec.md) | mssql-extension v0.2.5 — what the manager needs from the runtime pair | implemented (mssql v0.2.5) |

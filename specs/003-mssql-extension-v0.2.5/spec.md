@@ -1,7 +1,10 @@
 # Spec 003: mssql-extension v0.2.5 — what the DuckLake manager needs from the runtime pair
 
-- **Status**: accepted — handed to `hugr-lab/mssql-extension` (branch `duckdb-v1.5.5`, release
-  `v0.2.5`); this repository bumps its pin when it ships
+- **Status**: implemented — shipped as mssql `v0.2.5` (2026-09-08, from the `duckdb-v1.5.5`
+  branch; community-extensions PR duckdb/community-extensions#2676); this repository's pin is bumped
+  to it. R1 and R2 landed as specified (mssql-extension #313, #318), R3 as a per-catalog lock across
+  batch-and-drain. Verified live: DDL and inlined inserts on the lake work through the generic
+  manager; one caveat, recorded below, shapes spec 004.
 - **Date**: 2026-09-08
 - **Author**: VGSML
 - **Depends on**: [002](../002-embedded-ducklake/spec.md) (the live-attach findings)
@@ -131,6 +134,24 @@ branch from it, implement R1–R3 with tests, CHANGELOG `[0.2.5]`, tag `v0.2.5`,
 submission on the v1.5.5 line; then forward-port to `main` inside spec 066. This repository bumps
 `extension_config.cmake` (`GIT_TAG v0.2.5`), drops `METADATA_SCHEMA 'dbo'` from
 `test/sql/integration/attach_mssql.test` and extends it with the lake DDL/DML that fails today.
+
+### What v0.2.5 does not cover (from its CHANGELOG) — the constraint spec 004 inherits
+
+The materialization gate counts *catalog* scans (three-part names, the joins and correlated
+subqueries over them). `mssql_scan()` is a different table function on the same pinned connection
+and is **not** materialized: inside a transaction, a plan that mixes `mssql_scan()` with a catalog
+scan, or holds two `mssql_scan()`s, still fails the same way. For the manager this means an
+`mssql_scan()` may only appear as the *sole* source of its query — fine for `GetLatestSnapshotQuery`
+and for `Execute` (`mssql_exec` drains its batch before returning), not fine for
+`GenerateFileColumnStatsCTEBody`, whose CTE lives inside a query that also joins the catalog's
+tables. Either that read stays a catalog scan (materialized by v0.2.5), or the whole file-listing
+query is pushed server-side as one `mssql_scan()`. Verified against the v0.2.5 build (2026-09-08):
+`mssql_scan` + catalog scan in one plan and two `mssql_scan`s both fail inside a transaction;
+`mssql_scan` inside a correlated subquery over a catalog table passes (the catalog scan drains
+first), and two catalog scans with `threads = 4` pass. mssql-extension PR #314 closes the gap on
+the duckdb 2.0 line, and that is where this repository picks it up — with the 2.0 bump, not a
+backport. It does not block anything: on v1.5.5 the manager keeps `mssql_scan()` the sole source
+of its query, which is how the hot reads are shaped anyway.
 
 ## Enforcement & security
 

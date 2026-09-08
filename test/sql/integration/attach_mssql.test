@@ -1,10 +1,14 @@
 # name: test/sql/integration/attach_mssql.test
-# description: A DuckLake catalog in SQL Server: initialize, load, re-attach (specs/002)
+# description: A DuckLake catalog in SQL Server: initialize, DDL, inlined data, re-attach (specs/002, 003)
 # group: [integration]
 
 # The server-backed suite: `make docker-up` + `make test-integration` provide the connection string
 # (docker/docker-compose.yml, .env.example); without it the file skips. CI's floor forbids the skip.
 require-env MSSQL_DUCKLAKE_TEST_DSN
+
+# ducklake binds parquet's copy function for every insert, inlined or not; statically linked, but
+# the test runner loads static extensions lazily - `require` brings it up
+require parquet
 
 statement ok
 LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';
@@ -40,14 +44,15 @@ SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.tables WHERE name L
 
 # `ducklake:mssql:<ADO connection string>`: duckdb strips the `mssql:` prefix and picks the mssql
 # storage for the catalog ATTACH (the `mssql://` URI form is deliberately not a prefix to duckdb -
-# it needs META_TYPE 'mssql' instead). METADATA_SCHEMA is required for now: the mssql catalog
-# answers duckdb's default 'main' when ducklake asks for its default schema, not 'dbo'.
+# it needs META_TYPE 'mssql' instead). No METADATA_SCHEMA: since mssql v0.2.5 the catalog answers
+# `dbo` as its default schema (spec 003)
 statement ok
-ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/lake', METADATA_SCHEMA 'dbo');
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/lake');
 
-# a new DuckLake was initialized in SQL Server: the whole catalog schema, its metadata, snapshot 0
+# a new DuckLake was initialized in SQL Server, in dbo: the whole catalog schema, its metadata,
+# snapshot 0
 query I
-SELECT count(*) > 20 FROM mssql_scan('srv', 'SELECT name FROM sys.tables WHERE name LIKE ''ducklake%''');
+SELECT count(*) > 20 FROM mssql_scan('srv', 'SELECT t.name FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''dbo'' AND t.name LIKE ''ducklake%''');
 ----
 true
 
@@ -62,37 +67,70 @@ SELECT snapshot_id FROM ducklake_snapshots('lake');
 ----
 0
 
+# DDL and an inlined insert through the generic manager: the catalog load behind them reads the
+# metadata with decorrelated subqueries, which mssql v0.2.5 materializes on the transaction's
+# pinned connection (spec 003); the inlined rows land in a ducklake_inlined_data_* table in dbo
 statement ok
-DETACH lake;
+CREATE TABLE lake.t(i INTEGER, s VARCHAR);
 
-# the second attach finds the existing catalog and loads it (no re-initialization)
 statement ok
-ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/lake', METADATA_SCHEMA 'dbo');
+INSERT INTO lake.t VALUES (1, 'a'), (2, 'b');
+
+query II
+SELECT * FROM lake.t ORDER BY i;
+----
+1	a
+2	b
+
+# (the [_][0-9] keeps ducklake_inlined_data_tables, the catalog table listing them, out of the count)
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.tables WHERE name LIKE ''ducklake_inlined_data[_][0-9]%''');
+----
+1
 
 query I
 SELECT count(*) FROM ducklake_snapshots('lake');
 ----
-1
+3
+
+statement ok
+DETACH lake;
+
+# the second attach finds the existing catalog and loads it (no re-initialization): the table,
+# its inlined rows, the snapshots, time travel
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/lake');
 
 query I
-SELECT count(*) FROM mssql_scan('srv', 'SELECT snapshot_id FROM dbo.ducklake_snapshot');
+SELECT count(*) FROM ducklake_snapshots('lake');
 ----
-1
+3
+
+query II
+SELECT * FROM lake.t ORDER BY i;
+----
+1	a
+2	b
+
+query I
+SELECT count(*) FROM lake.t AT (VERSION => 1);
+----
+0
 
 # an existing catalog pins its data path
 statement error
-ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake2 (DATA_PATH '__TEST_DIR__/elsewhere', METADATA_SCHEMA 'dbo');
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake2 (DATA_PATH '__TEST_DIR__/elsewhere');
 ----
 <REGEX>:.*does not match existing data path.*
 
 statement ok
 DETACH lake;
 
-# TODO(specs/003, 004): DDL/DML on the lake (CREATE TABLE, INSERT, ...) fails on mssql v0.2.4: the
-# catalog load runs a decorrelated subquery with two mssql scans, and the scan executes its batch at
-# source initialization on the one connection pinned to the transaction - the second source finds
-# it streaming ("connection not in Idle state"). Spec 003 (mssql v0.2.5) materializes such scans;
-# then this file drops METADATA_SCHEMA and grows the lake DDL/DML cycle.
+# TODO(specs/004): a commit that writes a data file (an insert past the inlining limit), UPDATE and
+# DELETE still fail on the generic manager: their commit batch carries an UPDATE of
+# ducklake_table_stats, runs through duckdb's DML path, and mssql's UPDATE/DELETE needs a primary
+# key ("Table 'dbo.ducklake_table_stats' has no primary key"). The manager's Execute passthrough
+# (mssql_exec, raw T-SQL server-side) is what removes that path - research note §4.
 
 statement ok
 DETACH srv;

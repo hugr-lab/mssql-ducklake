@@ -63,14 +63,14 @@ Bootstrap:
 ```sql
 INSTALL mssql FROM community;  INSTALL mssql_ducklake FROM community;  -- once published
 LOAD mssql_ducklake;
-ATTACH 'ducklake:mssql:Server=…;Database=lake_meta;User Id=…;Password=…' AS lake
-    (DATA_PATH 's3://…', METADATA_SCHEMA 'dbo');   -- `mssql://…` needs META_TYPE 'mssql' (README)
+ATTACH 'ducklake:mssql:Server=…;Database=lake_meta;User Id=…;Password=…' AS lake (DATA_PATH 's3://…');
+-- the `mssql://…` URI form needs META_TYPE 'mssql' (README)
 ```
 
 ## Version pinning & vendoring
 
 One release line, bumped together: duckdb `v1.5.5`, ducklake `v1.5-variegata` (embedded), mssql
-`v0.2.4` (test loadable), extension-ci-tools `v1.5.5`. The ducklake submodule bumps on **our**
+`v0.2.5` (test loadable), extension-ci-tools `v1.5.5`. The ducklake submodule bumps on **our**
 schedule — manager iterations never wait for a ducklake release — and the flip side is ours too:
 ducklake fixes reach users with our bump, so bumps stay cheap and frequent (a bump = transpiler
 closed-list re-audit + the smoke suite).
@@ -91,11 +91,13 @@ mutually exclusive with the stock extension.
 - `scripts/ci/smoke_load.sh`: out-of-tree CLI load — the local-file lake round trip, the mssql
   gate, and the **stock-ducklake exclusion gate** against a real `INSTALL ducklake` artifact
   (skipped with a note when offline).
-- `test/sql/integration/attach_mssql.test`: a real SQL Server (docker/docker-compose.yml locally,
-  a service container on CI's Linux job; gated on `MSSQL_DUCKLAKE_TEST_DSN`, which
-  `make test-integration` exports and CI forbids skipping) — initialize a new catalog, read it
-  back through `mssql_scan`, re-attach the existing one, the data-path pin.
-- TODO (with the manager): DDL/DML/inlining against SQL Server; bench vs the postgres backend.
+- `test/sql/integration/attach_mssql.test`: a real SQL Server (docker/docker-compose.yml, the
+  same compose on CI's Linux job; gated on `MSSQL_DUCKLAKE_TEST_DSN`, which `make test-integration`
+  exports and CI forbids skipping) — initialize a new catalog in `dbo`, CREATE TABLE, an inlined
+  insert, read back through the lake and through `mssql_scan`, re-attach the existing catalog,
+  time travel, the data-path pin.
+- TODO (with the manager, spec 004): data-file commits, UPDATE/DELETE, the inlining type matrix
+  against SQL Server; bench vs the postgres backend.
 
 ## Alternatives considered
 
@@ -114,7 +116,8 @@ mutually exclusive with the stock extension.
 - Spec 004+: the manager phases (research note §7) — T-SQL transpile of the closed statement set
   over `Execute`, own `InitializeDuckLake` (keys + filtered `WHERE end_snapshot IS NULL` indexes),
   then the server-side `ducklake_commit` procedure (single round-trip data-only commits).
-- Two findings from the first live attach (2026-09-08), handed to mssql-extension as spec 003:
+- Two findings from the first live attach (2026-09-08), handed to mssql-extension as spec 003 and
+  fixed in mssql v0.2.5 (the pin since the same day):
   1. `METADATA_SCHEMA 'dbo'` is required — asked for its default schema, the mssql catalog answers
      duckdb's `main` (an mssql-extension fix: override `GetDefaultSchema`).
   2. Through the generic manager, ATTACH initializes and re-opens a catalog in SQL Server, but the
