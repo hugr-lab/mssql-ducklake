@@ -1,6 +1,6 @@
 # name: test/sql/integration/attach_mssql.test
 # description: A DuckLake catalog in SQL Server: initialize, load, re-attach (specs/002)
-# group: [mssql_ducklake_integration]
+# group: [integration]
 
 # The server-backed suite: `make docker-up` + `make test-integration` provide the connection string
 # (docker/docker-compose.yml, .env.example); without it the file skips. CI's floor forbids the skip.

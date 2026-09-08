@@ -70,6 +70,8 @@ scripts/ci/smoke_load.sh                    # out-of-tree CLI: local-file lake r
 cp -n .env.example .env; make docker-up     # the SQL Server for the integration suite (creates the catalog db)
 make test-integration                       # test/sql/integration/* with the DSN exported; `make test` skips them
 find src \( -name '*.cpp' -o -name '*.hpp' \) | xargs clang-format -i   # pin: clang_format==11.0.1 (pip)
+make format-check                           # duckdb's format.py over src + test (needs black, cmake-format, clang_format 11.0.1 in PATH)
+make tidy-check                             # clang-tidy over src (TIDY_BINARY=... to pick one); what the distribution's code-quality job runs
 ```
 
 Build outputs: CLI `build/release/duckdb`, loadables
@@ -83,7 +85,9 @@ it and the test silently SKIPS. Load those by build path:
 `SET autoload_known_extensions = false;` first. The static test shell loads static extensions
 lazily — `require parquet` before a lake writes data files. `require-env MSSQL_DUCKLAKE_TEST_DSN`
 gates the server-backed files: the Linux CI job provides it (service container) and forbids the
-skip. CI's `scripts/ci/assert_ran.sh` floor keeps a silently-skipped suite from passing.
+skip. CI's `scripts/ci/assert_ran.sh` floor keeps a silently-skipped suite from passing. A `.test`
+file's `# group:` must equal its directory name (`[sql]`, `[integration]`) — duckdb's `format.py`
+rewrites anything else and the distribution's format check fails on it.
 
 ## Code style
 
