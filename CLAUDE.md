@@ -67,7 +67,7 @@ GEN=ninja make debug
 
 build/release/test/unittest 'test/sql/*'    # the sqllogictest suite (what CI runs)
 scripts/ci/smoke_load.sh                    # out-of-tree CLI: local-file lake round trip, both gates
-cp .env.example .env && make docker-up      # the SQL Server for the integration suite (creates lake_meta)
+cp -n .env.example .env; make docker-up     # the SQL Server for the integration suite (creates the catalog db)
 make test-integration                       # test/sql/integration/* with the DSN exported; `make test` skips them
 find src \( -name '*.cpp' -o -name '*.hpp' \) | xargs clang-format -i   # pin: clang_format==11.0.1 (pip)
 ```
