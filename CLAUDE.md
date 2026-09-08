@@ -41,7 +41,7 @@ model, the full manager plan §7: transpiler, keys + filtered indexes, server-si
 src/
   mssql_ducklake_extension.cpp   # entry: exclusion gate (stock ducklake), mssql deps gate,
                                  #   ducklake_duckdb_cpp_init chain, Register("mssql") via call_once
-  mssql_metadata_manager.cpp     # the SQL Server metadata manager (specs/003+ fill the phases)
+  mssql_metadata_manager.cpp     # the SQL Server metadata manager (specs/004+ fill the phases)
   include/                       # mssql_ducklake_extension.hpp, mssql_metadata_manager.hpp
 ducklake/                        # submodule, EMBEDDED: add_subdirectory(ducklake/src) supplies
                                  #   ALL_OBJECT_FILES; never modified, never loaded separately
@@ -49,6 +49,9 @@ extension_config.cmake           # loads: this extension (DONT_LINK) + mssql (DO
 test/sql/
   mssql_ducklake.test            # embedded surface + a full local-file lake cycle (no server)
   deps_gate.test                 # the mssql refusal, then success beside mssql
+  integration/                   # server-backed suite, gated on MSSQL_DUCKLAKE_TEST_DSN (make test-integration)
+docker/                          # the integration SQL Server: compose (everything named mssql-ducklake-*,
+                                 #   port 7433) + init/sqlserver.sql (creates lake_meta); .env.example has the knobs
 scripts/ci/                      # smoke_load.sh (incl. the stock-ducklake exclusion), assert_ran.sh, ...
 specs/                           # one lightweight spec per feature, NNN-slug/spec.md (see specs/README.md)
 design/                          # LOCAL, gitignored: numbered research topics NNN-topic/
@@ -64,6 +67,8 @@ GEN=ninja make debug
 
 build/release/test/unittest 'test/sql/*'    # the sqllogictest suite (what CI runs)
 scripts/ci/smoke_load.sh                    # out-of-tree CLI: local-file lake round trip, both gates
+cp .env.example .env && make docker-up      # the SQL Server for the integration suite (creates lake_meta)
+make test-integration                       # test/sql/integration/* with the DSN exported; `make test` skips them
 find src \( -name '*.cpp' -o -name '*.hpp' \) | xargs clang-format -i   # pin: clang_format==11.0.1 (pip)
 ```
 
@@ -76,8 +81,9 @@ extensions (parquet here) and duckdb's AUTOLOADABLE list — a `DONT_LINK` loada
 it and the test silently SKIPS. Load those by build path:
 `LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';`. In a gate test,
 `SET autoload_known_extensions = false;` first. The static test shell loads static extensions
-lazily — `require parquet` before a lake writes data files. CI's `scripts/ci/assert_ran.sh` floor
-keeps a silently-skipped suite from passing.
+lazily — `require parquet` before a lake writes data files. `require-env MSSQL_DUCKLAKE_TEST_DSN`
+gates the server-backed files: the Linux CI job provides it (service container) and forbids the
+skip. CI's `scripts/ci/assert_ran.sh` floor keeps a silently-skipped suite from passing.
 
 ## Code style
 
@@ -118,6 +124,17 @@ keeps a silently-skipped suite from passing.
   (no upstream involved).
 - **Both lakes at once**: `ducklake:postgres:` works through the embedded copy too — one extension
   serves postgres-cataloged and mssql-cataloged lakes in the same process.
+- **Attach syntax**: `ducklake:mssql:<ADO connection string>` — duckdb strips `mssql:` as an
+  extension prefix, but deliberately not `mssql://`, so the URI form needs `META_TYPE 'mssql'`.
+  `METADATA_SCHEMA 'dbo'` is required until the mssql catalog answers its real default schema
+  (it returns duckdb's `main`; an mssql-extension fix).
+- **What the generic manager gets on a live server** (2026-09-08): ATTACH initializes and re-opens
+  a catalog in SQL Server, but DDL/DML fail — ducklake's catalog-load reads with decorrelated
+  subqueries (LEFT_DELIM_JOIN over `ducklake_view`/`ducklake_tag`) keep two mssql scans open on
+  the one connection pinned to the transaction (the scan runs its batch at source init) →
+  "connection not in Idle state". Plain joins pass; the same query passes in autocommit. Phase 1
+  therefore needs mssql v0.2.5 (spec 003: materialize multi-scan plans on a pinned connection,
+  default schema `dbo`); the manager's own reads via `mssql_scan` stay the perf story (research note §9).
 
 ## Distribution
 

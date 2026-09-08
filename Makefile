@@ -24,6 +24,45 @@ endif
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
+# --- integration environment (docker/docker-compose.yml) ----------------------------------------
+# One SQL Server holding the DuckLake catalog. `.env` (from .env.example) overrides the defaults;
+# the same variables feed the compose file and the connection string the tests gate on.
+-include .env
+MSSQL_DUCKLAKE_HOST ?= localhost
+MSSQL_DUCKLAKE_PORT ?= 7433
+MSSQL_DUCKLAKE_USER ?= sa
+MSSQL_DUCKLAKE_PASS ?= TestPassword1
+MSSQL_DUCKLAKE_DB ?= lake_meta
+export MSSQL_DUCKLAKE_PORT MSSQL_DUCKLAKE_PASS
+
+# The metadata connection string, ADO form: the tests put it behind the `ducklake:mssql:` prefix,
+# and it is that `mssql:` (not `mssql://`, which duckdb deliberately leaves alone) that duckdb strips
+# to pick the mssql storage for the catalog ATTACH.
+MSSQL_DUCKLAKE_TEST_DSN ?= Server=$(MSSQL_DUCKLAKE_HOST),$(MSSQL_DUCKLAKE_PORT);Database=$(MSSQL_DUCKLAKE_DB);User Id=$(MSSQL_DUCKLAKE_USER);Password=$(MSSQL_DUCKLAKE_PASS)
+
+DOCKER_COMPOSE := docker compose -f $(PROJ_DIR)docker/docker-compose.yml
+
+.PHONY: docker-up docker-down docker-status test-integration
+# --wait would treat the one-shot init container as a failure; wait on the server, then run the
+# init in the foreground so its output (and exit code) land here
+docker-up:
+	$(DOCKER_COMPOSE) up -d --wait sqlserver
+	$(DOCKER_COMPOSE) up --no-log-prefix sqlserver-init
+
+docker-down:
+	$(DOCKER_COMPOSE) down
+
+docker-status:
+	$(DOCKER_COMPOSE) ps
+
+# The server-backed suite (test/sql/integration/): gated on MSSQL_DUCKLAKE_TEST_DSN, so `make test`
+# skips it and this target is the one that provides it. The floor fails a run that skipped anyway.
+test-integration: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
+test-integration:
+	@test -x build/release/test/unittest || { echo "build first: GEN=ninja make"; exit 1; }
+	build/release/test/unittest '$(PROJ_DIR)test/sql/integration/*' 2>&1 | tee build/integration.log
+	scripts/ci/assert_ran.sh build/integration.log 1 1 'require-env MSSQL_DUCKLAKE_TEST_DSN'
+
 .PHONY: vcpkg-setup
 vcpkg-setup:
 	@test -d vcpkg || git clone https://github.com/microsoft/vcpkg.git vcpkg

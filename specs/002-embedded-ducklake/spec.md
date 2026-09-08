@@ -63,7 +63,8 @@ Bootstrap:
 ```sql
 INSTALL mssql FROM community;  INSTALL mssql_ducklake FROM community;  -- once published
 LOAD mssql_ducklake;
-ATTACH 'ducklake:mssql://…?database=lake_meta' AS lake (DATA_PATH 's3://…');
+ATTACH 'ducklake:mssql:Server=…;Database=lake_meta;User Id=…;Password=…' AS lake
+    (DATA_PATH 's3://…', METADATA_SCHEMA 'dbo');   -- `mssql://…` needs META_TYPE 'mssql' (README)
 ```
 
 ## Version pinning & vendoring
@@ -90,8 +91,11 @@ mutually exclusive with the stock extension.
 - `scripts/ci/smoke_load.sh`: out-of-tree CLI load — the local-file lake round trip, the mssql
   gate, and the **stock-ducklake exclusion gate** against a real `INSTALL ducklake` artifact
   (skipped with a note when offline).
-- TODO (with the manager): integration tests against a real SQL Server (docker) covering
-  ATTACH/commit/inlining; bench vs the postgres backend.
+- `test/sql/integration/attach_mssql.test`: a real SQL Server (docker/docker-compose.yml locally,
+  a service container on CI's Linux job; gated on `MSSQL_DUCKLAKE_TEST_DSN`, which
+  `make test-integration` exports and CI forbids skipping) — initialize a new catalog, read it
+  back through `mssql_scan`, re-attach the existing one, the data-path pin.
+- TODO (with the manager): DDL/DML/inlining against SQL Server; bench vs the postgres backend.
 
 ## Alternatives considered
 
@@ -107,9 +111,20 @@ mutually exclusive with the stock extension.
 
 ## Follow-ups
 
-- Spec 003+: the manager phases (research note §7) — T-SQL transpile of the closed statement set
+- Spec 004+: the manager phases (research note §7) — T-SQL transpile of the closed statement set
   over `Execute`, own `InitializeDuckLake` (keys + filtered `WHERE end_snapshot IS NULL` indexes),
   then the server-side `ducklake_commit` procedure (single round-trip data-only commits).
-- Docker SQL Server in CI for integration tests.
+- Two findings from the first live attach (2026-09-08), handed to mssql-extension as spec 003:
+  1. `METADATA_SCHEMA 'dbo'` is required — asked for its default schema, the mssql catalog answers
+     duckdb's `main` (an mssql-extension fix: override `GetDefaultSchema`).
+  2. Through the generic manager, ATTACH initializes and re-opens a catalog in SQL Server, but the
+     catalog load behind any DDL/DML fails: ducklake's reads with decorrelated subqueries
+     (`LEFT_DELIM_JOIN` over `ducklake_view`/`ducklake_tag`) keep two mssql scans open on the one
+     connection pinned to the transaction — the mssql scan runs its batch at source
+     initialization, and the second source finds it streaming ("connection not in Idle state").
+     Plain joins pass, the same query passes in autocommit. So the manager routes its reads
+     through `mssql_scan` (one server-side statement, one result set each), not only the hot
+     ones; an mssql-extension change (lazy or draining scan start on a pinned connection) is the
+     complementary half — spec 003 makes it the primary one.
 - Community submission (experimental), with the honest embeds-ducklake description.
 - The upstream-PR track, opened when usage justifies it.
