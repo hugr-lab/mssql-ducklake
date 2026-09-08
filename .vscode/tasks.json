@@ -1,0 +1,65 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build Release",
+            "type": "shell",
+            "command": "make",
+            "args": ["release"],
+            "options": { "cwd": "${workspaceFolder}", "env": { "GEN": "ninja" } },
+            "group": "build",
+            "problemMatcher": ["$gcc"],
+            "detail": "Build duckdb + ducklake + mssql + the bridge (release)"
+        },
+        {
+            "label": "Build Debug",
+            "type": "shell",
+            "command": "make",
+            "args": ["debug"],
+            "options": { "cwd": "${workspaceFolder}", "env": { "GEN": "ninja" } },
+            "group": { "kind": "build", "isDefault": true },
+            "problemMatcher": ["$gcc"],
+            "detail": "Build duckdb + ducklake + mssql + the bridge (debug, with symbols)"
+        },
+        {
+            "label": "Clean",
+            "type": "shell",
+            "command": "make",
+            "args": ["clean"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "detail": "Clean build artifacts"
+        },
+        {
+            "label": "Test (Release)",
+            "type": "shell",
+            "command": "./build/release/test/unittest",
+            "args": ["test/sql/*"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": { "kind": "test", "isDefault": true },
+            "problemMatcher": [],
+            "detail": "Run the sqllogictest suite (release)",
+            "dependsOn": "Build Release"
+        },
+        {
+            "label": "Test (Debug)",
+            "type": "shell",
+            "command": "./build/debug/test/unittest",
+            "args": ["test/sql/*"],
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": "test",
+            "problemMatcher": [],
+            "detail": "Run the sqllogictest suite (debug)",
+            "dependsOn": "Build Debug"
+        },
+        {
+            "label": "Smoke: the artifact loads",
+            "type": "shell",
+            "command": "scripts/ci/smoke_load.sh",
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": [],
+            "detail": "Load the built loadable out of tree, with and without its deps",
+            "dependsOn": "Build Release"
+        }
+    ]
+}

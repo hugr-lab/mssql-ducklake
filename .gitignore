@@ -1,0 +1,22 @@
+build
+.idea
+cmake-build-debug
+duckdb_unittest_tempdir/
+.DS_Store
+testext
+test/python/__pycache__/
+.Rhistory
+
+# IDE / clangd caches
+.cache/
+.vscode/*.log
+
+# local design / research scratch (not committed)
+design/
+
+# local environment config
+.env
+
+# local vcpkg checkout + artifacts (make vcpkg-setup)
+vcpkg/
+vcpkg_installed/

@@ -1,0 +1,37 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug (duckdb CLI)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/debug/duckdb",
+            "args": ["-unsigned"],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "Build Debug",
+            "env": { "DUCKDB_ALLOW_UNSIGNED_EXTENSIONS": "1" },
+            "stopOnEntry": false
+        },
+        {
+            "name": "Release (duckdb CLI)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/release/duckdb",
+            "args": ["-unsigned"],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "Build Release",
+            "env": { "DUCKDB_ALLOW_UNSIGNED_EXTENSIONS": "1" },
+            "stopOnEntry": false
+        },
+        {
+            "name": "Debug Tests (mssql_ducklake)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/debug/test/unittest",
+            "args": ["${workspaceFolder}/test/sql/mssql_ducklake.test"],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "Build Debug",
+            "stopOnEntry": false
+        }
+    ]
+}

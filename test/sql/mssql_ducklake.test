@@ -1,0 +1,17 @@
+# name: test/sql/mssql_ducklake.test
+# description: The bridge loads when both sides are present (specs/001)
+# group: [mssql_ducklake]
+
+# Load order is the production order: the bridge's Load requires both sides already loaded (or
+# autoloadable). ducklake is statically linked into the test shell; mssql is the loadable built
+# beside it from the pinned release.
+require ducklake
+
+require mssql
+
+require mssql_ducklake
+
+query I
+SELECT mssql_ducklake_version() IS NOT NULL;
+----
+true

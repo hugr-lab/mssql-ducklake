@@ -1,0 +1,9 @@
+# yamllint for the workflows, compose and packaging files (release plan 3.8). Relaxed on purpose:
+# the point is a malformed workflow failing in lint rather than at the first push, not a style war
+# with GitHub's own YAML idioms (`on:`, long comment lines).
+extends: relaxed
+rules:
+  line-length:
+    max: 140
+    allow-non-breakable-inline-mappings: true
+  truthy: disable

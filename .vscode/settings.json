@@ -1,0 +1,34 @@
+{
+    "cmake.configureOnOpen": false,
+    "cmake.buildDirectory": "${workspaceFolder}/build/debug",
+    "cmake.sourceDirectory": "${workspaceFolder}/duckdb",
+    "cmake.configureArgs": [
+        "-DDUCKDB_EXTENSION_CONFIGS=${workspaceFolder}/extension_config.cmake",
+        "-DCMAKE_BUILD_TYPE=Debug"
+    ],
+    "cmake.generator": "Ninja",
+    "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+    "C_Cpp.default.includePath": [
+        "${workspaceFolder}/src/include",
+        "${workspaceFolder}/ducklake/src/include",
+        "${workspaceFolder}/duckdb/src/include",
+        "${workspaceFolder}/duckdb/third_party/fmt/include",
+        "${workspaceFolder}/build/release/vcpkg_installed/*/include",
+        "${workspaceFolder}/build/debug/vcpkg_installed/*/include"
+    ],
+    "C_Cpp.default.cppStandard": "c++17",
+    "files.associations": {
+        "*.hpp": "cpp",
+        "*.cpp": "cpp"
+    },
+    "editor.formatOnSave": false,
+    "files.exclude": {
+        "**/.git": true
+    },
+    "search.exclude": {
+        "build": true,
+        "duckdb": true,
+        "ducklake": true,
+        "extension-ci-tools": true
+    }
+}

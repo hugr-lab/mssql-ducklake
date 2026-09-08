@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(GEN=ninja make:*)",
+      "Bash(make:*)",
+      "Bash(./build/release/test/unittest:*)",
+      "Bash(./build/debug/test/unittest:*)",
+      "Bash(build/release/test/unittest:*)",
+      "Bash(build/debug/test/unittest:*)",
+      "Bash(scripts/ci/smoke_load.sh:*)",
+      "Bash(git status:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git fetch:*)",
+      "Bash(git pull:*)",
+      "Bash(git checkout:*)",
+      "Bash(git tag:*)",
+      "Bash(git submodule status:*)",
+      "Bash(git submodule update:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh run view:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh issue view:*)",
+      "Bash(gh api:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(clang-format:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:duckdb.org)"
+    ]
+  }
+}
