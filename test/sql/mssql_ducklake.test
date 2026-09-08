@@ -1,6 +1,6 @@
 # name: test/sql/mssql_ducklake.test
 # description: The embedded ducklake works end to end through this extension (specs/002)
-# group: [mssql_ducklake]
+# group: [sql]
 
 # ducklake writes its data files through parquet; statically linked, but the test runner loads
 # static extensions lazily - `require` brings it up

@@ -1,6 +1,6 @@
 # name: test/sql/deps_gate.test
 # description: The load gates: mssql required, stock ducklake excluded (specs/002)
-# group: [mssql_ducklake]
+# group: [sql]
 
 # autoload could quietly satisfy the mssql check when a local extension repo is configured (e.g. a
 # LOCAL_EXTENSION_REPO run); pin it off so this file tests the refusal itself
