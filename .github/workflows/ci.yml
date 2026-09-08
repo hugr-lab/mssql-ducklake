@@ -2,7 +2,7 @@
 # macOS build on merges to main and manual runs. Full platform coverage lives in distribution.yml.
 #
 # The whole stack is release-pinned (see CLAUDE.md): duckdb v1.5.5, ducklake v1.5-variegata,
-# mssql v0.2.4, extension-ci-tools v1.5.5. A red build means our code or a pin bump - never a
+# mssql v0.2.5, extension-ci-tools v1.5.5. A red build means our code or a pin bump - never a
 # floating upstream.
 name: CI
 

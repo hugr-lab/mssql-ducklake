@@ -2,9 +2,12 @@
 
 - **Status**: implemented — shipped as mssql `v0.2.5` (2026-09-08, from the `duckdb-v1.5.5`
   branch; community-extensions PR duckdb/community-extensions#2676); this repository's pin is bumped
-  to it. R1 and R2 landed as specified (mssql-extension #313, #318), R3 as a per-catalog lock across
-  batch-and-drain. Verified live: DDL and inlined inserts on the lake work through the generic
-  manager; one caveat, recorded below, shapes spec 004.
+  to it. R1 and R2 landed as specified (mssql-extension #313, #318). **R3 did not**: nothing under
+  `src/tds/` changed between the tags, and the per-catalog mutex that shipped is taken only on the
+  R2 materialization path (`table_scan.cpp`, `if (bind_data.requires_materialization)`), so it
+  serializes that path rather than making an unmaterialized second batch fail cleanly — every shape
+  R3 targeted still tears the stream. Verified live: through the generic manager a table's first
+  write commits and its second fails; two caveats, both recorded below, shape spec 004.
 - **Date**: 2026-09-08
 - **Author**: VGSML
 - **Depends on**: [002](../002-embedded-ducklake/spec.md) (the live-attach findings)
@@ -29,9 +32,10 @@ is proven. It is deliberately small — the mechanism is the one mssql-extension
 `DuckLakeTransaction::GetDefaultSchemaName()` (`ducklake/src/storage/ducklake_transaction.cpp:1537`)
 asks the attached metadata catalog for `Catalog::GetDefaultSchema()`. `MSSQLCatalog` does not
 override it, so duckdb's base answer `main` comes back and the attach fails with
-`Schema 'main' not found in MSSQL database`. Today's workaround is `METADATA_SCHEMA 'dbo'` on every
-ATTACH; mssql-extension issue #129 shows a user working around the same thing by creating a schema
-called `main` in SQL Server.
+`Schema 'main' not found in MSSQL database`. The workaround until v0.2.5 was `METADATA_SCHEMA 'dbo'`
+on every ATTACH; mssql-extension issue #129 shows a user working around the same thing by creating a
+schema called `main` in SQL Server. (v0.2.5 answers the constant `dbo`, not `SCHEMA_NAME()`, so a
+login whose own default schema is elsewhere still passes `METADATA_SCHEMA`.)
 
 ### P2 — two scans of one catalog on the pinned connection
 
@@ -131,9 +135,10 @@ one an error message instead of a corrupted connection.
 v1.5.5, the pin this repository runs). `main` has moved to the duckdb 2.0 pre-release
 (`chore: track duckdb's v2.0 pre-release branch`), so the work lands on `duckdb-v1.5.5` first:
 branch from it, implement R1–R3 with tests, CHANGELOG `[0.2.5]`, tag `v0.2.5`, community
-submission on the v1.5.5 line; then forward-port to `main` inside spec 066. This repository bumps
-`extension_config.cmake` (`GIT_TAG v0.2.5`), drops `METADATA_SCHEMA 'dbo'` from
-`test/sql/integration/attach_mssql.test` and extends it with the lake DDL/DML that fails today.
+submission on the v1.5.5 line; then forward-port to `main` inside spec 066. **Done**: v0.2.5 is
+tagged, community-extensions#2676 is open, and this repository's pin, tests and docs are on it —
+`extension_config.cmake` at `GIT_TAG v0.2.5`, `METADATA_SCHEMA 'dbo'` gone from
+`test/sql/integration/attach_mssql.test`, which now also pins the second-write failure.
 
 ### What v0.2.5 does not cover (from its CHANGELOG) — the constraint spec 004 inherits
 
@@ -146,9 +151,12 @@ and for `Execute` (`mssql_exec` drains its batch before returning), not fine for
 `GenerateFileColumnStatsCTEBody`, whose CTE lives inside a query that also joins the catalog's
 tables. Either that read stays a catalog scan (materialized by v0.2.5), or the whole file-listing
 query is pushed server-side as one `mssql_scan()`. Verified against the v0.2.5 build (2026-09-08):
-`mssql_scan` + catalog scan in one plan and two `mssql_scan`s both fail inside a transaction;
-`mssql_scan` inside a correlated subquery over a catalog table passes (the catalog scan drains
-first), and two catalog scans with `threads = 4` pass. mssql-extension PR #314 closes the gap on
+`mssql_scan` + catalog scan in one plan and two `mssql_scan`s both fail inside a transaction, at
+`threads` 1 and 4 and at any table size, while two *catalog* scans pass. Which shapes survive is
+decided by the plan, not by drain order: a subquery that decorrelates into a plain build→probe
+hash-join chain passes, and any shape that plans as `LEFT_DELIM_JOIN` fails, because the gate
+counts `mssql_catalog_scan` only and materializes nothing. Do not read a passing example as a
+rule. mssql-extension PR #314 closes the gap on
 the duckdb 2.0 line, and that is where this repository picks it up — with the 2.0 bump, not a
 backport. It does not block anything: on v1.5.5 the manager keeps `mssql_scan()` the sole source
 of its query, which is how the hot reads are shaped anyway.
@@ -156,10 +164,12 @@ of its query, which is how the hot reads are shaped anyway.
 ## Enforcement & security
 
 No new trust surface. R2 only ever buffers data the same statement would have streamed; R1 changes
-a default, not a permission. Across a version mismatch (this extension against mssql v0.2.4) the
-behavior is the documented one: the attach works, the first lake DDL fails with the message above,
-and README says `METADATA_SCHEMA 'dbo'` is required. Once the pin is v0.2.5, the deps gate in
-`src/mssql_ducklake_extension.cpp` can require that version.
+a default, not a permission. Across a version mismatch (this extension against an older mssql) the
+attach itself fails, with `Schema 'main' not found in MSSQL database` — true but not actionable,
+because the deps gate in `src/mssql_ducklake_extension.cpp` still only checks that *some* mssql is
+loaded. Until it checks the version (Follow-ups), the README carries the requirement and the
+`METADATA_SCHEMA 'dbo'` fallback, which matters while `INSTALL mssql FROM community` still serves
+v0.2.4.
 
 ## Testing
 
@@ -184,8 +194,10 @@ SELECT current_schema();
 dbo
 ```
 
-In this repository, after the pin bump: `attach_mssql.test` without `METADATA_SCHEMA`, plus
-`CREATE TABLE lake.t`, `INSERT`, `SELECT`, `ducklake_snapshots` — the smoke that motivated the spec.
+In this repository, after the pin bump — **landed**: `attach_mssql.test` attaches without
+`METADATA_SCHEMA`, creates a table, inserts an inlined row pair, reads it back through the lake and
+through `mssql_scan`, checks the inlined-table registration row, re-attaches, time-travels, and
+pins the second-write failure with a `statement error`.
 
 ## Alternatives considered
 
@@ -206,3 +218,20 @@ In this repository, after the pin bump: `attach_mssql.test` without `METADATA_SC
   `TransformInlinedData` (spec 004) has to cast it, or v0.2.5 exposes plain `VARCHAR` under
   `mssql_catalog_native_types = false`.
 - #140 (UPDATE without PK) is not needed: the manager's writes go through `mssql_exec`.
+- **The version gate this spec assigned to the pin bump is not done.** The deps gate checks only
+  that mssql is loaded, so a user on v0.2.4 (still what `INSTALL mssql FROM community` serves until
+  community-extensions#2676 lands) gets `Schema 'main' not found in MSSQL database` with nothing
+  naming the version. Deferred because the version is only legible at runtime: duckdb reports our
+  build's git SHA in `duckdb_extensions().extension_version`, and the clean semver comes from
+  `mssql_version()` — a query, which the load path cannot run safely. Two ways out, both spec 004
+  work: run it from a fresh `Connection` at load, or check once in `MSSQLMetadataManager` at the
+  first `ducklake:mssql:` attach, refusing only on a *known* older version. Until then README
+  states the requirement and the fallback.
+- **R3 shipped only inside R2** (see Status): a second batch on a streaming pinned connection still
+  tears the stream instead of failing cleanly. Nothing in this repository depends on it — the
+  manager keeps `mssql_scan()` the sole source of its query — but the R3 section above describes an
+  intent, not the code.
+- **`MSSQL_VARCHAR(MAX, 'collation')`** — filed as mssql-extension#321. Today a per-column MAX
+  target with a stated collation does not exist (the binder caps `n` at 8000/4000), so the manager
+  writes the inlined-table DDL itself and uses `COPY … (CREATE_TABLE false)`. When it lands on the
+  2.0 line, those columns become an explicit cast and the hand-written DDL goes away.

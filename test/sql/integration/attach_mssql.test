@@ -37,8 +37,10 @@ FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id
 WHERE s.name = ''dbo'' AND t.name LIKE ''ducklake%'';
 EXEC sp_executesql @sql;');
 
+# the same predicate the reset used - a catalog someone put in another schema is not ours to drop,
+# and counting it here would wedge every later run
 query I
-SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.tables WHERE name LIKE ''ducklake%''');
+SELECT count(*) FROM mssql_scan('srv', 'SELECT t.name FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''dbo'' AND t.name LIKE ''ducklake%''');
 ----
 0
 
@@ -82,16 +84,29 @@ SELECT * FROM lake.t ORDER BY i;
 1	a
 2	b
 
-# (the [_][0-9] keeps ducklake_inlined_data_tables, the catalog table listing them, out of the count)
+# the registration row ducklake reads to find that table (<table_id>_<schema_version>)
 query I
-SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.tables WHERE name LIKE ''ducklake_inlined_data[_][0-9]%''');
+SELECT table_name FROM mssql_scan('srv', 'SELECT table_name FROM dbo.ducklake_inlined_data_tables');
 ----
-1
+ducklake_inlined_data_1_1
 
-query I
-SELECT count(*) FROM ducklake_snapshots('lake');
+# The boundary today, and it is per table rather than per operation: the FIRST write to a table
+# commits, every later one fails. Once a table has stats, the commit batch UPDATEs
+# ducklake_table_stats; that UPDATE goes through duckdb's DML path, and mssql requires a primary key
+# for UPDATE/DELETE. A DELETE of an inlined row fails the same way on the inlined table itself.
+# The manager's Execute passthrough (the batch as raw T-SQL through mssql_exec) is what removes that
+# path - research note §4, spec 004.
+statement error
+INSERT INTO lake.t VALUES (3, 'c');
 ----
-3
+Table 'dbo.ducklake_table_stats' has no primary key
+
+# the failed commit rolled back whole: the rows, the snapshot and the stats are as they were
+query II
+SELECT * FROM lake.t ORDER BY i;
+----
+1	a
+2	b
 
 statement ok
 DETACH lake;
@@ -102,7 +117,15 @@ statement ok
 ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/lake');
 
 query I
-SELECT count(*) FROM ducklake_snapshots('lake');
+SELECT snapshot_id FROM ducklake_snapshots('lake') ORDER BY 1;
+----
+0
+1
+2
+
+# and they are physically in dbo, where this attach found them
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT snapshot_id FROM dbo.ducklake_snapshot');
 ----
 3
 
@@ -126,11 +149,9 @@ ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake2 (DATA_PATH '__TEST_D
 statement ok
 DETACH lake;
 
-# TODO(specs/004): a commit that writes a data file (an insert past the inlining limit), UPDATE and
-# DELETE still fail on the generic manager: their commit batch carries an UPDATE of
-# ducklake_table_stats, runs through duckdb's DML path, and mssql's UPDATE/DELETE needs a primary
-# key ("Table 'dbo.ducklake_table_stats' has no primary key"). The manager's Execute passthrough
-# (mssql_exec, raw T-SQL server-side) is what removes that path - research note §4.
+# TODO(specs/004): with the Execute passthrough the second-write error pinned above turns green, and
+# this file grows the rest of the cycle - UPDATE, DELETE (both inlined and file-backed), an insert
+# past the inlining limit, expire/cleanup, and the inlining type matrix (research note §5).
 
 statement ok
 DETACH srv;
