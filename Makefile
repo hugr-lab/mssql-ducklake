@@ -26,28 +26,34 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 # --- integration environment (docker/docker-compose.yml) ----------------------------------------
 # One SQL Server holding the DuckLake catalog. `.env` (from .env.example) overrides the defaults;
-# the same variables feed the compose file and the connection string the tests gate on.
+# the same variables feed the compose file and the connection string the tests gate on. Make keeps
+# the quotes a dotenv habit adds (`X="y"` is the value `"y"` to make), so strip them here.
 -include .env
-MSSQL_DUCKLAKE_HOST ?= localhost
-MSSQL_DUCKLAKE_PORT ?= 7433
-MSSQL_DUCKLAKE_USER ?= sa
-MSSQL_DUCKLAKE_PASS ?= TestPassword1
-MSSQL_DUCKLAKE_DB ?= lake_meta
-export MSSQL_DUCKLAKE_PORT MSSQL_DUCKLAKE_PASS
+unquote = $(patsubst "%",%,$(patsubst '%',%,$(1)))
+MSSQL_DUCKLAKE_HOST := $(call unquote,$(if $(MSSQL_DUCKLAKE_HOST),$(MSSQL_DUCKLAKE_HOST),localhost))
+MSSQL_DUCKLAKE_PORT := $(call unquote,$(if $(MSSQL_DUCKLAKE_PORT),$(MSSQL_DUCKLAKE_PORT),7433))
+MSSQL_DUCKLAKE_PASS := $(call unquote,$(if $(MSSQL_DUCKLAKE_PASS),$(MSSQL_DUCKLAKE_PASS),TestPassword1))
+MSSQL_DUCKLAKE_DB := $(call unquote,$(if $(MSSQL_DUCKLAKE_DB),$(MSSQL_DUCKLAKE_DB),lake_meta))
+MSSQL_DUCKLAKE_IMAGE := $(call unquote,$(MSSQL_DUCKLAKE_IMAGE))
 
 # The metadata connection string, ADO form: the tests put it behind the `ducklake:mssql:` prefix,
 # and it is that `mssql:` (not `mssql://`, which duckdb deliberately leaves alone) that duckdb strips
-# to pick the mssql storage for the catalog ATTACH.
-MSSQL_DUCKLAKE_TEST_DSN ?= Server=$(MSSQL_DUCKLAKE_HOST),$(MSSQL_DUCKLAKE_PORT);Database=$(MSSQL_DUCKLAKE_DB);User Id=$(MSSQL_DUCKLAKE_USER);Password=$(MSSQL_DUCKLAKE_PASS)
+# to pick the mssql storage for the catalog ATTACH. The login is sa - the only one the container has.
+MSSQL_DUCKLAKE_TEST_DSN ?= Server=$(MSSQL_DUCKLAKE_HOST),$(MSSQL_DUCKLAKE_PORT);Database=$(MSSQL_DUCKLAKE_DB);User Id=sa;Password=$(MSSQL_DUCKLAKE_PASS)
 
 DOCKER_COMPOSE := docker compose -f $(PROJ_DIR)docker/docker-compose.yml
 
 .PHONY: docker-up docker-down docker-status test-integration
-# --wait would treat the one-shot init container as a failure; wait on the server, then run the
-# init in the foreground so its output (and exit code) land here
+# only the docker goals see the variables (the password stays out of every build process's
+# environment); the assignment form is the one make 3.81 (macOS) accepts for target-specific exports
+docker-up docker-down docker-status: export MSSQL_DUCKLAKE_PORT := $(MSSQL_DUCKLAKE_PORT)
+docker-up docker-down docker-status: export MSSQL_DUCKLAKE_PASS := $(MSSQL_DUCKLAKE_PASS)
+docker-up docker-down docker-status: export MSSQL_DUCKLAKE_DB := $(MSSQL_DUCKLAKE_DB)
+docker-up docker-down docker-status: export MSSQL_DUCKLAKE_IMAGE := $(MSSQL_DUCKLAKE_IMAGE)
+# `run --rm` starts sqlserver, waits for its health check (depends_on), streams the init's output,
+# propagates its exit code and removes the one-shot container
 docker-up:
-	$(DOCKER_COMPOSE) up -d --wait sqlserver
-	$(DOCKER_COMPOSE) up --no-log-prefix sqlserver-init
+	$(DOCKER_COMPOSE) run --rm sqlserver-init
 
 docker-down:
 	$(DOCKER_COMPOSE) down

@@ -43,22 +43,6 @@ jobs:
   build-test-linux:
     name: Build + test (linux_amd64)
     runs-on: ubuntu-24.04
-    services:
-      # the DuckLake catalog server behind test/sql/integration (docker/docker-compose.yml is the
-      # local twin); it starts bare, the seed step below creates lake_meta with the same script
-      sqlserver:
-        image: mcr.microsoft.com/mssql/server:2025-latest
-        env:
-          ACCEPT_EULA: Y
-          MSSQL_SA_PASSWORD: TestPassword1
-        ports:
-          - 1433:1433
-        options: >-
-          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P TestPassword1 -C -Q 'SELECT 1' || exit 1"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-          --health-start-period 30s
     env:
       GEN: ninja
       CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -72,6 +56,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build ccache
+
+      # the DuckLake catalog server behind test/sql/integration - the same compose file, image pin,
+      # init script and connection string a developer box uses (the Makefile composes the DSN once).
+      # Pulled and booted here, in the background, so it overlaps the build instead of preceding it
+      - name: Start the SQL Server (background)
+        run: docker compose -f docker/docker-compose.yml up -d sqlserver
 
       # the lint job checks format against the repo's own .clang-format copy; this job has the
       # submodules, so it is the one that can tell when that copy drifts from duckdb's
@@ -116,24 +106,19 @@ jobs:
         if: always()
         run: scripts/ci/prune_vcpkg_cache.sh
 
-      # the image ships sqlcmd (the health check above is that binary), so seed from inside the
-      # container rather than installing mssql-tools on the runner (mssql-extension #199)
-      - name: Seed the catalog database
-        env:
-          SQLSERVER_ID: ${{ job.services.sqlserver.id }}
-        run: |
-          docker cp docker/init/sqlserver.sql "$SQLSERVER_ID:/tmp/sqlserver.sql"
-          docker exec "$SQLSERVER_ID" /opt/mssql-tools18/bin/sqlcmd \
-            -S localhost -U sa -P TestPassword1 -C -b -i /tmp/sqlserver.sql
-
       # the floor keeps a suite that silently skipped everything (a `require` miss) from passing;
-      # this runner has the SQL Server, so the integration file must have run, not skipped
-      - name: Unit + integration suites
-        env:
-          MSSQL_DUCKLAKE_TEST_DSN: Server=localhost,1433;Database=lake_meta;User Id=sa;Password=TestPassword1
+      # the integration file skips here by design (no DSN) and runs in the next step
+      - name: Unit suites
         run: |
           build/release/test/unittest 'test/sql/*' 2>&1 | tee suite.log
-          scripts/ci/assert_ran.sh suite.log 3 30 'require-env MSSQL_DUCKLAKE_TEST_DSN'
+          scripts/ci/assert_ran.sh suite.log 2 6
+
+      # waits for the server started above, runs the init, then the server-backed suite under its own
+      # floor (the Makefile's, which forbids the require-env skip on a runner that has the server)
+      - name: Integration suite (SQL Server)
+        run: |
+          make docker-up
+          make test-integration
 
       - name: Upload extension artifact
         if: github.event_name != 'pull_request'

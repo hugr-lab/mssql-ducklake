@@ -2,7 +2,7 @@
 
 **DuckLake on SQL Server, batteries included.** This extension **compiles ducklake in** — the whole
 untouched pinned source — and adds a `MSSQLMetadataManager` beside the built-in postgres/sqlite
-ones, so `ATTACH 'ducklake:mssql://…'` keeps the DuckLake catalog in SQL Server through the `mssql`
+ones, so `ATTACH 'ducklake:mssql:…'` keeps the DuckLake catalog in SQL Server through the `mssql`
 extension. One image means the manager registry is ours by construction; the price is **mutual
 exclusion with stock ducklake** (same functions, same ATTACH prefix — one or the other, never
 both). `mssql` itself ships as today, untouched; nothing here links it (the manager only generates
@@ -50,8 +50,8 @@ test/sql/
   mssql_ducklake.test            # embedded surface + a full local-file lake cycle (no server)
   deps_gate.test                 # the mssql refusal, then success beside mssql
   integration/                   # server-backed suite, gated on MSSQL_DUCKLAKE_TEST_DSN (make test-integration)
-docker/                          # the integration SQL Server: compose (everything named mssql-ducklake-*,
-                                 #   port 7433) + init/sqlserver.sql (creates lake_meta); .env.example has the knobs
+docker/                          # the integration SQL Server: compose (everything named mssql-ducklake-*, port
+                                 #   7433, pinned image) + init/sqlserver.sql (catalog db + test marker); .env.example
 scripts/ci/                      # smoke_load.sh (incl. the stock-ducklake exclusion), assert_ran.sh, ...
 specs/                           # one lightweight spec per feature, NNN-slug/spec.md (see specs/README.md)
 design/                          # LOCAL, gitignored: numbered research topics NNN-topic/

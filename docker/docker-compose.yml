@@ -1,43 +1,53 @@
 # The integration environment: one SQL Server that holds the DuckLake catalog (the metadata side
 # of `ATTACH 'ducklake:mssql:...'`). Layout after hugr-lab/duckdb-acl and mssql-extension.
 #
-# Usage (from the repo root):
+# Usage (from the repo root; the Makefile is the one place the variables are read from):
 #   cp .env.example .env         # once; adjust if the port or password clash with something local
-#   make docker-up               # start, wait for healthy, run the init container (creates lake_meta)
+#   make docker-up               # start, wait for healthy, run the init (creates the catalog database)
 #   make docker-status
-#   make docker-down             # stop (keeps the data volume); `docker compose ... down -v` drops it
+#   make docker-down             # stop, keeps the data volume; to drop it:
+#   docker compose -f docker/docker-compose.yml down -v
 #
 # Every name is explicit and prefixed `mssql-ducklake-`: this machine also runs the SQL Servers of
 # mssql-extension (mssql-dev, :1433), duckdb-acl (acl-sqlserver, :6434) and hugr (hugr-mssql,
 # :18033), and compose would otherwise derive `docker_*` names from this directory - the same
 # names those repos' `docker/` folders derive, so it would recreate THEIR containers as ours.
+#
+# The image is pinned like every other piece of the stack (CLAUDE.md): a floating `2025-latest`
+# would move under CI (which pulls every run) but not under a developer box (which never re-pulls).
 name: mssql-ducklake
 
 services:
   sqlserver:
     # SQL Server 2025 (x64 emulation on ARM64 Macs)
-    image: mcr.microsoft.com/mssql/server:2025-latest
+    image: ${MSSQL_DUCKLAKE_IMAGE:-mcr.microsoft.com/mssql/server:2025-CU8-ubuntu-24.04}
     container_name: mssql-ducklake-sqlserver
     environment:
       - ACCEPT_EULA=Y
       - MSSQL_SA_PASSWORD=${MSSQL_DUCKLAKE_PASS:-TestPassword1}
+      # the catalog server shares a machine with a duckdb build (CI) or an IDE; cap its buffer pool
+      - MSSQL_MEMORY_LIMIT_MB=2048
     ports:
       - "${MSSQL_DUCKLAKE_PORT:-7433}:1433"
     volumes:
       - sqlserver-data:/var/opt/mssql
     healthcheck:
+      # runs inside the container: the password comes from its own environment, quoted
       test:
         - CMD-SHELL
-        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P ${MSSQL_DUCKLAKE_PASS:-TestPassword1} -C -Q 'SELECT 1' || exit 1
+        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -C -Q 'SELECT 1' || exit 1
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 30s
+      start_period: 40s
+      start_interval: 2s
 
-  # one-shot init: creates the catalog database once the server is healthy (idempotent; CI applies
-  # the same script to its service container with docker exec)
+  # one-shot init: creates the catalog database (name from MSSQL_DUCKLAKE_DB) and the marker table the
+  # tests check before they reset anything. Run it with `docker compose run --rm sqlserver-init`
+  # (what `make docker-up` does): that starts sqlserver, waits for its health check through
+  # depends_on, propagates sqlcmd's exit code and removes the container. Idempotent; CI runs the same.
   sqlserver-init:
-    image: mcr.microsoft.com/mssql/server:2025-latest
+    image: ${MSSQL_DUCKLAKE_IMAGE:-mcr.microsoft.com/mssql/server:2025-CU8-ubuntu-24.04}
     container_name: mssql-ducklake-sqlserver-init
     depends_on:
       sqlserver:
@@ -47,11 +57,13 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        echo "mssql-ducklake: applying docker/init/sqlserver.sql ..."
-        /opt/mssql-tools18/bin/sqlcmd -S sqlserver -U sa -P "$$MSSQL_SA_PASSWORD" -C -b -i /init/sqlserver.sql
+        echo "mssql-ducklake: applying docker/init/sqlserver.sql (DB=$$MSSQL_DUCKLAKE_DB) ..."
+        /opt/mssql-tools18/bin/sqlcmd -S sqlserver -U sa -P "$$MSSQL_SA_PASSWORD" -C -b \
+          -v DB="$$MSSQL_DUCKLAKE_DB" -i /init/sqlserver.sql
         echo "mssql-ducklake: init complete."
     environment:
       - MSSQL_SA_PASSWORD=${MSSQL_DUCKLAKE_PASS:-TestPassword1}
+      - MSSQL_DUCKLAKE_DB=${MSSQL_DUCKLAKE_DB:-lake_meta}
 
 volumes:
   sqlserver-data:

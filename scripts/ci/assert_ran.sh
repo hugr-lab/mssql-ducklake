@@ -7,7 +7,7 @@
 #   scripts/ci/assert_ran.sh <log> <min_test_cases> <min_assertions> [forbidden-skip-regex]
 #
 # Reads the unittest summary line "All tests passed (N skipped tests, A assertions in C test cases)"
-# (singular "test case" when C is 1 - a one-file suite is exactly what test-integration runs)
+# (singular "assertion"/"test case" when the count is 1 - a one-file suite is what test-integration runs)
 # from <log>, requires C >= min_test_cases and A >= min_assertions, and fails if any line of the
 # "Skipped tests for the following reasons:" block matches the regex (e.g. `require-env MSSQL_DUCKLAKE_TEST_DSN`
 # on a job that provides SQL Server). Also fails on any `SKIP:` line - the e2e scripts' own signal.
@@ -24,8 +24,22 @@ fi
 if [ "$min_cases" -eq 0 ] && [ "$min_assertions" -eq 0 ]; then
 	exit 0 # an e2e log: the SKIP check above is the whole floor
 fi
-summary="$(grep -oE '[0-9]+ assertions in [0-9]+ test cases?' "$log" | tail -1 || true)"
+# Catch pluralises both words: "1 assertion in 1 test case" on a one-file, one-statement run
+summary="$(grep -oE '[0-9]+ assertions? in [0-9]+ test cases?' "$log" | tail -1 || true)"
 if [ -z "$summary" ]; then
+	# every file skipped: duckdb's Catch prints "All tests were skipped (total skipped N)" and no
+	# assertion summary - name the skip reason (the forbidden one if it matches) rather than asking
+	# whether the suite ran
+	if grep -q 'All tests were skipped' "$log"; then
+		skipped="$(sed -n '/Skipped tests for the following reasons:/,$p' "$log" | grep -v 'Skipped tests' || true)"
+		if [ -n "$forbidden" ] && grep -qE "$forbidden" <<<"$skipped"; then
+			echo "assert_ran: a skip this runner must not have:" >&2
+		else
+			echo "assert_ran: every test file skipped itself:" >&2
+		fi
+		echo "$skipped" >&2
+		exit 1
+	fi
 	# a failed suite prints a different summary ("test cases: N | M passed | K failed"); say so rather
 	# than asking whether it ran at all
 	failed="$(grep -oE 'test cases:\s+[0-9]+\s+\|\s+[0-9]+ passed\s+\|\s+[0-9]+ failed' "$log" | tail -1 || true)"
