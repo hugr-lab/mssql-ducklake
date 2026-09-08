@@ -43,7 +43,8 @@ void LoadInternal(ExtensionLoader &loader) {
 	// dlsym into the loaded ducklake image in a loadable one.
 
 	loader.SetDescription("DuckLake metadata catalog on SQL Server (bridge between ducklake and mssql)");
-	loader.RegisterFunction(ScalarFunction("mssql_ducklake_version", {}, LogicalType::VARCHAR, MssqlDucklakeVersionFun));
+	loader.RegisterFunction(
+	    ScalarFunction("mssql_ducklake_version", {}, LogicalType::VARCHAR, MssqlDucklakeVersionFun));
 }
 
 } // namespace
