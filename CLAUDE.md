@@ -23,7 +23,7 @@ model, the full manager plan §7: transpiler, keys + filtered indexes, server-si
   | --- | --- | --- |
   | duckdb | submodule `duckdb/` | tag `v1.5.5` |
   | ducklake | submodule `ducklake/` (EMBEDDED — compiled into the extension) | branch `v1.5-variegata` (SHA in the submodule) |
-  | mssql | `extension_config.cmake` (runtime pair, test loadable) | tag `v0.2.4` |
+  | mssql | `extension_config.cmake` (runtime pair, test loadable) | tag `v0.2.5` |
   | extension-ci-tools | submodule `extension-ci-tools/` | branch `v1.5.5` |
   | CI reusable workflows | `.github/workflows/distribution.yml` | `@v1.5.5`, `duckdb_version: v1.5.5` |
 
@@ -130,15 +130,17 @@ rewrites anything else and the distribution's format check fails on it.
   serves postgres-cataloged and mssql-cataloged lakes in the same process.
 - **Attach syntax**: `ducklake:mssql:<ADO connection string>` — duckdb strips `mssql:` as an
   extension prefix, but deliberately not `mssql://`, so the URI form needs `META_TYPE 'mssql'`.
-  `METADATA_SCHEMA 'dbo'` is required until the mssql catalog answers its real default schema
-  (it returns duckdb's `main`; an mssql-extension fix).
-- **What the generic manager gets on a live server** (2026-09-08): ATTACH initializes and re-opens
-  a catalog in SQL Server, but DDL/DML fail — ducklake's catalog-load reads with decorrelated
-  subqueries (LEFT_DELIM_JOIN over `ducklake_view`/`ducklake_tag`) keep two mssql scans open on
-  the one connection pinned to the transaction (the scan runs its batch at source init) →
-  "connection not in Idle state". Plain joins pass; the same query passes in autocommit. Phase 1
-  therefore needs mssql v0.2.5 (spec 003: materialize multi-scan plans on a pinned connection,
-  default schema `dbo`); the manager's own reads via `mssql_scan` stay the perf story (research note §9).
+  The catalog lands in `dbo` (mssql ≥ v0.2.5 answers its real default schema; spec 003).
+- **What the generic manager gets on a live server with mssql v0.2.5** (2026-09-08): ATTACH
+  initializes/re-opens the catalog, CREATE TABLE, inlined INSERT, SELECT, snapshots, time travel
+  all work (v0.2.5 materializes multi-scan plans on the transaction's pinned connection, spec 003).
+  A commit that writes a data file, UPDATE and DELETE fail: the commit batch carries an UPDATE of
+  `ducklake_table_stats`, runs through duckdb's DML path, and mssql's UPDATE/DELETE needs a PK —
+  exactly what the manager's Execute passthrough removes (research note §4; spec 004).
+- **`mssql_scan()` on the pinned connection**: v0.2.5 materializes only *catalog* scans; a plan
+  mixing `mssql_scan()` with a catalog scan, or two `mssql_scan()`s, inside a transaction still
+  fails (verified). The fix (mssql-extension #314) arrives with the duckdb 2.0 line; not a
+  blocker — on v1.5.5 the manager uses `mssql_scan()` only as the sole source of a query.
 
 ## Distribution
 

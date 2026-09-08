@@ -9,8 +9,7 @@ manager, speaking to the server through the
 INSTALL mssql FROM community;
 INSTALL mssql_ducklake FROM community;   -- once published
 LOAD mssql_ducklake;
-ATTACH 'ducklake:mssql:Server=host,1433;Database=lake_meta;User Id=…;Password=…' AS lake
-    (DATA_PATH 's3://…', METADATA_SCHEMA 'dbo');
+ATTACH 'ducklake:mssql:Server=host,1433;Database=lake_meta;User Id=…;Password=…' AS lake (DATA_PATH 's3://…');
 ```
 
 The extension carries the complete, unmodified DuckLake source at a pinned release and registers a
@@ -24,17 +23,18 @@ exactly as stock, plus SQL Server as a metadata catalog.
 > `mssql_ducklake` **before** the first `ATTACH 'ducklake:…'`, otherwise DuckDB autoloads the stock
 > extension for that prefix.
 
-**Status: experimental.** The embedded-ducklake scaffold, gates and CI are in place, and an ATTACH
-already initializes (and re-opens) a DuckLake catalog in SQL Server. DDL and DML on the lake are
-blocked on two fixes in the mssql extension ([spec 003](specs/003-mssql-extension-v0.2.5/spec.md),
-v0.2.5) and then on the SQL Server metadata manager — see [`specs/`](specs/README.md). If this
+**Status: experimental.** The embedded-ducklake scaffold, gates and CI are in place. With mssql
+v0.2.5 ([spec 003](specs/003-mssql-extension-v0.2.5/spec.md)) an ATTACH initializes and re-opens a
+DuckLake catalog in SQL Server, and DDL plus inlined inserts already work through DuckLake's generic
+manager; commits that write data files, UPDATE and DELETE wait for the SQL Server metadata manager
+(its server-side commit batch), which is being implemented — see [`specs/`](specs/README.md). If this
 extension finds users, the manager is intended to be contributed upstream to DuckLake (the postgres
 metadata manager is the in-tree precedent), after which this extension becomes unnecessary.
 
 ## Versions
 
 One release line, bumped together: duckdb `v1.5.5`, ducklake `v1.5-variegata` (embedded), mssql
-`v0.2.4`. The embedded ducklake bumps on this repository's schedule; the pin is always named in the
+`v0.2.5`. The embedded ducklake bumps on this repository's schedule; the pin is always named in the
 release notes.
 
 ## Building
@@ -79,12 +79,10 @@ DuckDB strips the `mssql:` prefix and hands the rest to the mssql extension. The
 type spelled out, because DuckDB deliberately does not treat `mssql://` as a prefix:
 
 ```sql
-ATTACH 'ducklake:mssql://user:pass@host:1433/lake_meta' AS lake
-    (DATA_PATH 's3://…', METADATA_SCHEMA 'dbo', META_TYPE 'mssql');
+ATTACH 'ducklake:mssql://user:pass@host:1433/lake_meta' AS lake (DATA_PATH 's3://…', META_TYPE 'mssql');
 ```
 
-`METADATA_SCHEMA 'dbo'` is required for now: asked for its default schema, the mssql catalog
-answers DuckDB's `main`.
+The catalog tables live in the connection's default schema (`dbo`); `METADATA_SCHEMA` picks another.
 
 ## License
 
