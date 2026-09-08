@@ -9,7 +9,7 @@
             "options": { "cwd": "${workspaceFolder}", "env": { "GEN": "ninja" } },
             "group": "build",
             "problemMatcher": ["$gcc"],
-            "detail": "Build duckdb + ducklake + mssql + the bridge (release)"
+            "detail": "Build duckdb + mssql + mssql_ducklake with the embedded ducklake (release)"
         },
         {
             "label": "Build Debug",
@@ -19,7 +19,7 @@
             "options": { "cwd": "${workspaceFolder}", "env": { "GEN": "ninja" } },
             "group": { "kind": "build", "isDefault": true },
             "problemMatcher": ["$gcc"],
-            "detail": "Build duckdb + ducklake + mssql + the bridge (debug, with symbols)"
+            "detail": "Build duckdb + mssql + mssql_ducklake with the embedded ducklake (debug, with symbols)"
         },
         {
             "label": "Clean",

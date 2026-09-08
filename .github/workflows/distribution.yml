@@ -27,8 +27,8 @@ jobs:
       extension_name: mssql_ducklake
       duckdb_version: v1.5.5
       ci_tools_version: v1.5.5
-      # wasm is out: the bridge's loadable path reaches the co-loaded ducklake via dlopen/dlsym
-      # (specs/001), and mssql (raw TDS sockets) does not exist there either
+      # wasm is out: mssql (raw TDS sockets) does not exist there, and the manager is nothing
+      # without it
       exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
 
   code-quality-check:

@@ -1,0 +1,91 @@
+# name: test/sql/integration/attach_mssql.test
+# description: A DuckLake catalog in SQL Server: initialize, load, re-attach (specs/002, step 1)
+# group: [mssql_ducklake_integration]
+
+# The server-backed suite: `make docker-up` + `make test-integration` provide the connection string
+# (docker/docker-compose.yml, .env.example); without it the file skips. CI's floor forbids the skip.
+require-env MSSQL_DUCKLAKE_TEST_DSN
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
+
+# a side door into the catalog database, for the reset and for looking at what ducklake wrote
+statement ok
+ATTACH '${MSSQL_DUCKLAKE_TEST_DSN}' AS srv (TYPE mssql);
+
+# a fresh catalog per run: the lake below must be a NEW DuckLake (its data path is this run's test
+# directory, and an existing catalog pins the path it was created with)
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id
+WHERE s.name = ''dbo'' AND t.name LIKE ''ducklake%'';
+EXEC sp_executesql @sql;');
+
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.tables WHERE name LIKE ''ducklake%''');
+----
+0
+
+# `ducklake:mssql:<ADO connection string>`: duckdb strips the `mssql:` prefix and picks the mssql
+# storage for the catalog ATTACH (the `mssql://` URI form is deliberately not a prefix to duckdb -
+# it needs META_TYPE 'mssql' instead). METADATA_SCHEMA is required for now: the mssql catalog
+# answers duckdb's default 'main' when ducklake asks for its default schema, not 'dbo'.
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/lake', METADATA_SCHEMA 'dbo');
+
+# a new DuckLake was initialized in SQL Server: the whole catalog schema, its metadata, snapshot 0
+query I
+SELECT count(*) > 20 FROM mssql_scan('srv', 'SELECT name FROM sys.tables WHERE name LIKE ''ducklake%''');
+----
+true
+
+query II
+SELECT key, value FROM mssql_scan('srv', 'SELECT [key], [value] FROM dbo.ducklake_metadata WHERE [key] IN (''version'', ''encrypted'')') ORDER BY key;
+----
+encrypted	false
+version	1.0
+
+query I
+SELECT snapshot_id FROM ducklake_snapshots('lake');
+----
+0
+
+statement ok
+DETACH lake;
+
+# the second attach finds the existing catalog and loads it (no re-initialization)
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/lake', METADATA_SCHEMA 'dbo');
+
+query I
+SELECT count(*) FROM ducklake_snapshots('lake');
+----
+1
+
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT snapshot_id FROM dbo.ducklake_snapshot');
+----
+1
+
+# an existing catalog pins its data path
+statement error
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake2 (DATA_PATH '__TEST_DIR__/elsewhere', METADATA_SCHEMA 'dbo');
+----
+<REGEX>:.*does not match existing data path.*
+
+statement ok
+DETACH lake;
+
+# TODO(specs/003, 004): DDL/DML on the lake (CREATE TABLE, INSERT, ...) fails on mssql v0.2.4: the
+# catalog load runs a decorrelated subquery with two mssql scans, and the scan executes its batch at
+# source initialization on the one connection pinned to the transaction - the second source finds
+# it streaming ("connection not in Idle state"). Spec 003 (mssql v0.2.5) materializes such scans;
+# then this file drops METADATA_SCHEMA and grows the lake DDL/DML cycle.
+
+statement ok
+DETACH srv;

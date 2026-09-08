@@ -43,6 +43,22 @@ jobs:
   build-test-linux:
     name: Build + test (linux_amd64)
     runs-on: ubuntu-24.04
+    services:
+      # the DuckLake catalog server behind test/sql/integration (docker/docker-compose.yml is the
+      # local twin); it starts bare, the seed step below creates lake_meta with the same script
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2025-latest
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: TestPassword1
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P TestPassword1 -C -Q 'SELECT 1' || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 30s
     env:
       GEN: ninja
       CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -100,11 +116,24 @@ jobs:
         if: always()
         run: scripts/ci/prune_vcpkg_cache.sh
 
-      # the floor keeps a suite that silently skipped everything (a `require` miss) from passing
-      - name: Unit suites
+      # the image ships sqlcmd (the health check above is that binary), so seed from inside the
+      # container rather than installing mssql-tools on the runner (mssql-extension #199)
+      - name: Seed the catalog database
+        env:
+          SQLSERVER_ID: ${{ job.services.sqlserver.id }}
+        run: |
+          docker cp docker/init/sqlserver.sql "$SQLSERVER_ID:/tmp/sqlserver.sql"
+          docker exec "$SQLSERVER_ID" /opt/mssql-tools18/bin/sqlcmd \
+            -S localhost -U sa -P TestPassword1 -C -b -i /tmp/sqlserver.sql
+
+      # the floor keeps a suite that silently skipped everything (a `require` miss) from passing;
+      # this runner has the SQL Server, so the integration file must have run, not skipped
+      - name: Unit + integration suites
+        env:
+          MSSQL_DUCKLAKE_TEST_DSN: Server=localhost,1433;Database=lake_meta;User Id=sa;Password=TestPassword1
         run: |
           build/release/test/unittest 'test/sql/*' 2>&1 | tee suite.log
-          scripts/ci/assert_ran.sh suite.log 2 6
+          scripts/ci/assert_ran.sh suite.log 3 30 'require-env MSSQL_DUCKLAKE_TEST_DSN'
 
       - name: Upload extension artifact
         if: github.event_name != 'pull_request'
@@ -163,6 +192,8 @@ jobs:
         if: always()
         run: scripts/ci/prune_vcpkg_cache.sh
 
+      # no docker on the macOS runner: the integration file skips here (its require-env), the Linux
+      # job is the one that must run it
       - name: Unit suites
         run: |
           build/release/test/unittest 'test/sql/*' 2>&1 | tee suite.log
