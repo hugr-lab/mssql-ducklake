@@ -57,13 +57,20 @@ call; after that ducklake drives our factory and virtuals through the object's v
 came late, the generic manager has silently created a schema without our indexes/procedure. Load
 detects an existing `ducklake:mssql` attach and warns.
 
-Bootstrap a user runs:
+Bootstrap a user runs (the target shape, with DuckDB 2.0's external extension repositories):
 
 ```sql
 INSTALL ducklake FROM hugr;  INSTALL mssql FROM hugr;  INSTALL mssql_ducklake FROM hugr;
 LOAD mssql_ducklake;          -- autoloads deps, gates the version, registers the manager
 ATTACH 'ducklake:mssql://…?database=lake_meta' AS lake (DATA_PATH 's3://…');
 ```
+
+**Distribution reality at v1.5.5**: external extension repositories are a DuckDB 2.0 feature, so
+for now the channel is the community extensions repository (`INSTALL mssql FROM community;
+INSTALL mssql_ducklake FROM community;` once published; ducklake from the official repo). The
+paired ducklake build with the exported `Register` ships as a release artifact of this repo and is
+loaded explicitly; with a stock ducklake the bridge refuses at its gate (the matrix below). When
+2.0 lands, the hugr repository serves all three and the bootstrap above becomes literal.
 
 Support matrix: hugr repo (all three) — full experience; a static worker build — full (bridge linked
 in, direct `Register`); stock ducklake from the core repo — registry unreachable, the bridge refuses
