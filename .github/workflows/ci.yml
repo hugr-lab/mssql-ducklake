@@ -22,9 +22,10 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
-      # the project standard is duckdb's pinned formatter (scripts/format.py: clang_format==11.0.1);
-      # the runner's default clang-format is newer and reflows the code differently - and a bare
-      # `pip install` left the system binary first in PATH, so the pinned one is called by full path
+      # the project standard is duckdb's pinned formatter (scripts/format.py: clang_format==11.0.1),
+      # called by full path so no runner binary can shadow it. NB `.clang-format` must be a real
+      # file: the template ships it as a symlink into the duckdb submodule, and this job checks out
+      # no submodules - a dangling config makes clang-format silently fall back to LLVM defaults
       - name: Install duckdb's pinned clang-format
         run: |
           python3 -m venv /tmp/cf
@@ -55,6 +56,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build ccache
+
+      # the lint job checks format against the repo's own .clang-format copy; this job has the
+      # submodules, so it is the one that can tell when that copy drifts from duckdb's
+      - name: clang-format config is in sync with duckdb
+        run: diff <(tail -n +2 .clang-format) duckdb/.clang-format
 
       # dependencies (roaring from ducklake, openssl/simdutf from mssql) come from vcpkg via the
       # merged manifests of the loaded extensions - the standard duckdb-extension dependency flow
