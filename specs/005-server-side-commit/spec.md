@@ -464,10 +464,30 @@ that copying the postgres manager's overrides was not worth doing. That number c
 catalog entry lookup, and materialising the scan inside the transaction - and is invisible there. I
 measured the wrong side of the wire and drew the wrong conclusion from it.
 
-So `GetLatestSnapshotQuery` is worth doing, on the same grounds the postgres manager does it, and
-the stats CTE would be worth more still. The blocker for the CTE stands: several `mssql_scan` calls
-in one plan is the case v0.2.5 cannot materialise inside a transaction, which waits for the duckdb
-2.0 line. The latest-snapshot query is a sole source and can be done now.
+So `GetLatestSnapshotQuery` is worth doing, on the same grounds the postgres manager does it. It is
+now done, and measured on a 200-table catalog, A/B on the same data with the build swapped under it:
+
+| | first read | mean of five repeats |
+| --- | ---: | ---: |
+| through `mssql_scan` | 0.253s | 0.0050s |
+| through the catalog | 0.267s | 0.0056s |
+
+**About ten percent of a repeat read, and inside the noise on the first** - much less than the 4x the
+per-query comparison suggested, because this is one of roughly four catalog queries a read makes and
+a repeat read on this catalog is 5ms rather than the 26ms the production one costs. The saving
+should grow with the catalog, since that is what makes the catalog path expensive, but that is an
+expectation and not a measurement.
+
+**The stats CTE cannot follow, and `MATERIALIZED` does not rescue it.** DuckLake already emits the
+hint itself - `AS MATERIALIZED` when a CTE is referenced more than once, `AS NOT MATERIALIZED`
+otherwise - so the obvious idea is to force materialisation and let the scans run one at a time.
+Tried, at the top level and nested as `WITH x AS (WITH s AS MATERIALIZED (...) SELECT * FROM s)`:
+both fail inside a transaction with *connection not in Idle state*, and both succeed outside one.
+
+The reason is that `mssql_scan` runs its query **at bind time**, to learn its result columns - the
+same point at which the metadata is loaded. Every source of a statement is bound before any of them
+is executed, so two scans in one statement collide however the plan later chooses to evaluate them.
+Materialisation reorders execution, and the constraint is not in execution.
 
 The read path therefore has two separate causes, not one:
 

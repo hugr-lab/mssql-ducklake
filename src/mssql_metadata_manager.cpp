@@ -615,6 +615,25 @@ static bool SkipSnapshotFetchEnabled() {
 	return enabled;
 }
 
+string MSSQLMetadataManager::GetLatestSnapshotQuery() const {
+	// Read through `mssql_scan` instead of through the attached catalog, which is what the postgres
+	// manager does with this same query. Measured (specs/005 D13), the same rows cost 10.0ms through
+	// DuckDB's catalog against 2.5ms as a direct scan: binding, the catalog entry lookup and
+	// materialising the scan inside the transaction, none of which the direct path pays. It is not
+	// the wire - a trivial round trip here is 1.0ms against postgres's 2.3ms.
+	//
+	// Only a query shaped like this one can take the direct path on v0.2.5. The extension
+	// materialises a catalog scan but not a plan holding two `mssql_scan`s inside a transaction, so
+	// the direct form is available exactly where the scan is the SOLE source of its query. This one
+	// is; the file-column-stats CTE is not, and waits for the duckdb 2.0 line.
+	//
+	// TOP 1 descending rather than the base's MAX subquery: same row, one seek down the primary key
+	// this manager puts on ducklake_snapshot, and no self-join for the server to unpick.
+	return R"(SELECT * FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, 'SELECT TOP 1 snapshot_id, )"
+	       R"(schema_version, next_catalog_id, next_file_id FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot )"
+	       R"(ORDER BY snapshot_id DESC'))";
+}
+
 bool MSSQLMetadataManager::CanSkipSnapshotFetch(const TransactionChangeInformation &changes) const {
 	// This is where phase 2's saving actually is. Measured (specs/005 D7), the apply on its own costs
 	// a round trip per commit rather than saving one, because phase 1's Execute passthrough already
