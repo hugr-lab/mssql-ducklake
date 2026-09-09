@@ -115,19 +115,24 @@ rewrites anything else and the distribution's format check fails on it.
   This extension is loaded explicitly first; after that the prefix is taken and no autoload fires.
 - **The manager only generates SQL** — like the postgres manager (the in-tree precedent) it never
   links its scanner; `mssql_exec('…', sql)` resolves at runtime.
-- **Execute-passthrough kills the PK problem**: every ducklake write (commit batch, inlined flush,
-  expire/cleanup) flows through one `Execute` seam; passed through as raw T-SQL server-side,
-  duckdb's DML path (rowid/PK) is never involved — mssql's PK-required UPDATE/DELETE limitation
-  never applies to the lake catalog.
+- **Execute-passthrough kills the PK problem**: every ducklake write that carries an UPDATE or a
+  DELETE (commit batch, inlined flush, expire/cleanup) flows through one `Execute` seam; passed
+  through as raw T-SQL server-side, duckdb's DML path (rowid/PK) is not involved — mssql's
+  PK-required UPDATE/DELETE limitation never applies to the lake catalog. The one write that does
+  take duckdb's DML path is the appender's, since spec 006 turned it on: it INSERTs a commit's data
+  files, statistics and partition values, and mssql needs a key for UPDATE and DELETE but not for
+  INSERT — so the exception is safe, and those four tables carry primary keys regardless.
 - **Inlining is in scope**: DuckLake inlines small inserts into catalog tables (default limit 10);
   the manager owns the inlined-table DDL/types via the type hooks. The matrix and edge cases
   (FLOAT NaN, TIMESTAMP_NS, HUGEINT, STRUCT) are in the research note §5.
 - **Performance target: ≥ postgres backend.** Phase 1 parity (Execute passthrough,
-  `GetLatestSnapshotQuery` via `mssql_scan`, own `InitializeDuckLake` with PKs + filtered
-  `WHERE end_snapshot IS NULL` indexes, `MaxIdentifierLength=128`, `SupportsAppender=false`);
-  phase 2 beats it with a server-side `ducklake_commit` T-SQL procedure — data-only commits in one
-  round trip with server-side retry. Research note §7 is the plan; both phases are entirely ours
-  (no upstream involved).
+  `GetLatestSnapshotQuery` via `mssql_scan`, own `InitializeDuckLake` with PKs + indexes,
+  `MaxIdentifierLength=128`); phase 2 beats it with a server-side `ducklake_commit` T-SQL
+  procedure — data-only commits in one round trip with server-side retry. Research note §7 is the
+  plan; both phases are entirely ours (no upstream involved). Spec 006 then turned
+  `SupportsAppender` on — measured, the appender does work against a remote catalog, contrary to
+  what postgres and sqlite answering `false` suggested — and made the catalog's own storage
+  `VARCHAR` under a UTF-8 BIN2 collation rather than `NVARCHAR`.
 - **Both lakes at once**: `ducklake:postgres:` works through the embedded copy too — one extension
   serves postgres-cataloged and mssql-cataloged lakes in the same process.
 - **Attach syntax**: `ducklake:mssql:<ADO connection string>` — duckdb strips `mssql:` as an

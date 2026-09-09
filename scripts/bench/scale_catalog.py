@@ -43,6 +43,12 @@ PHASES = [
     "merge_adjacent",
     "cleanup_files",
     "checkpoint",
+    "partitioned_create",
+    "partitioned_commits",
+    "partitioned_read_latest",
+    "partitioned_read_pruned",
+    "partitioned_reattach",
+    "partitioned_merge_adjacent",
     "deep_history",
     "deep_list_snapshots",
     "deep_read_latest",
@@ -104,7 +110,8 @@ def attach_sql(backend: str, mssql_dsn: str, pg_dsn: str, data_path: str) -> str
 
 
 def build_and_measure_sql(tables: int, rows: int, schemas: int, columns: int, deep_tables: int,
-                          deep_snapshots: int, evolutions: int, attach: str) -> str:
+                          deep_snapshots: int, evolutions: int, partitioned_tables: int,
+                          partitions: int, partitioned_commits: int, attach: str) -> str:
     """The catalog, then the questions asked of it.
 
     Every CREATE TABLE and every INSERT is its own DuckLake commit, so `tables` tables with two
@@ -162,6 +169,27 @@ def build_and_measure_sql(tables: int, rows: int, schemas: int, columns: int, de
         for n in range(deep_snapshots) for t in deep
     )
     deep_probe = deep[0] if deep else probe
+
+    # Partitioning is the shape none of the above produces, and it is the one that multiplies the
+    # catalog rather than adding to it. An unpartitioned insert commits ONE data file; a partitioned
+    # one commits a file per partition it touches, and every one of those files brings a full set of
+    # per-column statistics rows plus a ducklake_file_partition_value row. So a single commit into a
+    # wide, 25-way partitioned table writes as much catalog as twenty-five ordinary commits - which
+    # is exactly the state a production lake partitioned by day or by tenant lives in, and it is the
+    # state the read path has to prune against.
+    part_tables = [f"lake.s{i % schemas}.p{i}" for i in range(partitioned_tables)]
+    partitioned_ddl = "\n".join(
+        f"CREATE TABLE {t}(id BIGINT, p BIGINT, {column_defs()});\n"
+        f"ALTER TABLE {t} SET PARTITIONED BY (p);"
+        for t in part_tables
+    )
+    # four rows per partition, so every commit lands a file in every one of them
+    partitioned_writes = "\n".join(
+        f"INSERT INTO {t} SELECT r, r % {partitions}, {column_values('r')} "
+        f"FROM range({n} * {partitions * 4}, {(n + 1) * partitions * 4}) t(r);"
+        for n in range(partitioned_commits) for t in part_tables
+    )
+    part_probe = part_tables[0] if part_tables else probe
 
     # The versions to travel to are READ from the history rather than computed. The maintenance
     # functions above commit as they see fit, so counting the statements we emit does not give the
@@ -224,6 +252,20 @@ SELECT 'phase:cleanup_files';
 SELECT count(*) FROM ducklake_cleanup_old_files('lake', dry_run => true, cleanup_all => true);
 SELECT 'phase:checkpoint';
 CHECKPOINT;
+SELECT 'phase:partitioned_create';
+{partitioned_ddl}
+SELECT 'phase:partitioned_commits';
+{partitioned_writes}
+SELECT 'phase:partitioned_read_latest';
+SELECT count(*), sum(c0) FROM {part_probe};
+SELECT 'phase:partitioned_read_pruned';
+SELECT count(*), sum(c0) FROM {part_probe} WHERE p = {partitions // 2};
+SELECT 'phase:partitioned_reattach';
+DETACH lake;
+{attach}
+SELECT count(*) FROM {part_probe};
+SELECT 'phase:partitioned_merge_adjacent';
+SELECT count(*) FROM ducklake_merge_adjacent_files('lake');
 {mark_deep_base}
 SELECT 'phase:deep_history';
 {deep_writes}
@@ -307,6 +349,11 @@ def main() -> None:
                         help="file-backed commits into EACH deep table; this is what makes reads interesting")
     parser.add_argument("--evolutions", type=int, default=100,
                         help="schema changes on one table, each followed by a commit")
+    parser.add_argument("--partitioned-tables", type=int, default=10,
+                        help="tables partitioned by a key, so one commit writes a file per partition")
+    parser.add_argument("--partitions", type=int, default=25, help="partitions in each of those tables")
+    parser.add_argument("--partitioned-commits", type=int, default=5,
+                        help="commits into EACH partitioned table; each writes `partitions` data files")
     parser.add_argument("--backends", default="mssql,postgres", help="comma-separated: mssql, postgres")
     args = parser.parse_args()
 
@@ -328,7 +375,9 @@ def main() -> None:
                   + warmup_sql(backend, args.mssql_dsn, args.pg_dsn)
                   + attach + "\n"
                   + build_and_measure_sql(args.tables, args.rows, args.schemas, args.columns,
-                                          args.deep_tables, args.deep_snapshots, args.evolutions, attach))
+                                          args.deep_tables, args.deep_snapshots, args.evolutions,
+                                          args.partitioned_tables, args.partitions,
+                                          args.partitioned_commits, attach))
         print(f"building {args.tables} tables on {backend} ...", file=sys.stderr)
         # the probe table holds one inlined row plus the file-backed insert
         results[backend] = run(args.duckdb, script, args.rows + 1)
@@ -345,7 +394,12 @@ def main() -> None:
           f"{args.deep_tables} tables then take {args.deep_snapshots} file-backed commits each, so the reads "
           f"below run against\n~{args.deep_tables * args.deep_snapshots} data files and a history that deep.\n"
           f"One table then takes {args.evolutions} schema changes, so a read at an old version has to "
-          f"rebuild the schema as it was")
+          f"rebuild the schema as it was.\n"
+          f"{args.partitioned_tables} tables are partitioned {args.partitions} ways and take "
+          f"{args.partitioned_commits} commits each, so those commits alone\nwrite "
+          f"{args.partitioned_tables * args.partitions * args.partitioned_commits} data files and "
+          f"~{args.partitioned_tables * args.partitions * args.partitioned_commits * (args.columns + 2)} "
+          f"file column stats rows")
     print(f"\n{header}")
     print("-" * len(header))
     totals = {b: 0.0 for b in backends}

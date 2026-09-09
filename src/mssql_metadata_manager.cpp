@@ -15,7 +15,7 @@ namespace duckdb {
 
 // the out-of-line definition the pre-C++17 build needs, since the constant is passed by reference
 constexpr const char *MSSQLMetadataManager::VARCHAR_COLLATION;
-constexpr const char *MSSQLMetadataManager::SHAPE_MARKER_CONSTRAINT;
+constexpr const char *MSSQLMetadataManager::SHAPE_VERSION_PROPERTY;
 
 MSSQLMetadataManager::MSSQLMetadataManager(DuckLakeTransaction &transaction) : DuckLakeMetadataManager(transaction) {
 }
@@ -188,6 +188,17 @@ void MSSQLMetadataManager::ClearCache() {
 	}
 }
 
+void MSSQLMetadataManager::InvalidateTableCache(const string &table_name) {
+	auto &connection = transaction.GetConnection();
+	auto result = connection.Query(
+	    StringUtil::Format("SELECT mssql_invalidate_cache(%s, %s, %s)", CatalogLiteral(),
+	                       DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName()),
+	                       DuckLakeUtil::SQLLiteralToString(table_name)));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to refresh the SQL Server catalog cache: ");
+	}
+}
+
 string MSSQLMetadataManager::GetInlinedDeletionTableName(TableIndex table_id, DuckLakeSnapshot snapshot,
                                                          bool create_if_not_exists) {
 	auto table_name = DuckLakeMetadataManager::GetInlinedDeletionTableName(table_id, snapshot, create_if_not_exists);
@@ -204,22 +215,30 @@ string MSSQLMetadataManager::GetInlinedDeletionTableName(TableIndex table_id, Du
 //===--------------------------------------------------------------------===//
 
 bool MSSQLMetadataManager::CatalogShapeIsCurrent() {
-	// One cheap question instead of two batches of DDL: the last constraint the shaping applies is
-	// the marker for all of it. Attaching an existing catalog is on the hot path - every transaction
-	// pays for whatever happens here - and the DDL is only ever needed once per catalog.
+	// One cheap question instead of two batches of DDL. Attaching an existing catalog is on the hot
+	// path - every transaction pays for whatever happens here - and the shaping is only ever needed
+	// once per catalog per version of this extension.
+	//
+	// A version rather than the presence of one constraint. The marker used to be the last key the
+	// shaping adds, which answered "some build of this extension shaped this catalog" - so a catalog
+	// shaped by an older one, whose column types and indexes are not what the current build wants,
+	// read as current and was left alone. The stamp is written last, after the DDL that earns it.
 	auto &connection = transaction.GetConnection();
 	// the inner statement travels inside a duckdb string literal, so each of its own quotes is
 	// doubled once - the same shape the collation probe above uses
 	auto schema_name = StringUtil::Replace(transaction.GetCatalog().MetadataSchemaName(), "'", "''''");
-	auto result = connection.Query(
-	    StringUtil::Format("SELECT keys FROM mssql_scan(%s, 'SELECT COUNT(*) AS keys FROM sys.key_constraints "
-	                       "WHERE name = ''%s'' AND schema_id = SCHEMA_ID(''%s'')')",
-	                       CatalogLiteral(), SHAPE_MARKER_CONSTRAINT, schema_name));
+	auto result = connection.Query(StringUtil::Format(
+	    "SELECT shape FROM mssql_scan(%s, 'SELECT TRY_CAST(CAST(value AS VARCHAR(32)) AS BIGINT) AS shape "
+	    "FROM sys.extended_properties WHERE class = 3 AND major_id = SCHEMA_ID(''%s'') AND name = ''%s''')",
+	    CatalogLiteral(), schema_name, SHAPE_VERSION_PROPERTY));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to inspect the DuckLake catalog on SQL Server: ");
 	}
 	auto row = result->Fetch();
-	return row && row->size() > 0 && !row->GetValue(0, 0).IsNull() && row->GetValue(0, 0).GetValue<int64_t>() > 0;
+	if (!row || row->size() == 0 || row->GetValue(0, 0).IsNull()) {
+		return false;
+	}
+	return row->GetValue(0, 0).GetValue<int64_t>() >= SHAPE_VERSION;
 }
 
 //! A T-SQL string literal, or NULL - the value travels inside the batch mssql_exec runs.
@@ -301,6 +320,49 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 		                                  entry.first, entry.second, VARCHAR_COLLATION);
 	}
 
+	// A partition value is bounded so it can be an index key. DuckLake declares it an unbounded
+	// VARCHAR, which lands as a LOB, and a LOB can be neither an index key nor an INCLUDE - so the
+	// pruning predicate below would have nothing to seek. 200 bytes of UTF-8 is far more than a
+	// partition key ever is (a date, a tenant, a bucket) and well inside the 900-byte index limit;
+	// a longer one is refused by the server rather than silently truncated.
+	columns_ddl += StringUtil::Format("ALTER TABLE %s.ducklake_file_partition_value ALTER COLUMN partition_value "
+	                                  "VARCHAR(200) COLLATE %s NULL;\n",
+	                                  schema, VARCHAR_COLLATION);
+
+	// Everything else DuckLake declared as a string. mssql maps DuckDB's VARCHAR to NVARCHAR, which
+	// is UTF-16: two bytes per character for catalog content that is paths, type names and
+	// identifiers, and a linguistic case-insensitive collation over them. Neither is what this
+	// catalog wants. VARCHAR under a UTF-8 collation stores the same text in half the space for that
+	// content, and BIN2 is DuckDB's own comparison - DuckDB has no case-insensitive string compare,
+	// so a server that does is the one behaving differently.
+	//
+	// Generated from sys.columns rather than listed here: the list is DuckLake's, it moves with every
+	// submodule bump, and a column added upstream would otherwise silently keep the wrong type. Once
+	// converted the sweep matches nothing, so it costs a single statement on every later attach - but
+	// the FIRST attach after an upgrade converts in place, and ALTER COLUMN rewrites the table, so
+	// that one attach walks the whole catalog (specs/006 D4 measures it).
+	//
+	// `ducklake%` in the metadata schema is the extension's namespace, not a guess: DuckLake creates
+	// and drops tables under that prefix there by itself (every `ducklake_inlined_data_<t>_<v>`), so
+	// a table of someone else's answering to it would already be colliding with DuckLake. The scope
+	// is deliberately the same one the integration suite's reset uses.
+	//
+	// Column-by-column because ALTER COLUMN cannot restate a whole table, and nullability has to be
+	// restated or the column silently becomes nullable.
+	columns_ddl += StringUtil::Format(R"(
+DECLARE @widen NVARCHAR(MAX) = N'';
+SELECT @widen += N'ALTER TABLE ' + QUOTENAME(sch.name) + N'.' + QUOTENAME(t.name)
+               + N' ALTER COLUMN ' + QUOTENAME(c.name) + N' VARCHAR(MAX) COLLATE %s'
+               + CASE WHEN c.is_nullable = 0 THEN N' NOT NULL' ELSE N' NULL' END + N';'
+FROM sys.columns c
+JOIN sys.tables t ON t.object_id = c.object_id
+JOIN sys.schemas sch ON sch.schema_id = t.schema_id
+JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+WHERE sch.name = %s AND t.name LIKE 'ducklake%%' AND ty.name IN ('nvarchar', 'nchar', 'ntext');
+EXEC sp_executesql @widen;
+)",
+	                                  VARCHAR_COLLATION, schema_literal);
+
 	// Indexes on the condition almost every DuckLake read carries. Neither the postgres nor the
 	// sqlite manager has indexes here at all.
 	//
@@ -373,6 +435,33 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	constraints_ddl += StringUtil::Format(
 	    "IF NOT EXISTS (%s) CREATE INDEX %s ON %s.ducklake_file_column_stats(table_id, column_id);\n",
 	    index_exists(stats_lookup), stats_lookup, schema);
+
+	// Partition pruning, which is the whole reason to partition: DuckLake turns a filter on a
+	// partition key into
+	//   SELECT data_file_id FROM ducklake_file_partition_value
+	//   WHERE table_id = ? AND partition_key_index = ? AND partition_value IN (...)
+	// (ducklake_metadata_manager.cpp). The primary key is (data_file_id, partition_key_index) and its
+	// leading column is not in that predicate, so nothing served it - the same shape that made the
+	// file-column-stats index worth 15x. All three predicate columns are in the key, so the server
+	// seeks and reads nothing it does not return; this is what the VARCHAR(200) above is for.
+	const string partition_lookup = "ix_ducklake_file_partition_value_lookup";
+	constraints_ddl += StringUtil::Format("IF NOT EXISTS (%s) CREATE INDEX %s ON "
+	                                      "%s.ducklake_file_partition_value(table_id, partition_key_index, "
+	                                      "partition_value);\n",
+	                                      index_exists(partition_lookup), partition_lookup, schema);
+
+	// Last, and only if everything above succeeded: the version stamp CatalogShapeIsCurrent reads.
+	// It is what lets a catalog shaped by an older build of this extension be brought up to the
+	// current shape - the DDL is all idempotent, so the stamp is the only thing that decides whether
+	// it is worth running at all.
+	constraints_ddl += StringUtil::Format(R"(
+IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 3 AND major_id = SCHEMA_ID(%s) AND name = '%s')
+    EXEC sp_updateextendedproperty @name = N'%s', @value = N'%d', @level0type = N'SCHEMA', @level0name = %s;
+ELSE
+    EXEC sp_addextendedproperty @name = N'%s', @value = N'%d', @level0type = N'SCHEMA', @level0name = %s;
+)",
+	                                      schema_literal, SHAPE_VERSION_PROPERTY, SHAPE_VERSION_PROPERTY, SHAPE_VERSION,
+	                                      schema_literal, SHAPE_VERSION_PROPERTY, SHAPE_VERSION, schema_literal);
 
 	// Two batches: inside one, a column's new NOT NULL is not yet visible to the constraint that
 	// needs it, and the server answers "cannot define PRIMARY KEY on a nullable column".
@@ -872,7 +961,21 @@ string MSSQLMetadataManager::GetInlinedTableQueries(DuckLakeSnapshot commit_snap
 	    DuckLakeUtil::SQLLiteralToString(table_name), SchemaIdentifier(), SQLIdentifier(table_name), columns,
 	    SQLIdentifier("pk_" + table_name));
 	RunServerSideOutsideTransaction(statement, "Failed to create the inlined data table: ");
-	// The base marked the cache pending for exactly this; tell ClearCache which table it was.
+	// Refresh the extension's view of THIS table now, before returning into the batch being built.
+	// DuckLake clears the cache only after the commit batch has run - CommitChanges builds it (and
+	// gets here), execute_commit_batch runs it, and flush_cache_if_pending comes after that - so a
+	// table created and written in the SAME commit is invisible to the very INSERT that needs it and
+	// the commit dies with "Table with name ducklake_inlined_data_<table>_<version> does not exist".
+	// Creating a table and inlining rows into it in one statement is the ordinary case: any
+	// CREATE TABLE ... AS SELECT under the inlining limit. The base's deletion-table path does not
+	// have the problem because it invalidates there itself, right after creating the table.
+	//
+	// Safe here where a schema-wide clear at this point is not: the table was created OUTSIDE this
+	// transaction (see RunServerSideOutsideTransaction), so it is committed and holds no lock that
+	// the extension's metadata read - which takes its own connection - could wait on.
+	InvalidateTableCache(table_name);
+	// Recorded as well, so DuckLake's own clear after the batch stays the cheap targeted one rather
+	// than falling back to re-reading the whole schema. The repeat costs a single round trip.
 	tables_pending_cache_refresh.push_back(table_name);
 	return table_name;
 }
