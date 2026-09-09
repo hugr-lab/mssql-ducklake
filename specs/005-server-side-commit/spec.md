@@ -498,12 +498,36 @@ can see is not the autocommit the extension decides on. Adding a second catalog 
 statement - the file list joins `ducklake_data_file` and `ducklake_delete_file` - is enough to
 collide even with a single `mssql_scan`.
 
+**And the size the ceiling was measured at was too small to judge by.** Synthesising file and stats
+rows straight into the catalog under an unused `table_id` - the queries under test touch only those
+two tables, so nothing else needs to exist - the gap grows with the catalog rather than staying
+where the 301-file table left it:
+
+| files | stats rows | through the catalog | one server-side scan | ratio |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 41,000 | 0.007s | 0.005s | 1.40x |
+| 10,000 | 410,000 | 0.043s | 0.014s | **3.07x** |
+
+The mechanism says why, and says it keeps going: the catalog path transfers every stats row to the
+client and joins there, while the server-side form joins and returns the survivors. At 10,000 files
+that filtered read moved **410,000 rows across the wire to produce 6**. The ratio tracks rows
+transferred over rows returned, so it widens with both the catalog and the selectivity of the
+filter - which is to say it is worst exactly where a lake is most useful. (A 30,000-file point was
+attempted and the synthetic insert of 1.23M rows would not complete, so the curve stops at two
+points.)
+
 `GetFilesForTable` is virtual, so the whole query could be generated as one server-side statement
-instead, which would sidestep this entirely and do the pruning on the server. The parsing is not
-extracted - it is an inline loop building `DuckLakeFileListEntry` - so that path means duplicating
-it and re-auditing on every submodule bump, against a ceiling measured in milliseconds at this
-catalog size. Worth revisiting when the deferred-`BEGIN`-until-first-write idea below lands, which
-would remove the constraint rather than work around it.
+and sidestep all of this. What stops that today is not the cost of the copy but its shape: of the
+six pieces it is built from, five are **private** - `ReadDataFile`, `ReadDeleteFile`,
+`GetFileSelectList`, `GetDeleteFileSelectList`, `GenerateFilterPushdownComponents` - and
+`SetSnapshotFilter` is file-local. Only `ReadInlinedFileDeletions` is reachable. So the virtual is a
+seam with nothing behind it to hold on to, and overriding it means copying private internals of the
+submodule and keeping them in step, where a drift shows up not as a compile error but as a quietly
+wrong file list.
+
+Which makes the order of preference clear, cheapest first: defer `BEGIN` to the first write in the
+extension, so reads take pooled connections and the constraint disappears; or ask upstream to make
+those six `protected`, after which the override is small and honest; and only failing both, copy.
 
 **`MATERIALIZED` does not rescue it either.** DuckLake already emits the
 hint itself - `AS MATERIALIZED` when a CTE is referenced more than once, `AS NOT MATERIALIZED`
