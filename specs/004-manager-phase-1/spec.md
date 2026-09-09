@@ -113,6 +113,18 @@ Two things about *how* they run were found the hard way, and both are load-beari
   concluded it was worthless.** With every row under a single `table_id` the same query matches
   30,000 rows, a scan is competitive, and the index measures as no help at all. A real catalog
   spreads its rows over its tables, and then the predicate is selective.
+- **Page compression is not worth it, measured.** The catalog looks like a good candidate - ids
+  repeated per file, short encoded min/max - so it was tried on the same 1.23M-row table, rounds
+  alternated:
+
+  | | `PAGE` | `NONE` |
+  | --- | ---: | ---: |
+  | the selective read | 0.001s | 0.001s |
+  | a full scan of the table | 0.507 - 0.520s | 0.056 - 0.241s |
+
+  Two to nine times **slower** on the scan, and identical on the seek. Compression trades CPU for
+  IO, and a catalog that fits in the buffer pool has no IO to trade away - every page has to be
+  decompressed to be read. The tables are left uncompressed.
 
   `ducklake_snapshot` and `ducklake_snapshot_changes` need nothing: DuckLake gives both a clustered
   primary key on `snapshot_id`, which is exactly what every query asks them for.
