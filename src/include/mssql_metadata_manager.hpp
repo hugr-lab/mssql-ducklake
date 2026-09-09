@@ -67,6 +67,11 @@ private:
 	string TSQLColumnType(const LogicalType &type) const;
 	//! Keys, indexes and collations, written so that running them twice is a no-op.
 	void EnsureCatalogShape();
+	//! Is that shaping already applied? Asked on every attach, so it is one query rather than the
+	//! whole idempotent batch.
+	bool CatalogShapeIsCurrent();
+	//! The constraint the shaping adds last, and therefore the marker that all of it is present.
+	static constexpr const char *SHAPE_MARKER_CONSTRAINT = "pk_ducklake_schema_versions";
 	//! Run T-SQL through `mssql_exec` on a connection of the caller's choosing.
 	void RunOn(Connection &connection, const string &tsql, const string &context);
 	//! On this transaction's connection.

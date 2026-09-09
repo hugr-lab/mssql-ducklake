@@ -13,6 +13,7 @@ namespace duckdb {
 
 // the out-of-line definition the pre-C++17 build needs, since the constant is passed by reference
 constexpr const char *MSSQLMetadataManager::VARCHAR_COLLATION;
+constexpr const char *MSSQLMetadataManager::SHAPE_MARKER_CONSTRAINT;
 
 MSSQLMetadataManager::MSSQLMetadataManager(DuckLakeTransaction &transaction) : DuckLakeMetadataManager(transaction) {
 }
@@ -172,6 +173,25 @@ void MSSQLMetadataManager::ClearCache() {
 // Initialization (specs/004 D3)
 //===--------------------------------------------------------------------===//
 
+bool MSSQLMetadataManager::CatalogShapeIsCurrent() {
+	// One cheap question instead of two batches of DDL: the last constraint the shaping applies is
+	// the marker for all of it. Attaching an existing catalog is on the hot path - every transaction
+	// pays for whatever happens here - and the DDL is only ever needed once per catalog.
+	auto &connection = transaction.GetConnection();
+	// the inner statement travels inside a duckdb string literal, so each of its own quotes is
+	// doubled once - the same shape the collation probe above uses
+	auto schema_name = StringUtil::Replace(transaction.GetCatalog().MetadataSchemaName(), "'", "''''");
+	auto result = connection.Query(
+	    StringUtil::Format("SELECT keys FROM mssql_scan(%s, 'SELECT COUNT(*) AS keys FROM sys.key_constraints "
+	                       "WHERE name = ''%s'' AND schema_id = SCHEMA_ID(''%s'')')",
+	                       CatalogLiteral(), SHAPE_MARKER_CONSTRAINT, schema_name));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to inspect the DuckLake catalog on SQL Server: ");
+	}
+	auto row = result->Fetch();
+	return row && row->size() > 0 && !row->GetValue(0, 0).IsNull() && row->GetValue(0, 0).GetValue<int64_t>() > 0;
+}
+
 void MSSQLMetadataManager::EnsureCatalogShape() {
 	const string schema = SchemaIdentifier();
 	const string schema_literal = DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName());
@@ -294,8 +314,12 @@ void MSSQLMetadataManager::ProbeServerCapabilities() {
 	// Runs once per attach, including for a catalog this manager did not create - one made by an
 	// older build, or by a run that failed between DuckLake's DDL and ours. Without the keys such a
 	// catalog is readable but not writable, and the failure would surface much later as "requires a
-	// table with a primary key". The statements are idempotent, so this costs two round trips.
-	EnsureCatalogShape();
+	// table with a primary key". Applying the DDL unconditionally cost two seconds on every attach
+	// (measured against the postgres backend), so ask first: one round trip when the catalog is
+	// already in shape, which is every attach after the first.
+	if (!CatalogShapeIsCurrent()) {
+		EnsureCatalogShape();
+	}
 }
 
 //===--------------------------------------------------------------------===//

@@ -66,6 +66,32 @@ services:
       - MSSQL_SA_PASSWORD=${MSSQL_DUCKLAKE_PASS:-TestPassword1}
       - MSSQL_DUCKLAKE_DB=${MSSQL_DUCKLAKE_DB:-lake_meta}
 
+  # The other DuckLake catalog backend, for the comparison the performance target is stated against
+  # (specs/004): the same extension serves `ducklake:postgres:` through the embedded ducklake, so one
+  # binary can drive both. Only `make bench` needs it; `make docker-up` leaves it alone.
+  postgres:
+    image: ${MSSQL_DUCKLAKE_PG_IMAGE:-postgres:18}
+    container_name: mssql-ducklake-postgres
+    profiles: [bench]
+    environment:
+      - POSTGRES_USER=${MSSQL_DUCKLAKE_PG_USER:-ducklake}
+      - POSTGRES_PASSWORD=${MSSQL_DUCKLAKE_PG_PASS:-TestPassword1}
+      - POSTGRES_DB=${MSSQL_DUCKLAKE_PG_DB:-lake_meta}
+    ports:
+      # loopback only, like the SQL Server beside it
+      - "127.0.0.1:${MSSQL_DUCKLAKE_PG_PORT:-7432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${MSSQL_DUCKLAKE_PG_USER:-ducklake} -d ${MSSQL_DUCKLAKE_PG_DB:-lake_meta}
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
 volumes:
   sqlserver-data:
     name: mssql-ducklake-sqlserver-data
+  postgres-data:
+    name: mssql-ducklake-postgres-data

@@ -148,12 +148,47 @@ returns a bare `VARCHAR` for them without consulting the manager, and a bare `VA
 `SupportsInlining` refuses VARIANT: DuckLake aborts a commit for a VARIANT it cannot store natively
 rather than falling back to a data file, so the column has to be declared un-inlinable up front.
 
-### D5 — the hot reads through `mssql_scan`
+### D5 — the hot reads through `mssql_scan`: tried, measured, dropped
 
-`GetLatestSnapshotQuery` runs on every transaction start; it becomes a single
-`mssql_scan('<catalog>', '...')`. `GenerateFileColumnStatsCTEBody` stays a catalog scan for now: its
-CTE lives inside a query that also joins catalog tables, and on mssql v0.2.5 an `mssql_scan()` may
-only be the sole source of its query (spec 003). Revisit when that constraint lifts on the 2.0 line.
+The plan was to send `GetLatestSnapshotQuery` — which runs at every transaction start — as a single
+server-side statement, the way the postgres manager does. Implemented and benchmarked, it moved
+nothing: 19-21x of the postgres backend either way, inside the run-to-run spread. The table it reads
+holds one row per snapshot and the scan of it was never the cost; the cost is the number of round
+trips a commit makes, which this does not change. Reverted rather than kept on faith, because it
+also brings a constraint — on mssql v0.2.5 an `mssql_scan()` may only be the sole source of its
+query (spec 003) — that would shape later reads for no gain.
+
+`GenerateFileColumnStatsCTEBody` was never a candidate for the same reason: its CTE lives inside a
+query that also joins catalog tables.
+
+## Measured
+
+`make bench` (`scripts/bench/compare_backends.py`) runs one workload against both backends in one
+process — the extension serves `ducklake:mssql:` and `ducklake:postgres:` at once — with both
+catalogs rebuilt from scratch. Against the docker servers, 20k rows and 10 small commits:
+
+| phase | mssql | postgres | ratio |
+| --- | --- | --- | --- |
+| attach (creates the catalog) | 2.10 | 0.05 | 40x |
+| create_table | 0.74 | 0.02 | 37x |
+| small_commits (10) | 0.41 | 0.05 | 9x |
+| bulk_insert (20k rows) | 0.03 | 0.01 | 5x |
+| point_read | 0.34 | 0.02 | 23x |
+| update_delete | 0.20 | 0.02 | 11x |
+| reattach | 0.86 | 0.03 | 25x |
+| **total** | **4.9** | **0.24** | **~20x** |
+
+**The stated target — "not worse than the postgres backend" — is not met by phase 1, and not
+narrowly.** The reason is the design this phase deliberately chose: every metadata statement is its
+own round trip, where the postgres manager sends a whole commit as one `postgres_execute`. It can do
+that without translating anything, because DuckLake's SQL already is postgres's dialect; ours is
+not, and rewriting it proved to be how correctness bugs get in (D1).
+
+So the batching has to come from somewhere that does not require rewriting SQL, which is exactly
+what phase 2 is: a `ducklake_commit` procedure on the server takes the commit's *data* and applies
+it in one call. That reframes phase 2 from an optimization to the thing that makes the target
+reachable. Two cheaper wins are already in: the catalog shaping now asks one question instead of
+re-applying its DDL on every attach (2.0s → 0.8s), and D5 was measured and dropped.
 
 ## Enforcement & security
 
@@ -196,8 +231,7 @@ unquoted that would not have reached the generic path the same way.
   `FlushChangesServerSide` — data-only commits in one round trip with server-side retry.
 - The BCP staging path for large inlined writes (research note §7): `##stage` filled by
   `COPY … (FORMAT 'bcp')` on a second connection, moved into place by the commit batch.
-- Bench against the postgres backend on the same dataset; the target is "not worse", and the
-  filtered indexes are where it should be better.
+- The remaining gap, by phase, is in Measured above; `make bench` is the way to watch it move.
 - An inlined data table created on a retried commit is orphaned: the name carries the schema
   version, which the retry bumps, so the abandoned table is never registered and never cleaned up.
   Harmless (an empty table) but it accumulates; cleanup should drop unregistered
