@@ -301,11 +301,43 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 		                                  entry.first, entry.second, VARCHAR_COLLATION);
 	}
 
-	// Filtered indexes on the condition almost every DuckLake read carries. Neither the postgres nor
-	// the sqlite manager has indexes here at all.
+	// Indexes on the condition almost every DuckLake read carries. Neither the postgres nor the
+	// sqlite manager has indexes here at all.
+	//
+	// The two file tables are keyed on the whole visibility condition rather than filtered on part of
+	// it. A filtered `WHERE end_snapshot IS NULL` index serves a read of the current state and, by
+	// construction, nothing else: a read at an older snapshot wants the rows whose end_snapshot is
+	// SET, which the filter excludes, so it falls back to scanning the table - and that scan grows
+	// with the whole table rather than with the answer. Measured over 300,000 files across 1000
+	// tables, half of them superseded, with the rounds alternated:
+	//
+	//     filtered only       current 0.001s   at an old snapshot 0.006 - 0.008s
+	//     unfiltered only     current 0.001s   at an old snapshot 0.001s
+	//     both                current 0.001s   at an old snapshot 0.001s
+	//
+	// One unfiltered index does what two do, so this replaces rather than adds. Time travel is the
+	// obvious beneficiary; so is every maintenance function that walks history.
+	const vector<pair<string, string>> visibility_indexes = {
+	    {"ducklake_data_file", "table_id, begin_snapshot, end_snapshot"},
+	    {"ducklake_delete_file", "table_id, begin_snapshot, end_snapshot"},
+	};
+	for (auto &entry : visibility_indexes) {
+		constraints_ddl += StringUtil::Format("IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_%s_visible') "
+		                                      "CREATE INDEX ix_%s_visible ON %s.%s(%s);\n",
+		                                      entry.first, entry.first, schema, entry.first, entry.second);
+		// the filtered index this replaces, left behind by an older build of this extension
+		constraints_ddl += StringUtil::Format("IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_%s_live') "
+		                                      "DROP INDEX ix_%s_live ON %s.%s;\n",
+		                                      entry.first, entry.first, schema, entry.first);
+	}
+
+	// The rest keep the filtered form: their hot reads are the catalog load, which asks for the
+	// current state and nothing else, and they are small enough that the difference was not worth
+	// measuring either way.
 	const vector<pair<string, string>> live_indexes = {
-	    {"ducklake_data_file", "table_id"}, {"ducklake_delete_file", "table_id"}, {"ducklake_table", "schema_id"},
-	    {"ducklake_column", "table_id"},    {"ducklake_view", "schema_id"},
+	    {"ducklake_table", "schema_id"},
+	    {"ducklake_column", "table_id"},
+	    {"ducklake_view", "schema_id"},
 	};
 	for (auto &entry : live_indexes) {
 		constraints_ddl += StringUtil::Format("IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_%s_live') "
