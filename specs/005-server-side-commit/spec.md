@@ -499,10 +499,20 @@ The same ingredients pass or fail depending on the plan - whether the scan happe
 before the next source is opened. That is not something a manager can control or predict, which
 already argues the fix belongs in the extension rather than in how the SQL is shaped.
 
-And the five catalog scans are the proof that the fix works: catalog scans inside a transaction are
-materialised (spec 003 R2), five of them share the pinned connection in one statement, and there is
-no simultaneous-bind problem to solve. Binding is sequential on one thread; each source runs its
-query, buffers it, and hands the connection back before the next one binds.
+And the catalog scans are the proof that the fix works. The obvious objection to materialising at
+bind is that two binds would then fight over the connection while one of them is still buffering.
+They do not, and the evidence is that the extension already does exactly this: catalog scans inside
+a transaction are materialised (spec 003 R2). Six of them in one statement over one pinned
+connection, twenty consecutive transactions: **twenty successes, no errors, the same answer every
+time**, and the same with `SET threads = 16`. A race would show up as intermittent failure across
+twenty runs; there is none, because a source buffers its result and hands the connection back before
+the next source is bound, and binding is sequential on the calling thread. Execution parallelism
+never touches the connection, since by then the rows are in memory.
+
+That is the difference from today's streaming scan in one sentence: it leaves the connection
+`Executing` across the boundary between one source and the next, so whichever source comes second
+finds it busy - and whether a plan puts one there is what makes the failure shape-dependent rather
+than timing-dependent.
 
 So the override was written to emit the direct form only in autocommit and the catalog form
 otherwise. It still fails, and the reason is the guard rather than the rule: DuckLake reads its
