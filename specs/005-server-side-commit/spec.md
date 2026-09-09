@@ -399,6 +399,46 @@ So the read-path answer is conditional on the deployment, which is worth saying 
 quoting a single ratio: pool the connections and the gap is 2x; do not, and it is 4.6x with a clear
 cause and a known fix that lives in DuckLake rather than here.
 
+### D12 — why a table with a hundred schema changes takes 23 seconds to read
+
+The slowest read in the production run was not the deep one. Reading a table with 154 schema
+versions costs 23.0s against postgres's 7.9s, where reading a table across a thousand data files
+costs 0.08s. Profiled, it is one statement:
+
+| calls | server ms | statement |
+| ---: | ---: | --- |
+| 154 | 7382 | the full column list of the catalog, `SELECT ... FROM ducklake_column` |
+| 154 | 150 | `ducklake_inlined_data_tables` |
+| 154 | 12 | `ducklake_schema_versions` |
+| 154 | ~4 each | sort_expression, partition_column, macro_parameters, macro_impl |
+
+**Once per schema version, DuckLake loads the entire catalog.** `DuckLakeCatalog::GetSchemaCacheEntry`
+caches on `SchemaCacheKey(snapshot.schema_version)` and the entry holds the whole catalog at that
+version, so a table with 154 versions touches 154 distinct keys, misses each once, and pays 154 full
+loads. Exactly 154 calls were observed, so the cache is working perfectly - the granularity is the
+cost, not a bug.
+
+The waste is in what each load reads. To interpret rows written under version V it needs that one
+table's columns at V - 41 rows. It reads every table's columns at V - 41,122 rows. A thousand times
+more, 154 times over.
+
+Three things it is **not**, each measured rather than assumed:
+
+- **Not a missing pushdown.** DuckLake's query is filtered, but the column-side predicate sits in an
+  `OR column_id IS NULL` beside a LEFT JOIN, so it is a post-join predicate and nothing reaches the
+  scan. Pushing it down anyway would not help: at the latest snapshot the predicate keeps 41,069 of
+  41,122 rows, and the filtered scan measured slightly slower than the unfiltered one.
+- **Not statistics.** `SET mssql_enable_statistics = false` measures the same read.
+- **Not our SQL routing.** The postgres manager overrides `Execute`, `GetLatestSnapshotQuery` and
+  `GenerateFileColumnStatsCTEBody` to go through `postgres_query`, but its `Query()` calls the base -
+  so it reads the catalog through DuckDB exactly as this manager does. Copying those two overrides
+  is worth about a millisecond here: the latest-snapshot query is one call at 1ms, and the stats CTE
+  would put several `mssql_scan` calls in one plan, which v0.2.5 cannot materialise inside a
+  transaction anyway.
+
+Backend-independent, and visible on postgres too at 7.9s. It belongs upstream in DuckLake, as a
+per-table schema load for this path rather than a whole-catalog one.
+
 ## Enforcement & security
 
 The procedure is created by us and takes no SQL from the client: its parameters are the schema name,
