@@ -69,10 +69,19 @@ the seventeen staged tables is flat — `BIGINT`, `VARCHAR` and `BOOLEAN` column
 types anywhere (`DuckLakeStagedTable::Columns`). DuckLake normalizes a commit into scalars before it
 stages it, which is exactly what BCP can carry.
 
-### D3 — `ducklake_commit`, in T-SQL
+### D3 — the apply, in T-SQL — and why it is a batch rather than a procedure
 
-The procedure is ours to write, versioned with the manager, and recreated whenever its recorded
-version differs from the manager's. It does what the client loop does today, on the server:
+A stored procedure is the natural home for it: versioned, compiled once, called by name. It is not
+usable today. Calling any procedure through this extension desynchronizes its TDS parser by two
+bytes, because `RETURNSTATUS` (0x79) is read as if it carried a length field when [MS-TDS] makes it
+fixed at five bytes — filed as **hugr-lab/mssql-extension#323** with the wire evidence. A
+desynchronized connection cannot be recovered mid-commit, so this is not a matter of retrying.
+
+A plain batch produces no `RETURNSTATUS`, so the apply is sent as one. It costs compilation per
+commit and gives up the version-in-the-catalog story, and it goes back to being a procedure when
+#323 lands.
+
+The apply is ours to write, and this is what it does. It does what the client loop does today, on the server:
 
 1. allocate the next `snapshot_id` and `schema_version`, under the isolation the retry loop needs;
 2. insert the staged data files, their column statistics and partition values; the delete files; the
@@ -127,6 +136,22 @@ text — which is the property that makes this safe where rewriting SQL was not.
 
 Fail-open, not fail-closed: every reason to refuse the fast path (no procedure, wrong version, a
 commit that is not data-only) falls back to phase 1 rather than failing the commit.
+
+## Where this stands
+
+Landed and exercised on every data-only commit: the staging (D1, D2), measured in D5.
+
+Written but **off by default** behind `MSSQL_DUCKLAKE_SERVER_COMMIT=1`: the apply. It runs correctly
+when driven by hand — staged rows in, snapshot and statistics out — and inside the real commit path
+it currently ends in a duckdb internal error during query teardown, which is the next thing to
+understand. Until then `ProbeServerCapabilities` does not arm the fast path, so DuckLake never
+takes it and the default build is exactly phase 1.
+
+Two lessons already paid for, both about SQL Server rather than about DuckLake:
+
+- a `#temp` table created inside a stored procedure dies with it, so the result table is created by
+  the caller in the same batch;
+- and the RETURNSTATUS desync above, which is what turned the procedure into a batch.
 
 ## Testing
 

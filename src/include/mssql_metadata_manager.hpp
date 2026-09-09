@@ -68,11 +68,16 @@ public:
 	static constexpr const char *VARCHAR_COLLATION = "Latin1_General_100_BIN2_UTF8";
 
 private:
+	//! What a staging pass found, which decides whether the server-side apply can take it.
+	struct StagedCommit {
+		bool only_data_files = true;
+	};
+
 	//! Put the commit's rows into `#temp` tables on this transaction's connection: DuckLake stages
 	//! them into local duckdb tables, and each non-empty one is bulk-loaded across (specs/005 D1,
 	//! D2). Inside the transaction, so a rollback takes the staging with it.
-	void StageCommit(DuckLakeTransaction &transaction, const DuckLakeSnapshot &snapshot,
-	                 const DuckLakeRetryConfig &retry_config);
+	StagedCommit StageCommit(DuckLakeTransaction &transaction, const DuckLakeSnapshot &snapshot,
+	                         const DuckLakeRetryConfig &retry_config);
 
 	//! The T-SQL column type for an inlined column, from the matrix.
 	string TSQLColumnType(const LogicalType &type) const;
