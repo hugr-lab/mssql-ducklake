@@ -194,6 +194,15 @@ bool MSSQLMetadataManager::CatalogShapeIsCurrent() {
 	return row && row->size() > 0 && !row->GetValue(0, 0).IsNull() && row->GetValue(0, 0).GetValue<int64_t>() > 0;
 }
 
+//! A T-SQL string literal, or NULL - the value travels inside the batch mssql_exec runs.
+static string TSQLLiteral(const string &value) {
+	return "N'" + StringUtil::Replace(value, "'", "''") + "'";
+}
+
+static string TSQLLiteral(const Value &value) {
+	return value.IsNull() ? "NULL" : TSQLLiteral(value.ToString());
+}
+
 void MSSQLMetadataManager::EnsureCatalogShape() {
 	const string schema = SchemaIdentifier();
 	const string schema_literal = DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName());
@@ -316,8 +325,138 @@ void MSSQLMetadataManager::InitializeDuckLake(bool has_explicit_schema, DuckLake
 // Phase 2: staging a commit on the server (specs/005)
 //===--------------------------------------------------------------------===//
 
-void MSSQLMetadataManager::StageCommit(DuckLakeTransaction &flush_transaction, const DuckLakeSnapshot &snapshot,
-                                       const DuckLakeRetryConfig &retry_config) {
+//! The server-side apply. Bump this whenever the body below changes: the procedure is recreated
+//! when the version recorded in ducklake_metadata differs, which is how a catalog written by an
+//! older build of this extension gets the current one.
+static constexpr const char *COMMIT_PROCEDURE_VERSION = "1";
+
+//! What the procedure covers today: a commit that adds data files and nothing else. Every other
+//! staged shape - delete files, inlined data, compactions, name maps - still goes to the client
+//! loop, and the caller checks that before using this (specs/005 D4).
+//! The server-side apply, as a batch rather than a stored procedure. A procedure would be the
+//! natural home for it - versioned, compiled once - but calling one desynchronizes the mssql
+//! extension's TDS parser (hugr-lab/mssql-extension#323: RETURNSTATUS is read as if it carried a
+//! length), and a desynchronized connection cannot be recovered mid-commit. A batch produces no
+//! RETURNSTATUS. Revisit when that lands.
+static string CommitBatchSql(const string &schema, const string &collation, int64_t schema_version,
+                             const string &author, const string &commit_message, const string &commit_extra_info) {
+	return StringUtil::Format(R"(
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+    DECLARE @schema_version BIGINT = %lld;
+    DECLARE @author NVARCHAR(MAX) = %s;
+    DECLARE @commit_message NVARCHAR(MAX) = %s;
+    DECLARE @commit_extra_info NVARCHAR(MAX) = %s;
+    DROP TABLE IF EXISTS #ducklake_commit_result;
+    CREATE TABLE #ducklake_commit_result(snapshot_id BIGINT, schema_version BIGINT, had_flushes BIT);
+
+    -- Allocate the snapshot. UPDLOCK/HOLDLOCK is what serializes two commits racing for the same
+    -- id: the second waits here rather than failing later on the primary key, which is the whole
+    -- point of doing this on the server.
+    DECLARE @snapshot_id BIGINT, @schema_ver BIGINT, @next_catalog_id BIGINT, @next_file_id BIGINT;
+    SELECT TOP 1
+        @snapshot_id = snapshot_id + 1,
+        @schema_ver = schema_version,
+        @next_catalog_id = next_catalog_id,
+        @next_file_id = next_file_id
+    FROM %s.ducklake_snapshot WITH (UPDLOCK, HOLDLOCK)
+    ORDER BY snapshot_id DESC;
+
+    IF @schema_version >= 0 AND @schema_version <> @schema_ver
+    BEGIN
+        -- the catalog moved under this transaction; the client has to rebuild and retry
+        THROW 51000, 'ducklake_commit: schema version conflict', 1;
+    END
+
+    -- Hand the staged files their catalog ids, in a stable order.
+    DECLARE @files TABLE (local_id BIGINT PRIMARY KEY, data_file_id BIGINT, table_id BIGINT);
+    INSERT INTO @files (local_id, data_file_id, table_id)
+    SELECT data_file_id,
+           @next_file_id + ROW_NUMBER() OVER (ORDER BY data_file_id) - 1,
+           table_id
+    FROM #ducklake_staged_data_file;
+
+    INSERT INTO %s.ducklake_data_file
+        (data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path, path_is_relative,
+         file_format, record_count, file_size_bytes, footer_size, row_id_start, partition_id,
+         encryption_key, mapping_id, partial_max)
+    SELECT f.data_file_id, s.table_id, @snapshot_id, NULL, s.file_order, s.path, s.path_is_relative,
+           s.file_format, s.record_count, s.file_size_bytes, s.footer_size, s.row_id_start,
+           s.partition_id, s.encryption_key, s.mapping_id, s.partial_max
+    FROM #ducklake_staged_data_file s
+    JOIN @files f ON f.local_id = s.data_file_id;
+
+    INSERT INTO %s.ducklake_file_column_stats
+        (data_file_id, table_id, column_id, column_size_bytes, value_count, null_count, min_value,
+         max_value, contains_nan, extra_stats)
+    SELECT f.data_file_id, s.table_id, s.column_id, s.column_size_bytes,
+           CASE WHEN s.has_num_values = 1 THEN s.num_values END,
+           CASE WHEN s.has_null_count = 1 THEN s.null_count END,
+           CASE WHEN s.has_min = 1 THEN s.min_value END,
+           CASE WHEN s.has_max = 1 THEN s.max_value END,
+           CASE WHEN s.has_contains_nan = 1 THEN s.contains_nan END,
+           s.extra_stats
+    FROM #ducklake_staged_data_file_column_stats s
+    JOIN @files f ON f.local_id = s.data_file_id;
+
+    -- Table totals: a table this commit is the first to write gets a row, the rest are added to.
+    MERGE %s.ducklake_table_stats AS t
+    USING (
+        SELECT table_id,
+               SUM(record_count) AS added_records,
+               SUM(file_size_bytes) AS added_bytes,
+               MAX(row_id_start + record_count) AS next_row_id
+        FROM #ducklake_staged_data_file
+        GROUP BY table_id
+    ) AS s ON t.table_id = s.table_id
+    WHEN MATCHED THEN UPDATE SET
+        record_count = t.record_count + s.added_records,
+        file_size_bytes = t.file_size_bytes + s.added_bytes,
+        next_row_id = CASE WHEN s.next_row_id > t.next_row_id THEN s.next_row_id ELSE t.next_row_id END
+    WHEN NOT MATCHED THEN INSERT (table_id, record_count, next_row_id, file_size_bytes)
+        VALUES (s.table_id, s.added_records, s.next_row_id, s.added_bytes);
+
+    -- Per-column totals: widen the range, and remember a null or a NaN once one appears.
+    MERGE %s.ducklake_table_column_stats AS t
+    USING (
+        SELECT table_id, column_id,
+               MAX(CASE WHEN has_null_count = 1 AND null_count > 0 THEN 1 ELSE 0 END) AS any_null,
+               MAX(CASE WHEN has_contains_nan = 1 AND contains_nan = 1 THEN 1 ELSE 0 END) AS any_nan,
+               MIN(CASE WHEN has_min = 1 THEN min_value END) AS min_value,
+               MAX(CASE WHEN has_max = 1 THEN max_value END) AS max_value
+        FROM #ducklake_staged_data_file_column_stats
+        GROUP BY table_id, column_id
+    ) AS s ON t.table_id = s.table_id AND t.column_id = s.column_id
+    WHEN MATCHED THEN UPDATE SET
+        contains_null = CASE WHEN t.contains_null = 1 OR s.any_null = 1 THEN 1 ELSE t.contains_null END,
+        contains_nan = CASE WHEN t.contains_nan = 1 OR s.any_nan = 1 THEN 1 ELSE t.contains_nan END,
+        min_value = CASE WHEN t.min_value IS NULL OR s.min_value COLLATE %s < t.min_value COLLATE %s
+                         THEN s.min_value ELSE t.min_value END,
+        max_value = CASE WHEN t.max_value IS NULL OR s.max_value COLLATE %s > t.max_value COLLATE %s
+                         THEN s.max_value ELSE t.max_value END
+    WHEN NOT MATCHED THEN INSERT (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
+        VALUES (s.table_id, s.column_id, s.any_null, s.any_nan, s.min_value, s.max_value, NULL);
+
+    DECLARE @added_files BIGINT = (SELECT COUNT(*) FROM #ducklake_staged_data_file);
+    INSERT INTO %s.ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
+    VALUES (@snapshot_id, SYSDATETIMEOFFSET(), @schema_ver, @next_catalog_id, @next_file_id + @added_files);
+
+    DECLARE @changes NVARCHAR(MAX) = (
+        SELECT STRING_AGG(CAST('inserted_into_table:' + CAST(table_id AS NVARCHAR(20)) AS NVARCHAR(MAX)), ',')
+        FROM (SELECT DISTINCT table_id FROM #ducklake_staged_data_file) d);
+    INSERT INTO %s.ducklake_snapshot_changes (snapshot_id, changes_made, author, commit_message, commit_extra_info)
+    VALUES (@snapshot_id, @changes, @author, @commit_message, @commit_extra_info);
+
+    SELECT @snapshot_id AS snapshot_id, @schema_ver AS schema_version, CAST(0 AS BIT) AS had_flushes;
+END
+)",
+	                          schema, schema, schema, schema, schema, schema, collation, collation, collation,
+	                          collation, schema, schema);
+}
+
+MSSQLMetadataManager::StagedCommit MSSQLMetadataManager::StageCommit(DuckLakeTransaction &flush_transaction,
+                                                                     const DuckLakeSnapshot &snapshot,
+                                                                     const DuckLakeRetryConfig &retry_config) {
 	// DuckLake already knows how to turn a transaction into staged rows - seventeen flat tables of
 	// scalars - and doing that ourselves would be a copy to re-audit on every submodule bump. Its
 	// batch ends with the call to its own ducklake_commit; we keep the staging half and supply the
@@ -334,10 +473,15 @@ void MSSQLMetadataManager::StageCommit(DuckLakeTransaction &flush_transaction, c
 	// them - which has to be the one the bulk load reads from, and the one holding the transaction.
 	auto &connection = flush_transaction.GetConnection();
 	auto result = connection.Query(staging_sql);
+	if (getenv("MSSQL_DUCKLAKE_TRACE")) {
+		fprintf(stderr, "[stage] sql=%zu bytes, error=%s\n", staging_sql.size(),
+		        result->HasError() ? result->GetError().c_str() : "none");
+	}
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to stage the DuckLake commit: ");
 	}
 
+	StagedCommit report;
 	const auto catalog_name = flush_transaction.GetCatalog().MetadataDatabaseName();
 	for (auto type : DuckLakeStagedTable::AllTypes()) {
 		const string name = DuckLakeStagedTable::BaseName(type);
@@ -351,15 +495,25 @@ void MSSQLMetadataManager::StageCommit(DuckLakeTransaction &flush_transaction, c
 		if (!chunk || chunk->size() == 0 || chunk->GetValue(0, 0).GetValue<int64_t>() == 0) {
 			continue;
 		}
+		// what the server-side apply understands so far, and everything else is a reason to fall back
+		if (type != DuckLakeStagedTableType::COMMIT_HEADER && type != DuckLakeStagedTableType::DATA_FILE &&
+		    type != DuckLakeStagedTableType::DATA_FILE_COLUMN_STATS) {
+			report.only_data_files = false;
+		}
 		// `#name` is a session temp table: private to this connection, and gone if the transaction
 		// rolls back. REPLACE, because the connection may have staged an earlier commit already.
 		auto copy = connection.Query(
 		    StringUtil::Format("COPY %s TO 'mssql://%s/#%s' (FORMAT 'bcp', CREATE_TABLE true, REPLACE true)",
 		                       SQLIdentifier(name), catalog_name, name));
+		if (getenv("MSSQL_DUCKLAKE_TRACE")) {
+			fprintf(stderr, "[stage] copy %s -> %s\n", name.c_str(),
+			        copy->HasError() ? copy->GetError().c_str() : "ok");
+		}
 		if (copy->HasError()) {
 			copy->GetErrorObject().Throw("Failed to bulk-load the staged DuckLake commit: ");
 		}
 	}
+	return report;
 }
 
 namespace {
@@ -386,13 +540,57 @@ void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_tra
                                                   DuckLakeSnapshot transaction_snapshot,
                                                   const TransactionChangeInformation &transaction_changes,
                                                   const DuckLakeRetryConfig &retry_config) {
-	// Being built (specs/005 D3): the rows are staged on the server, and then the client loop still
-	// applies them, so this is exercised on every data commit while it cannot yet be trusted with
-	// one. When the procedure lands it replaces the loop below rather than joining it.
-	if (IsDataOnlyCommit(transaction_changes) && !flush_transaction.GetRequiresNewInlinedTable()) {
-		StageCommit(flush_transaction, transaction_snapshot, retry_config);
+	if (!IsDataOnlyCommit(transaction_changes) || flush_transaction.GetRequiresNewInlinedTable()) {
+		flush_transaction.RunCommitLoop(transaction_snapshot, transaction_changes, retry_config);
+		return;
 	}
-	flush_transaction.RunCommitLoop(transaction_snapshot, transaction_changes, retry_config);
+	auto staged = StageCommit(flush_transaction, transaction_snapshot, retry_config);
+	if (!staged.only_data_files) {
+		// The procedure covers data files and nothing else yet (specs/005 D3). Anything else staged -
+		// a delete file, inlined rows, a compaction - takes the client loop, which reads the same
+		// transaction state and is unaffected by the staging that just happened.
+		flush_transaction.RunCommitLoop(transaction_snapshot, transaction_changes, retry_config);
+		return;
+	}
+
+	auto &commit_info = flush_transaction.GetCommitInfo();
+	auto &connection = flush_transaction.GetConnection();
+	const int64_t schema_version = transaction_snapshot.snapshot_id != DConstants::INVALID_INDEX
+	                                   ? static_cast<int64_t>(transaction_snapshot.schema_version)
+	                                   : -1;
+	// One batch, which also creates the table it reports through: mssql_exec returns a row count
+	// rather than a result set, and the values are read back from that table afterwards.
+	auto call = StringUtil::Format(
+	    "SELECT mssql_exec(%s, %s)", CatalogLiteral(),
+	    SQLString(
+	        CommitBatchSql(SchemaIdentifier(), VARCHAR_COLLATION, schema_version,
+	                       commit_info.author.IsNull() ? "" : commit_info.author.ToString(),
+	                       commit_info.commit_message.IsNull() ? "" : commit_info.commit_message.ToString(),
+	                       commit_info.commit_extra_info.IsNull() ? "" : commit_info.commit_extra_info.ToString())));
+	auto applied = connection.Query(call);
+	if (getenv("MSSQL_DUCKLAKE_TRACE")) {
+		fprintf(stderr, "[commit] %s\n", applied->HasError() ? applied->GetError().c_str() : "ok");
+	}
+	// No fallback from here on: the procedure writes inside this transaction, so the client loop
+	// cannot start over in it. Everything that chooses between the two paths happens before the call.
+	if (applied->HasError()) {
+		applied->GetErrorObject().Throw("The server-side DuckLake commit failed: ");
+	}
+	auto result = connection.Query(
+	    StringUtil::Format("SELECT snapshot_id, schema_version, had_flushes FROM mssql_scan(%s, 'SELECT snapshot_id, "
+	                       "schema_version, had_flushes FROM #ducklake_commit_result')",
+	                       CatalogLiteral()));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("The server-side DuckLake commit did not report its snapshot: ");
+	}
+	auto chunk = result->Fetch();
+	if (!chunk || chunk->size() == 0) {
+		throw IOException("The server-side DuckLake commit returned no snapshot");
+	}
+	auto committed_snapshot_id = chunk->GetValue(0, 0).GetValue<int64_t>();
+	auto committed_schema_version = chunk->GetValue(1, 0).GetValue<int64_t>();
+	flush_transaction.GetCatalog().SetCommittedSnapshotId(static_cast<idx_t>(committed_snapshot_id));
+	flush_transaction.ApplyServerSideCommit(static_cast<idx_t>(committed_schema_version));
 }
 
 void MSSQLMetadataManager::ProbeServerCapabilities() {
@@ -405,9 +603,13 @@ void MSSQLMetadataManager::ProbeServerCapabilities() {
 	if (!CatalogShapeIsCurrent()) {
 		EnsureCatalogShape();
 	}
-	// Phase 2 is opt-in from here, and safe to arm before it is finished: every path through
-	// FlushChangesServerSide still ends in the client-side loop (specs/005 D4).
-	transaction.GetCatalog().SetRetrialsServerSide(true);
+	// Phase 2 is off by default while it is unfinished (specs/005 D6). Staging works and the
+	// procedure applies a data-file commit correctly when called on its own, but calling it on the
+	// pinned connection after the bulk loads tears the TDS stream, and DuckLake then retries a
+	// commit that cannot succeed. MSSQL_DUCKLAKE_SERVER_COMMIT=1 turns it on for that investigation.
+	if (getenv("MSSQL_DUCKLAKE_SERVER_COMMIT")) {
+		transaction.GetCatalog().SetRetrialsServerSide(true);
+	}
 }
 
 //===--------------------------------------------------------------------===//
