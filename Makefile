@@ -94,6 +94,18 @@ test-integration:
 	build/release/test/unittest '$(PROJ_DIR)test/sql/integration/*' 2>&1 | tee build/integration.log
 	scripts/ci/assert_ran.sh build/integration.log 1 1 'require-env MSSQL_DUCKLAKE_TEST_DSN'
 
+.PHONY: test-integration-fast-path
+# The same suite with phase 2's server-side apply armed (specs/005). It is off by default, so
+# nothing else reaches it - and the row-id bug that cost spec 005 a session was invisible to the
+# default path while being fatal on this one. The suite drives five data-only commits through the
+# apply, and both runs must agree, so this is the check that the two paths stay interchangeable.
+test-integration-fast-path: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
+test-integration-fast-path: export MSSQL_DUCKLAKE_SERVER_COMMIT := 1
+test-integration-fast-path:
+	@test -x build/release/test/unittest || { echo "build first: GEN=ninja make"; exit 1; }
+	build/release/test/unittest '$(PROJ_DIR)test/sql/integration/*' 2>&1 | tee build/integration-fast-path.log
+	scripts/ci/assert_ran.sh build/integration-fast-path.log 1 1 'require-env MSSQL_DUCKLAKE_TEST_DSN'
+
 .PHONY: vcpkg-setup
 vcpkg-setup:
 	@test -d vcpkg || git clone https://github.com/microsoft/vcpkg.git vcpkg
