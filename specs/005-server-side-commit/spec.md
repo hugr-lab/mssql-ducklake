@@ -484,12 +484,25 @@ prunes - and the ceiling is real: the same filtered read, hand-written both ways
 301 files and 12,341 stats rows, returns the same 114 rows in 0.228s through the catalog and 0.107s
 as one server-side join, and warm 0.005s against 0.001s.
 
-The constraint is finer than "inside a transaction it fails", which is what the notes said. Measured:
+The constraint is finer than "inside a transaction it fails", and finer than the first version of
+this section claimed. Measured:
 
-| | one `mssql_scan` beside a catalog scan | two `mssql_scan`s |
-| --- | --- | --- |
-| autocommit | works | works |
-| explicit transaction | works | fails |
+| shape, inside an explicit transaction | |
+| --- | --- |
+| five catalog scans in one statement | works |
+| one `mssql_scan` + a catalog scan, as a LEFT JOIN | works |
+| one `mssql_scan` + a catalog scan, as scalar subqueries | **fails** |
+| two `mssql_scan`s | fails |
+| any of the above in autocommit | works |
+
+The same ingredients pass or fail depending on the plan - whether the scan happens to be drained
+before the next source is opened. That is not something a manager can control or predict, which
+already argues the fix belongs in the extension rather than in how the SQL is shaped.
+
+And the five catalog scans are the proof that the fix works: catalog scans inside a transaction are
+materialised (spec 003 R2), five of them share the pinned connection in one statement, and there is
+no simultaneous-bind problem to solve. Binding is sequential on one thread; each source runs its
+query, buffers it, and hands the connection back before the next one binds.
 
 So the override was written to emit the direct form only in autocommit and the catalog form
 otherwise. It still fails, and the reason is the guard rather than the rule: DuckLake reads its
