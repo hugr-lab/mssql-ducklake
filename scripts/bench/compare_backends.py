@@ -40,11 +40,12 @@ def warmup(kind: str, mssql_dsn: str, pg_dsn: str) -> str:
     outlive the process that made it. That matters here: an mssql attach performs three TDS logins
     at ~175ms each on loopback, and they are the pool warming up (measured, specs/005 D8).
 
-    So each arm opens its backend, touches it and lets it go before the first phase marker. The
-    timings of these statements are never parsed - `run` only attributes a timing once it has seen a
-    marker - so this costs wall clock and appears in no column. Both backends get the same treatment,
-    which is the point: postgres defers connection setup where SQL Server front-loads it, and a
-    comparison that lets one of them pay at measurement time and the other not is not a comparison."""
+    So each arm opens its backend and touches it before the first phase marker, leaving it attached
+    for the reason below. The timings of these statements are never parsed - `run` only attributes a
+    timing once it has seen a marker - so this costs wall clock and appears in no column. Both
+    backends get the same treatment, which is the point: postgres defers connection setup where SQL
+    Server front-loads it, and a comparison that lets one of them pay at measurement time and the
+    other not is not a comparison."""
     # NOT detached. A connection pool belongs to the attached catalog, so detaching the warm one
     # throws away exactly what was warmed; left attached, the extension's connection cache can hand
     # its connections to the lake's own catalog on the same connection string.
