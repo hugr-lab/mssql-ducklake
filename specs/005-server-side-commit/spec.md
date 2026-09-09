@@ -439,6 +439,43 @@ Three things it is **not**, each measured rather than assumed:
 Backend-independent, and visible on postgres too at 7.9s. It belongs upstream in DuckLake, as a
 per-table schema load for this path rather than a whole-catalog one.
 
+### D13 — the steady-state 2x is the catalog path, not the wire and not metadata volume
+
+D11 left a 2x on repeated reads unexplained, and D10's answer - metadata volume - only covers the
+first read of a session. Taking the rest apart:
+
+**A round trip is cheaper here than on postgres.** Twenty trivial scans, mean per scan: **1.0ms on
+mssql, 2.3ms on postgres**. So the protocol is not the gap, which rules out the obvious suspect.
+
+**Reading through DuckDB's catalog costs four times what the same rows cost directly.** The same
+predicate over `ducklake_data_file`, alternated six times each:
+
+| | mean |
+| --- | ---: |
+| `SELECT ... FROM srv.dbo.ducklake_data_file WHERE ...`, the way DuckLake reads | 10.0ms |
+| `mssql_scan(srv, 'SELECT ... WHERE ...')`, the way the postgres manager reads its hot queries | 2.5ms |
+
+DuckLake issues about four catalog queries per read - the latest snapshot twice, the file list and
+the record counts - so that 7.5ms of per-query overhead is most of the 26ms a repeat read costs.
+
+**This corrects D12.** There I priced `GetLatestSnapshotQuery` at about a millisecond and concluded
+that copying the postgres manager's overrides was not worth doing. That number came from
+`dm_exec_query_stats`, which measures **server** time; the overhead is on the client - binding, the
+catalog entry lookup, and materialising the scan inside the transaction - and is invisible there. I
+measured the wrong side of the wire and drew the wrong conclusion from it.
+
+So `GetLatestSnapshotQuery` is worth doing, on the same grounds the postgres manager does it, and
+the stats CTE would be worth more still. The blocker for the CTE stands: several `mssql_scan` calls
+in one plan is the case v0.2.5 cannot materialise inside a transaction, which waits for the duckdb
+2.0 line. The latest-snapshot query is a sole source and can be done now.
+
+The read path therefore has two separate causes, not one:
+
+| | cost | cause | where the fix lives |
+| --- | --- | --- | --- |
+| first read of a session | 0.69s vs 0.15s | metadata volume, 1054 empty leftover tables | DuckLake |
+| every read after it | 26ms vs 13ms | ~4 catalog-path queries at ~10ms instead of ~2.5ms | here |
+
 ## Enforcement & security
 
 The procedure is created by us and takes no SQL from the client: its parameters are the schema name,
