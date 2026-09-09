@@ -97,6 +97,17 @@ of them; the types were checked coming back through the scan (`contains_null` ar
 
 Measured after the change, same fourteen alternating rounds: **mssql 0 of 14, postgres 0 of 14.**
 
+What it does **not** buy is throughput, and the measurement says so. Six writers, ten commits each,
+three rounds per timing, the two builds alternated: 19.49 / 19.54 / 20.69s for the five-statement
+form against 18.46 / 19.96 / 18.32s for the one-statement form. The ranges overlap — the new form is
+slower in one of the three rounds — so there is no wall-clock signal here, and the arithmetic agrees:
+eleven round trips at about a millisecond, on the fraction of commits that retry, is roughly half a
+second inside nineteen. The justification is the round trips and the guarantee, not the clock.
+
+Nor does it move `make bench` or `make bench-scale` at all, and it cannot: `CheckForConflicts` runs
+only when `i > 0`, so a single-writer benchmark never executes this query once. That is also why the
+bug survived so long — no single-threaded run reaches the code it lives in.
+
 Measured cost, for the record: the whole conflict query takes 0.002s against a thousand snapshots,
 0.003s against ten thousand and 0.016s against a hundred thousand, and the `MAX` subquery and the
 `TOP 1` forms are level on that axis. So `TOP 1` is not where the win is — the round trips are. An
