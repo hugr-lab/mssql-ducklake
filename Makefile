@@ -61,6 +61,31 @@ docker-down:
 docker-status:
 	$(DOCKER_COMPOSE) ps
 
+# The postgres catalog the benchmark compares against (docker profile `bench`, so it is not part of
+# `make docker-up`).
+MSSQL_DUCKLAKE_PG_HOST ?= localhost
+MSSQL_DUCKLAKE_PG_PORT ?= 7432
+MSSQL_DUCKLAKE_PG_USER ?= ducklake
+MSSQL_DUCKLAKE_PG_PASS ?= TestPassword1
+MSSQL_DUCKLAKE_PG_DB ?= lake_meta
+MSSQL_DUCKLAKE_PG_DSN ?= dbname=$(MSSQL_DUCKLAKE_PG_DB) host=$(MSSQL_DUCKLAKE_PG_HOST) port=$(MSSQL_DUCKLAKE_PG_PORT) user=$(MSSQL_DUCKLAKE_PG_USER) password=$(MSSQL_DUCKLAKE_PG_PASS)
+
+.PHONY: bench-up bench-down bench
+bench-up docker-status: export MSSQL_DUCKLAKE_PG_PORT := $(MSSQL_DUCKLAKE_PG_PORT)
+bench-up:
+	$(DOCKER_COMPOSE) --profile bench up -d --wait postgres
+
+bench-down:
+	$(DOCKER_COMPOSE) --profile bench down
+
+# The comparison specs/004 states its performance target against. Needs both servers:
+#   make docker-up bench-up && GEN=ninja make && make bench
+bench: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
+bench: export MSSQL_DUCKLAKE_PG_DSN := $(MSSQL_DUCKLAKE_PG_DSN)
+bench:
+	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
+	python3 scripts/bench/compare_backends.py
+
 # The server-backed suite (test/sql/integration/): gated on MSSQL_DUCKLAKE_TEST_DSN, so `make test`
 # skips it and this target is the one that provides it. The floor fails a run that skipped anyway.
 test-integration: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
