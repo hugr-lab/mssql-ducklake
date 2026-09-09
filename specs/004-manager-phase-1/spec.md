@@ -97,10 +97,22 @@ Two things about *how* they run were found the hard way, and both are load-beari
   to duplicate into one. There is no filtered form either, since stats have no `end_snapshot`; they
   belong to a file, and the file is what expires.
 
-  Added on the grounds that the predicate had no index rather than on a measured win: three attempts
-  to benchmark it disagreed with each other (0.195s→0.101s one way, 0.102s→0.124s the other), each
-  spoiled by measuring the two variants in sequence rather than alternating them. The honest state
-  is that the effect is unmeasured here, not that it is large.
+  Measured over 1000 tables holding 1.23M stats rows between them, asking one table for one column -
+  30 rows out of the million - with the rounds alternated so neither variant gets the cold cache:
+
+  | round | with the index | without |
+  | --- | ---: | ---: |
+  | 1 | 0.001s | 0.014s |
+  | 2 | 0.001s | 0.021s |
+  | 3 | 0.001s | 0.015s |
+
+  Fourteen to twenty times, and `sys.dm_db_index_usage_stats` confirms the shape: one **seek** on
+  this index and none on the primary key, against 32 scans of the key in the rounds without it.
+
+  **The distribution is what makes it matter, and getting that wrong is how three earlier attempts
+  concluded it was worthless.** With every row under a single `table_id` the same query matches
+  30,000 rows, a scan is competitive, and the index measures as no help at all. A real catalog
+  spreads its rows over its tables, and then the predicate is selective.
 
   `ducklake_snapshot` and `ducklake_snapshot_changes` need nothing: DuckLake gives both a clustered
   primary key on `snapshot_id`, which is exactly what every query asks them for.
