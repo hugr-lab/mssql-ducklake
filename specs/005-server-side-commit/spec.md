@@ -363,6 +363,42 @@ roughly thirteen times the biggest item on the path. Where it belongs — DuckLa
 function, or this manager - is the open question; doing it from the manager means dropping a table
 DuckLake still has registered, which is DuckLake's invariant to hold, not ours to break.
 
+### D11 — repeated reads on one connection, which is what a read workload actually does
+
+D10 measured the read path one session at a time, which charges every read the whole cost of opening
+the catalog. A read-heavy service does not work that way: it holds the connection and reads over and
+over. Timing each read inside one session, against the same production catalog:
+
+| read | mssql | postgres | ratio |
+| --- | ---: | ---: | ---: |
+| first read of the session | 0.686 | 0.149 | 4.6x |
+| the same table again | 0.026 | 0.013 | 2.0x |
+| the same table a third time | 0.027 | 0.013 | 2.1x |
+| first read of a second table | 0.101 | 0.049 | 2.1x |
+| that second table again | 0.026 | 0.012 | 2.2x |
+| first read of a third table | 0.105 | 0.060 | 1.8x |
+| first read of a fourth | 0.133 | 0.083 | 1.6x |
+| back to the first table | 0.031 | 0.015 | 2.1x |
+
+**In the steady state the backend is 2x postgres, not 8x and not 20x.** A repeated read costs 26ms
+against 13ms, and touching a table for the first time costs about 0.1s against 0.05s. Everything
+above those numbers is the session's first read - 0.686s against 0.149s - which is where the catalog
+metadata load lands, and it is paid **once** however many reads follow.
+
+Two things follow, and they point in different directions:
+
+- **For a service holding its connections, the read path is close to fine.** The one-off is
+  amortised to nothing over a few hundred reads, and what remains is a 2x that is spread evenly
+  across every shape of read rather than concentrated anywhere fixable.
+- **For anything that opens a connection per query** - serverless, a CLI, a scheduler starting a
+  fresh process each time - that 0.54s of one-off is paid per query, and then the 4.6x is the real
+  number. That is the case where D10's leftover empty inlined tables matter, because they are 13x of
+  the metadata that one-off consists of.
+
+So the read-path answer is conditional on the deployment, which is worth saying plainly rather than
+quoting a single ratio: pool the connections and the gap is 2x; do not, and it is 4.6x with a clear
+cause and a known fix that lives in DuckLake rather than here.
+
 ## Enforcement & security
 
 The procedure is created by us and takes no SQL from the client: its parameters are the schema name,
