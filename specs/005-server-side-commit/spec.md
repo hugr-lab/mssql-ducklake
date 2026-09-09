@@ -604,6 +604,12 @@ exists for exactly the last-page contention these ever-increasing keys should ca
 nothing: 3.78s off, 3.18s on, 2.90s off again - the last run being the fastest is the tell. Queueing
 behind the snapshot id hides any queueing behind a latch.
 
+It does nothing on the read side either, which was worth checking rather than asserting, since the
+option's name says nothing about which side it is for. Reads of a partitioned table, rounds
+alternated, discarding the first as warm-up: 0.0083s against 0.0077s, then 0.0080s against 0.0083s.
+The mechanism explains it - the option governs how *inserting* threads queue for the latch on an
+index's trailing page, and a read joins no such queue.
+
 **What the runs did find is a writer dying outright, in two runs of six**, with
 `INTERNAL Error: Failed to commit DuckLake transaction.` and, underneath it, `Calling
 GetValueInternal on a value that is NULL`. The stack:
