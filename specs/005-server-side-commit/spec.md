@@ -203,6 +203,61 @@ snapshot afterwards. `CanSkipSnapshotFetch` must therefore answer for exactly th
 finishes without falling back — which is why both now ask `IsDataFilesOnlyCommit` and neither decides
 anything after staging.
 
+### D8 — warmed, and against postgres: the commit path is not where the time goes
+
+`make bench` now runs each arm's whole workload once and throws the result away before timing, and
+`make bench-paths` compares the two commit paths the same way. Warming matters because the first run
+pays for the server's plan cache, its buffer pool and its file growth; alternating the arms per round
+removed the rest of the ordering bias.
+
+Warmed, against the postgres backend on the same workload, the SQL Server backend is **7.5x slower
+overall** — and almost none of that is the commit:
+
+| phase | mssql | postgres | ratio |
+| --- | --- | --- | --- |
+| attach (creates the catalog) | 1.715 | 0.055 | 31x |
+| reattach (opens an existing one) | 0.783 | 0.034 | 23x |
+| all the commit phases together | ~1.4 | ~0.3 | ~4x |
+
+**Where that goes is TDS logins, and they are the connection pool warming up.** From the server's
+`Logins/sec` counter, a bare attach performs three (one with `catalog false`, none also with
+`lazy_validation true`), and one login on loopback is 0.175s — three of them being the 0.51s the
+attach measures. But they are paid **once**: a session doing 41 commits performs the same four
+logins as one doing a single commit. So this is a fixed startup cost that the pool then serves the
+whole session from, not a per-operation one, and the 31x and 23x above describe *starting up*
+against postgres rather than running against it. Postgres is not doing the same work more cheaply;
+it defers connection setup and pays it later.
+
+Two things follow. The benchmark's totals overstate the practical gap for a long-lived session and
+understate it for a short one, so attach is worth reading as its own line rather than folded into a
+total. And `lazy_validation true` removes one of the logins, 0.15s, by deferring credential checking
+to first use — which for a lake is the very next statement.
+
+A preload of the catalog metadata was tried here and **dropped**: `mssql_preload_catalog` does load
+33 tables and 204 columns in 7ms, but the extension already loads eagerly at attach, so there is
+nothing left for a preload to save (measured: no difference beyond noise). No setting moves the
+attach either — `mssql_min_connections` is already 0, and statistics off, native types off and a
+larger TDS packet all measure the same. The cost is the logins, and the logins are the warmup.
+
+The commit-path crossover, measured per commit rather than per run — ten commits of N data files in
+one session, timed and divided, which is both faster and far less noisy than timing one commit per
+process:
+
+| data files in the commit | phase 1 | phase 2 | ratio |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.0404 | 0.0543 | 1.34x |
+| 8 | 0.0450 | 0.0548 | 1.22x |
+| 16 | 0.0619 | 0.0624 | 1.01x |
+| 24 | 0.0747 | 0.0675 | 0.90x |
+| 48 | 0.1235 | 0.0872 | 0.71x |
+| 128 | 0.3071 | 0.1433 | 0.47x |
+| 256 | 0.5735 | 0.2311 | 0.40x |
+
+Phase 1 grows with the number of files, phase 2 barely does — which is the shape the design predicted
+and D5 could only assert. **The crossover is around 16 data files**, and that is the threshold the
+path-picking rule should use. The staged file count is local duckdb state, known before anything
+crosses the wire.
+
 ## Enforcement & security
 
 The procedure is created by us and takes no SQL from the client: its parameters are the schema name,
