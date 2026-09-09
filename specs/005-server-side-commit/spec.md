@@ -300,6 +300,54 @@ catalog inserts use: *table ducklake_table has 9 columns but 8 values were suppl
 column list works, and raw T-SQL through `mssql_exec` works, so the fix is small and narrow, and is
 filed as hugr-lab/mssql-extension#327. Worth revisiting when that lands.
 
+### D10 — the read path, profiled at production scale
+
+`make bench-scale` at 1000 tables over 10 schemas, 41 columns each, three tables carrying a
+thousand file-backed commits and one carrying a hundred schema changes: **2.36x postgres overall**,
+down from 7.9x on the small workload. Fixed overheads stop dominating once the catalog is real,
+which is the first thing worth knowing.
+
+The read phases from that run:
+
+| read | mssql | postgres | ratio |
+| --- | ---: | ---: | ---: |
+| a table with 100 schema versions | 23.718 | 7.899 | 3.00x |
+| reattach against the full catalog | 4.523 | 0.242 | 18.7x |
+| one wide table out of a thousand | 3.059 | 0.176 | 17.4x |
+| filtered, over 1000 data files | 0.140 | 0.013 | 10.8x |
+| all of a table over 1000 data files | 0.081 | 0.033 | 2.45x |
+
+**Pruning over a thousand files is not the problem** — that read costs 81ms against 41,000 stats
+rows. The expensive reads are the ones that touch the catalog as a whole.
+
+Profiling one, statement by statement from `dm_exec_query_stats`, gives a single answer. Every read
+session spends **480ms of server time and 264,000 logical reads in one query** — the mssql
+extension's bulk metadata load — which is **76% of all server-side time on the read path**. Nothing
+DuckLake asks for comes close.
+
+What it is loading is the surprise:
+
+| | tables | columns |
+| --- | ---: | ---: |
+| inlined-data tables | 1155 | 50,035 |
+| catalog tables | 28 | 182 |
+
+**1054 of those 1155 inlined tables are empty**, left behind by `ducklake_flush_inlined_data` after
+it moved their rows into parquet, and all 1154 are still registered in
+`ducklake_inlined_data_tables`. Measured directly, the metadata query over everything takes 640ms
+for 50,217 rows; the same query with the empty inlined tables excluded takes **126ms for 4,118
+rows**. Five times cheaper, on the single most expensive thing a read does.
+
+DuckLake's own cleanup does not reach them. `DropEmptySupersededInlinedTables` selects tables whose
+`schema_version` is below the newest for that table — *superseded* ones. A table emptied by a flush
+is not superseded: it is the current version, and it is empty. So it survives every cleanup, and its
+metadata is re-read on every session that opens the catalog.
+
+That makes the read-path lever a cleanup rather than an index or a query rewrite, and it is worth
+roughly five times the biggest item on the path. Where it belongs — DuckLake's flush, a maintenance
+function, or this manager - is the open question; doing it from the manager means dropping a table
+DuckLake still has registered, which is DuckLake's invariant to hold, not ours to break.
+
 ## Enforcement & security
 
 The procedure is created by us and takes no SQL from the client: its parameters are the schema name,
