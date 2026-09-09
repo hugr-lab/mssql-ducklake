@@ -478,7 +478,34 @@ a repeat read on this catalog is 5ms rather than the 26ms the production one cos
 should grow with the catalog, since that is what makes the catalog path expensive, but that is an
 expectation and not a measurement.
 
-**The stats CTE cannot follow, and `MATERIALIZED` does not rescue it.** DuckLake already emits the
+**The stats CTE was tried and reverted.** It is the one that carries rows - one per file per
+filtered column, so a thousand-file table contributes a thousand rows per column to every read that
+prunes - and the ceiling is real: the same filtered read, hand-written both ways against a table of
+301 files and 12,341 stats rows, returns the same 114 rows in 0.228s through the catalog and 0.107s
+as one server-side join, and warm 0.005s against 0.001s.
+
+The constraint is finer than "inside a transaction it fails", which is what the notes said. Measured:
+
+| | one `mssql_scan` beside a catalog scan | two `mssql_scan`s |
+| --- | --- | --- |
+| autocommit | works | works |
+| explicit transaction | works | fails |
+
+So the override was written to emit the direct form only in autocommit and the catalog form
+otherwise. It still fails, and the reason is the guard rather than the rule: DuckLake reads its
+metadata on its own internal connection, inside its own transaction, so the autocommit the manager
+can see is not the autocommit the extension decides on. Adding a second catalog scan to the
+statement - the file list joins `ducklake_data_file` and `ducklake_delete_file` - is enough to
+collide even with a single `mssql_scan`.
+
+`GetFilesForTable` is virtual, so the whole query could be generated as one server-side statement
+instead, which would sidestep this entirely and do the pruning on the server. The parsing is not
+extracted - it is an inline loop building `DuckLakeFileListEntry` - so that path means duplicating
+it and re-auditing on every submodule bump, against a ceiling measured in milliseconds at this
+catalog size. Worth revisiting when the deferred-`BEGIN`-until-first-write idea below lands, which
+would remove the constraint rather than work around it.
+
+**`MATERIALIZED` does not rescue it either.** DuckLake already emits the
 hint itself - `AS MATERIALIZED` when a CTE is referenced more than once, `AS NOT MATERIALIZED`
 otherwise - so the obvious idea is to force materialisation and let the scans run one at a time.
 Tried, at the top level and nested as `WITH x AS (WITH s AS MATERIALIZED (...) SELECT * FROM s)`:
@@ -486,8 +513,21 @@ both fail inside a transaction with *connection not in Idle state*, and both suc
 
 The reason is that `mssql_scan` runs its query **at bind time**, to learn its result columns - the
 same point at which the metadata is loaded. Every source of a statement is bound before any of them
-is executed, so two scans in one statement collide however the plan later chooses to evaluate them.
+is executed, so scans in one statement collide however the plan later chooses to evaluate them.
 Materialisation reorders execution, and the constraint is not in execution.
+
+What holds the connection, and therefore what would have to change: the extension pins one pooled
+connection to an explicit transaction, issues `BEGIN TRANSACTION` on it and binds the 8-byte
+transaction descriptor to it, so every later statement must go there. That connection then carries
+the catalog scans, our `mssql_exec` calls, and phase 2's `#temp` staging tables with the bulk loads
+that fill them - session temp tables live on the connection, which is why the apply batch must run
+on it.
+
+Pinning starts at the **first access** in a transaction, read or write. A read-only DuckLake
+transaction does not need SQL Server isolation at all: its consistency comes from the snapshot
+predicate in DuckLake's own SQL, and writers only append new snapshots. Deferring `BEGIN` to the
+first write would let reads take pooled connections and remove this constraint for them, which is
+the shape most of a read workload has.
 
 The read path therefore has two separate causes, not one:
 
