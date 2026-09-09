@@ -12,231 +12,6 @@ namespace duckdb {
 MSSQLMetadataManager::MSSQLMetadataManager(DuckLakeTransaction &transaction) : DuckLakeMetadataManager(transaction) {
 }
 
-namespace {
-
-//! Is this offset the start of a whole word (so `true` in `construed` is not a match)?
-bool IsWordBoundary(const string &sql, idx_t pos, idx_t len) {
-	auto is_word_char = [](char c) {
-		return StringUtil::CharacterIsAlphaNumeric(c) || c == '_';
-	};
-	if (pos > 0 && is_word_char(sql[pos - 1])) {
-		return false;
-	}
-	const idx_t after = pos + len;
-	return after >= sql.size() || !is_word_char(sql[after]);
-}
-
-bool MatchesAt(const string &sql, idx_t pos, const char *needle) {
-	return sql.compare(pos, strlen(needle), needle) == 0;
-}
-
-//! The identifier of the table a `CREATE TABLE IF NOT EXISTS <identifier>(` names, as written -
-//! ducklake produces a quoted, schema-qualified name here.
-string ReadTableIdentifier(const string &sql, idx_t pos, idx_t &out_end) {
-	idx_t start = pos;
-	while (start < sql.size() && StringUtil::CharacterIsSpace(sql[start])) {
-		start++;
-	}
-	idx_t end = start;
-	bool in_quotes = false;
-	while (end < sql.size()) {
-		const char c = sql[end];
-		if (c == '"') {
-			in_quotes = !in_quotes;
-		} else if (!in_quotes && (c == '(' || StringUtil::CharacterIsSpace(c))) {
-			break;
-		}
-		end++;
-	}
-	out_end = end;
-	return sql.substr(start, end - start);
-}
-
-//! Quote a comma-separated column list the way T-SQL wants it, so a name that collides with a
-//! reserved word (ducklake has a `key` column) survives.
-string QuoteColumnList(const string &columns) {
-	string result;
-	for (auto &column : StringUtil::Split(columns, ',')) {
-		auto name = column;
-		StringUtil::Trim(name);
-		if (name.empty()) {
-			continue;
-		}
-		if (!result.empty()) {
-			result += ", ";
-		}
-		if (name.front() == '"') {
-			result += name;
-		} else {
-			result += "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
-		}
-	}
-	return result;
-}
-
-//! Skip from an opening parenthesis to the one that closes it, stepping over string literals.
-//! Returns npos when the batch is unbalanced, which means we did not understand it.
-idx_t FindMatchingParen(const string &sql, idx_t open_paren) {
-	idx_t depth = 0;
-	for (idx_t i = open_paren; i < sql.size(); i++) {
-		const char c = sql[i];
-		if (c == '\'' || c == '"') {
-			const char quote = c;
-			i++;
-			while (i < sql.size()) {
-				if (sql[i] == quote) {
-					if (i + 1 < sql.size() && sql[i + 1] == quote) {
-						i++;
-					} else {
-						break;
-					}
-				}
-				i++;
-			}
-			continue;
-		}
-		if (c == '(') {
-			depth++;
-		} else if (c == ')') {
-			depth--;
-			if (depth == 0) {
-				return i;
-			}
-		}
-	}
-	return DConstants::INVALID_INDEX;
-}
-
-idx_t SkipSpaces(const string &sql, idx_t pos) {
-	while (pos < sql.size() && StringUtil::CharacterIsSpace(sql[pos])) {
-		pos++;
-	}
-	return pos;
-}
-
-} // namespace
-
-MSSQLMetadataManager::TranspiledBatch MSSQLMetadataManager::TranspileBatch(const string &query) {
-	TranspiledBatch batch;
-	string &result = batch.sql;
-	result.reserve(query.size() + query.size() / 8);
-
-	for (idx_t i = 0; i < query.size();) {
-		const char c = query[i];
-
-		// Data, not code: copy string literals and quoted identifiers through untouched, so a value
-		// that happens to contain NOW() or the word `true` survives. '' and "" escape themselves.
-		if (c == '\'' || c == '"') {
-			const char quote = c;
-			// A bare 'text' literal is parsed in the database's collation code page, so anything
-			// outside it becomes '?' before it ever reaches a UTF-8 column - silently. N'text' is
-			// parsed as Unicode and converts losslessly into one. The database default is often a
-			// legacy CP1252 collation, so this is not a corner case.
-			if (quote == '\'' && !(i > 0 && (query[i - 1] == 'N' || query[i - 1] == 'n'))) {
-				result += 'N';
-			}
-			result += quote;
-			i++;
-			while (i < query.size()) {
-				if (query[i] == quote) {
-					if (i + 1 < query.size() && query[i + 1] == quote) {
-						result.append(2, quote);
-						i += 2;
-						continue;
-					}
-					result += quote;
-					i++;
-					break;
-				}
-				result += query[i++];
-			}
-			continue;
-		}
-
-		// NOW() - the commit timestamp of a snapshot, and of a scheduled deletion
-		if (MatchesAt(query, i, "NOW()")) {
-			result += "SYSDATETIMEOFFSET()";
-			i += 5;
-			continue;
-		}
-		// boolean literals: SQL Server has BIT, and no `true`/`false` keywords
-		if (MatchesAt(query, i, "true") && IsWordBoundary(query, i, 4)) {
-			result += "1";
-			i += 4;
-			continue;
-		}
-		if (MatchesAt(query, i, "false") && IsWordBoundary(query, i, 5)) {
-			result += "0";
-			i += 5;
-			continue;
-		}
-		// the batch casts its boolean columns by DuckDB's type name
-		if (MatchesAt(query, i, "BOOLEAN") && IsWordBoundary(query, i, 7)) {
-			result += "BIT";
-			i += 7;
-			continue;
-		}
-		// CREATE TABLE IF NOT EXISTS x(...) -> IF OBJECT_ID('x') IS NULL CREATE TABLE x(...)
-		if (MatchesAt(query, i, "CREATE TABLE IF NOT EXISTS") && IsWordBoundary(query, i, 6)) {
-			idx_t name_end;
-			auto identifier = ReadTableIdentifier(query, i + strlen("CREATE TABLE IF NOT EXISTS"), name_end);
-			// OBJECT_ID takes the name as a string, so the identifier quotes are dropped from it
-			auto object_name = StringUtil::Replace(StringUtil::Replace(identifier, "\"", ""), "'", "''");
-			result += StringUtil::Format("IF OBJECT_ID('%s') IS NULL CREATE TABLE %s", object_name, identifier);
-			batch.changes_schema = true;
-			i = name_end;
-			continue;
-		}
-		if (MatchesAt(query, i, "DROP TABLE") && IsWordBoundary(query, i, 4)) {
-			// valid T-SQL as generated (2016+); the cache still has to hear about it
-			batch.changes_schema = true;
-			result += c;
-			i++;
-			continue;
-		}
-		// WITH cte(a, b) AS (VALUES ...) is DuckDB's; T-SQL needs the VALUES list to be a derived
-		// table with an alias. The column list is right there, so it names the alias too.
-		if (MatchesAt(query, i, "WITH") && IsWordBoundary(query, i, 4)) {
-			idx_t pos = SkipSpaces(query, i + 4);
-			const idx_t name_start = pos;
-			while (pos < query.size() && (StringUtil::CharacterIsAlphaNumeric(query[pos]) || query[pos] == '_')) {
-				pos++;
-			}
-			const string cte_name = query.substr(name_start, pos - name_start);
-			pos = SkipSpaces(query, pos);
-			if (!cte_name.empty() && pos < query.size() && query[pos] == '(') {
-				const idx_t columns_end = FindMatchingParen(query, pos);
-				if (columns_end != DConstants::INVALID_INDEX) {
-					const string columns = query.substr(pos + 1, columns_end - pos - 1);
-					idx_t after = SkipSpaces(query, columns_end + 1);
-					if (MatchesAt(query, after, "AS") && IsWordBoundary(query, after, 2)) {
-						after = SkipSpaces(query, after + 2);
-						if (after < query.size() && query[after] == '(') {
-							const idx_t body_end = FindMatchingParen(query, after);
-							const idx_t body_start = SkipSpaces(query, after + 1);
-							if (body_end != DConstants::INVALID_INDEX && MatchesAt(query, body_start, "VALUES")) {
-								// the body is code too - it carries the booleans this batch writes, so it
-								// goes through the scanner rather than being copied verbatim
-								auto values = TranspileBatch(query.substr(body_start, body_end - body_start));
-								batch.changes_schema |= values.changes_schema;
-								const string quoted = QuoteColumnList(columns);
-								result += StringUtil::Format("WITH %s(%s) AS (SELECT * FROM (%s) AS __v(%s))", cte_name,
-								                             quoted, values.sql, quoted);
-								i = body_end + 1;
-								continue;
-							}
-						}
-					}
-				}
-			}
-		}
-
-		result += c;
-		i++;
-	}
-	return batch;
-}
-
 bool MSSQLMetadataManager::TypeIsNativelySupported(const LogicalType &type) {
 	switch (type.id()) {
 	// SQL Server has no NaN and no infinities, so a float column cannot round trip
@@ -312,57 +87,170 @@ string MSSQLMetadataManager::GetColumnTypeInternal(const LogicalType &column_typ
 	}
 }
 
-void MSSQLMetadataManager::SubstitutePassthroughPlaceholders(DuckLakeSnapshot snapshot, string &query) const {
-	auto &commit_info = transaction.GetCommitInfo();
-	query = StringUtil::Replace(query, "{SNAPSHOT_ID}", to_string(snapshot.snapshot_id));
-	query = StringUtil::Replace(query, "{SCHEMA_VERSION}", to_string(snapshot.schema_version));
-	query = StringUtil::Replace(query, "{NEXT_CATALOG_ID}", to_string(snapshot.next_catalog_id));
-	query = StringUtil::Replace(query, "{NEXT_FILE_ID}", to_string(snapshot.next_file_id));
-	query = StringUtil::Replace(query, "{AUTHOR}", commit_info.author.ToSQLString());
-	query = StringUtil::Replace(query, "{COMMIT_MESSAGE}", commit_info.commit_message.ToSQLString());
-	query = StringUtil::Replace(query, "{COMMIT_EXTRA_INFO}", commit_info.commit_extra_info.ToSQLString());
-
-	auto &ducklake_catalog = transaction.GetCatalog();
-	auto catalog_literal = DuckLakeUtil::SQLLiteralToString(ducklake_catalog.MetadataDatabaseName());
-	auto catalog_identifier = DuckLakeUtil::SQLIdentifierToString(ducklake_catalog.MetadataDatabaseName());
-	auto schema_identifier = DuckLakeUtil::SQLIdentifierToString(ducklake_catalog.MetadataSchemaName());
-	auto schema_identifier_escaped = StringUtil::Replace(schema_identifier, "'", "''");
-	auto schema_literal = DuckLakeUtil::SQLLiteralToString(ducklake_catalog.MetadataSchemaName());
-	auto metadata_path = DuckLakeUtil::SQLLiteralToString(ducklake_catalog.MetadataPath());
-	auto data_path = DuckLakeUtil::SQLLiteralToString(ducklake_catalog.DataPath());
-
-	query = StringUtil::Replace(query, "{METADATA_CATALOG_NAME_LITERAL}", catalog_literal);
-	query = StringUtil::Replace(query, "{METADATA_CATALOG_NAME_IDENTIFIER}", catalog_identifier);
-	query = StringUtil::Replace(query, "{METADATA_SCHEMA_NAME_LITERAL}", schema_literal);
-	// the schema alone: this SQL runs on the server, where the attached catalog is not a prefix
-	query = StringUtil::Replace(query, "{METADATA_CATALOG}", schema_identifier);
-	query = StringUtil::Replace(query, "{METADATA_SCHEMA_ESCAPED}", schema_identifier_escaped);
-	query = StringUtil::Replace(query, "{METADATA_PATH}", metadata_path);
-	query = StringUtil::Replace(query, "{DATA_PATH}", data_path);
+string MSSQLMetadataManager::SchemaIdentifier() const {
+	return DuckLakeUtil::SQLIdentifierToString(transaction.GetCatalog().MetadataSchemaName());
 }
 
-unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot, string &query) {
-	SubstitutePassthroughPlaceholders(snapshot, query);
-	auto batch = TranspileBatch(query);
+string MSSQLMetadataManager::CatalogLiteral() const {
+	return DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataDatabaseName());
+}
 
-	auto &ducklake_catalog = transaction.GetCatalog();
-	auto catalog_literal = DuckLakeUtil::SQLLiteralToString(ducklake_catalog.MetadataDatabaseName());
+void MSSQLMetadataManager::RunServerSide(const string &tsql, const string &context) {
 	auto &connection = transaction.GetConnection();
-	auto result =
-	    connection.Query(StringUtil::Format("SELECT mssql_exec(%s, %s)", catalog_literal, SQLString(batch.sql)));
-	if (result->HasError() || !batch.changes_schema) {
-		return result;
+	auto result = connection.Query(StringUtil::Format("SELECT mssql_exec(%s, %s)", CatalogLiteral(), SQLString(tsql)));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw(context);
 	}
-	// The batch created or dropped a table (an inlined data or deletion table). The mssql extension
-	// caches catalog metadata and cannot see a change made behind its back through mssql_exec, so
-	// the reads that follow in this session would miss the table entirely - a silently stale answer
-	// rather than an error. Its own `mssql_exec_invalidate_cache` setting does this, but it is
-	// global and the user's to set; point invalidation is ours to call.
-	auto invalidate = connection.Query(StringUtil::Format("SELECT mssql_invalidate_cache(%s)", catalog_literal));
-	if (invalidate->HasError()) {
-		invalidate->GetErrorObject().Throw("Failed to refresh the SQL Server catalog cache after DDL: ");
+}
+
+void MSSQLMetadataManager::RunServerSideOutsideTransaction(const string &tsql, const string &context) {
+	// A table this transaction creates but has not committed is locked against the metadata query
+	// the mssql extension runs to discover it - and that query takes its own connection, so it waits
+	// on us until it times out. Creating the table on a connection of its own, in autocommit, makes
+	// it visible immediately and holds no lock. The statement is `IF OBJECT_ID(...) IS NULL`-shaped,
+	// so a rolled back commit leaves at worst an empty table that the next attempt reuses.
+	auto client_context = transaction.context.lock();
+	if (!client_context) {
+		throw InternalException("MSSQLMetadataManager: the client context is gone");
 	}
-	return result;
+	Connection connection(*client_context->db);
+	auto result = connection.Query(StringUtil::Format("SELECT mssql_exec(%s, %s)", CatalogLiteral(), SQLString(tsql)));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw(context);
+	}
+}
+
+void MSSQLMetadataManager::ClearCache() {
+	// The mssql extension caches catalog metadata, and a table created behind its back through
+	// mssql_exec is invisible to the duckdb reads that follow - they miss it silently rather than
+	// failing. DuckLake already knows when that has happened (`MarkPendingCacheClear` on creating an
+	// inlined table) and calls this after the commit, which is the only safe moment: a refresh
+	// issued mid-transaction queries the catalog on a second connection and blocks on the schema
+	// locks the transaction itself is holding. The extension's own setting for this is global and
+	// fires on every DML; this is the point version.
+	auto &connection = transaction.GetConnection();
+	auto result = connection.Query(StringUtil::Format("SELECT mssql_invalidate_cache(%s)", CatalogLiteral()));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to refresh the SQL Server catalog cache: ");
+	}
+}
+
+void MSSQLMetadataManager::InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) {
+	auto &connection = transaction.GetConnection();
+	// SQL Server 2019 is the floor: older servers have no UTF-8 collation, so the catalog could not
+	// store the strings DuckLake puts in it without lossy conversion. SERVERPROPERTY returns
+	// sql_variant, which the mssql extension cannot decode - hence the cast, server-side.
+	auto version = connection.Query(StringUtil::Format(
+	    "SELECT major FROM mssql_scan(%s, 'SELECT CAST(SERVERPROPERTY(''ProductMajorVersion'') AS INT) AS major')",
+	    CatalogLiteral()));
+	if (version->HasError()) {
+		version->GetErrorObject().Throw("Failed to read the SQL Server version: ");
+	}
+	auto major = version->Fetch();
+	if (!major || major->size() == 0 || major->GetValue(0, 0).IsNull() ||
+	    major->GetValue(0, 0).GetValue<int32_t>() < 15) {
+		throw NotImplementedException("A DuckLake catalog needs SQL Server 2019 or newer: its string columns are "
+		                              "stored with a UTF-8 collation, which older versions do not have.");
+	}
+
+	// DuckLake's own DDL first, through duckdb - it owns the shape of its catalog, and reproducing
+	// it here would be a copy to re-audit on every submodule bump.
+	DuckLakeMetadataManager::InitializeDuckLake(has_explicit_schema, encryption);
+
+	const string schema = SchemaIdentifier();
+	// Two phases, because within one T-SQL batch a column's new NOT NULL is not yet visible to a
+	// constraint that needs it - the server answers "cannot define PRIMARY KEY on a nullable column".
+	string columns_ddl;
+	string constraints_ddl;
+
+	// Primary keys. DuckLake declares a few itself; the rest are ours, and they are what make the
+	// catalog writable: the mssql extension builds a row identity out of the primary key, and
+	// without one it refuses every UPDATE and DELETE - which a commit is full of.
+	const vector<pair<string, string>> keys = {
+	    {"ducklake_table_stats", "table_id"},
+	    {"ducklake_table_column_stats", "table_id, column_id"},
+	    {"ducklake_table", "table_id, begin_snapshot"},
+	    {"ducklake_view", "view_id, begin_snapshot"},
+	    {"ducklake_column", "table_id, column_id, begin_snapshot"},
+	    {"ducklake_tag", "object_id, begin_snapshot, [key]"},
+	    {"ducklake_column_tag", "table_id, column_id, begin_snapshot, [key]"},
+	    {"ducklake_partition_info", "partition_id"},
+	    {"ducklake_sort_info", "sort_id"},
+	    {"ducklake_macro", "macro_id, begin_snapshot"},
+	    {"ducklake_inlined_data_tables", "table_id, schema_version"},
+	    {"ducklake_files_scheduled_for_deletion", "data_file_id"},
+	};
+	for (auto &entry : keys) {
+		for (auto &column : StringUtil::Split(entry.second, ',')) {
+			auto name = column;
+			StringUtil::Trim(name);
+			// a key column has to be NOT NULL, and DuckLake declares none of them so. The tag tables
+			// key on a name rather than an id; a primary key cannot be over MAX, so it is capped -
+			// 200 bytes of UTF-8 is a long tag name and well inside the 900-byte index limit.
+			const bool is_name = name == "[key]";
+			columns_ddl += StringUtil::Format(
+			    "ALTER TABLE %s.%s ALTER COLUMN %s %s NOT NULL;\n", schema, entry.first, name,
+			    is_name ? StringUtil::Format("VARCHAR(200) COLLATE %s", VARCHAR_COLLATION) : string("BIGINT"));
+		}
+		constraints_ddl += StringUtil::Format("ALTER TABLE %s.%s ADD CONSTRAINT pk_%s PRIMARY KEY (%s);\n", schema,
+		                                      entry.first, entry.first, entry.second);
+	}
+
+	// The statistics DuckLake compares server-side. Its min/max values are the bytes DuckDB computed
+	// in UTF-8 order, and a filter it pushes down is answered by the column's collation - so a
+	// linguistic one prunes wrongly and drops rows from a result. BIN2 over UTF-8 is DuckDB's order.
+	const vector<pair<string, string>> stats_columns = {
+	    {"ducklake_file_column_stats", "min_value"},  {"ducklake_file_column_stats", "max_value"},
+	    {"ducklake_table_column_stats", "min_value"}, {"ducklake_table_column_stats", "max_value"},
+	    {"ducklake_file_variant_stats", "min_value"}, {"ducklake_file_variant_stats", "max_value"},
+	};
+	for (auto &entry : stats_columns) {
+		columns_ddl += StringUtil::Format("ALTER TABLE %s.%s ALTER COLUMN %s VARCHAR(MAX) COLLATE %s;\n", schema,
+		                                  entry.first, entry.second, VARCHAR_COLLATION);
+	}
+
+	// Filtered indexes on the condition almost every DuckLake read carries. Neither the postgres nor
+	// the sqlite manager has indexes here at all.
+	const vector<pair<string, string>> live_indexes = {
+	    {"ducklake_data_file", "table_id"}, {"ducklake_delete_file", "table_id"}, {"ducklake_table", "schema_id"},
+	    {"ducklake_column", "table_id"},    {"ducklake_view", "schema_id"},
+	};
+	for (auto &entry : live_indexes) {
+		constraints_ddl += StringUtil::Format("CREATE INDEX ix_%s_live ON %s.%s(%s) WHERE end_snapshot IS NULL;\n",
+		                                      entry.first, schema, entry.first, entry.second);
+	}
+
+	RunServerSide(columns_ddl, "Failed to prepare the DuckLake catalog columns for SQL Server: ");
+	RunServerSide(constraints_ddl, "Failed to key and index the DuckLake catalog for SQL Server: ");
+}
+
+string MSSQLMetadataManager::GetInlinedTableQueries(DuckLakeSnapshot commit_snapshot, const DuckLakeTableInfo &table,
+                                                    string &inlined_tables, string &inlined_table_queries) {
+	// Let the base build the registration tuple and the DDL, then take the DDL out of the batch and
+	// run it ourselves: it carries our column types, which are T-SQL and would not parse in the
+	// duckdb batch the rest of the commit travels in.
+	string ddl;
+	auto table_name = DuckLakeMetadataManager::GetInlinedTableQueries(commit_snapshot, table, inlined_tables, ddl);
+	if (!ddl.empty()) {
+		auto statement = StringUtil::Replace(ddl, "{METADATA_CATALOG}", SchemaIdentifier());
+		// IF NOT EXISTS is DuckDB's spelling; T-SQL asks the question with OBJECT_ID
+		statement = StringUtil::Replace(statement, "CREATE TABLE IF NOT EXISTS ", "CREATE TABLE ");
+		// An inlined row is updated (its end_snapshot is set) and deleted, so this table needs a key
+		// for the same reason the catalog's own tables do - the mssql extension builds a row identity
+		// out of it. (row_id, begin_snapshot) is what identifies a version of an inlined row.
+		statement = StringUtil::Replace(statement, "row_id BIGINT, begin_snapshot BIGINT,",
+		                                "row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL,");
+		const auto close_paren = statement.rfind(')');
+		if (close_paren != string::npos) {
+			statement.insert(close_paren,
+			                 StringUtil::Format(", CONSTRAINT pk_%s PRIMARY KEY (row_id, begin_snapshot)", table_name));
+		}
+		statement = StringUtil::Format("IF OBJECT_ID('%s.%s') IS NULL %s",
+		                               transaction.GetCatalog().MetadataSchemaName(), table_name, statement);
+		RunServerSideOutsideTransaction(statement, "Failed to create the inlined data table: ");
+	}
+	(void)inlined_table_queries;
+	return table_name;
 }
 
 } // namespace duckdb

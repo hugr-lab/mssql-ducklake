@@ -24,9 +24,21 @@ public:
 		return 128;
 	}
 
-	//! The commit batch goes to the server as one raw T-SQL statement through `mssql_exec`, so
-	//! duckdb's DML path - and its primary-key requirement - is never involved (specs/004 D1).
-	unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string &query) override;
+	//! Our own initialization: DuckLake's DDL, then the T-SQL it cannot express - primary keys, the
+	//! filtered indexes every versioned read wants, and a binary UTF-8 collation on the statistics
+	//! columns the server compares (specs/004 D3). The keys are what let every UPDATE and DELETE in
+	//! a commit run through duckdb, which is why this manager needs no SQL rewriting at all.
+	void InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) override;
+
+	//! Drop the mssql extension's catalog cache, which DuckLake asks for after a commit that created
+	//! an inlined table - the one moment it is safe to (specs/004 D2).
+	void ClearCache() override;
+
+	//! The inlined table's DDL is ours (its types and collation are), and T-SQL cannot travel in a
+	//! batch duckdb parses - so it is executed here, on the transaction's connection, and left out
+	//! of the batch (specs/004 D2).
+	string GetInlinedTableQueries(DuckLakeSnapshot commit_snapshot, const DuckLakeTableInfo &table,
+	                              string &inlined_tables, string &inlined_table_queries) override;
 
 	//! The inlining type matrix (specs/004 D4). A type SQL Server cannot hold exactly is stored as
 	//! text and cast back on read; everything else gets a real column type.
@@ -52,10 +64,15 @@ public:
 	static TranspiledBatch TranspileBatch(const string &query);
 
 private:
-	//! Placeholder substitution for the passthrough. Mirrors the base, except that
-	//! `{METADATA_CATALOG}` becomes the schema identifier alone: the SQL runs inside SQL Server,
-	//! where the attached catalog's name is not a prefix (the postgres manager does the same).
-	void SubstitutePassthroughPlaceholders(DuckLakeSnapshot snapshot, string &query) const;
+	//! Run T-SQL on the metadata server through `mssql_exec`, on this transaction's connection.
+	void RunServerSide(const string &tsql, const string &context);
+	//! The same, on a connection of its own in autocommit - for DDL whose table duckdb has to
+	//! discover before this transaction commits.
+	void RunServerSideOutsideTransaction(const string &tsql, const string &context);
+	//! The schema the catalog lives in, quoted for T-SQL.
+	string SchemaIdentifier() const;
+	//! The name of the attached mssql catalog, as a SQL literal - `mssql_exec`'s first argument.
+	string CatalogLiteral() const;
 };
 
 } // namespace duckdb
