@@ -87,58 +87,47 @@ WHERE record_count IS NOT NULL
 ORDER BY table_id NULLS FIRST;
 	)";
 
-//! The replacement. Reading the table once removes the disagreement rather than papering over it:
-//! one scan cannot contradict itself, whatever commits in parallel. Everything else is untouched -
-//! same columns in the same order, same placeholders - because DuckLake's parser depends on all of
-//! it, and the base substitutes {METADATA_CATALOG} and {SNAPSHOT_ID} here exactly as it would there.
+//! The replacement: the same question asked as ONE statement the server answers by itself.
+//!
+//! Two properties follow from that, and only the first is why it was written. A single statement is
+//! evaluated against a single consistent state, so no part of it can disagree with any other part -
+//! which fixes the crash above and, unlike patching the one branch that happened to read a table
+//! twice, keeps fixing it if DuckLake's query ever reads any table twice again. And it is one round
+//! trip: the DuckDB-SQL form sends a separate SELECT per table, measured at 25 batches against 14
+//! for this one on the same conflict check (specs/007 D1).
+//!
+//! T-SQL differences from DuckLake's version, none of them optional: `JOIN ... ON` because `USING`
+//! is not T-SQL; `TOP 1` in a derived table because a branch of a `UNION ALL` may not carry its own
+//! `ORDER BY`; `CAST(NULL AS ...)` so the union resolves the column types rather than guessing from
+//! an untyped NULL; and no `NULLS FIRST`, which SQL Server does not have and does not need, since it
+//! sorts NULLs first ascending - which is what puts the snapshot row where the parser expects it.
+//!
+//! The inner text travels inside a DuckDB string literal, so each of its own quotes is doubled once.
 constexpr const char *MSSQL_CONFLICT_CHECK_QUERY = R"(
-SELECT
-    snapshot_id,
-    schema_version,
-    next_catalog_id,
-    next_file_id,
-    COALESCE((
-            SELECT STRING_AGG(changes_made, ',')
-            FROM {METADATA_CATALOG}.ducklake_snapshot_changes c
-            WHERE c.snapshot_id > {SNAPSHOT_ID}
-            ),'') AS changes,
-    NULL AS table_id,
-    NULL AS column_id,
-    NULL AS record_count,
-    NULL AS next_row_id,
-    NULL AS file_size_bytes,
-    NULL AS contains_null,
-    NULL AS contains_nan,
-    NULL AS min_value,
-    NULL AS max_value,
-    NULL AS extra_stats
-    FROM (
-        SELECT * FROM {METADATA_CATALOG}.ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 1
-    ) latest_snapshot
+SELECT * FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, '
+SELECT s.snapshot_id, s.schema_version, s.next_catalog_id, s.next_file_id,
+       COALESCE((SELECT STRING_AGG(changes_made, '','')
+                 FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot_changes c
+                 WHERE c.snapshot_id > {SNAPSHOT_ID}), '''') AS changes,
+       CAST(NULL AS BIGINT) AS table_id,
+       CAST(NULL AS BIGINT) AS column_id,
+       CAST(NULL AS BIGINT) AS record_count,
+       CAST(NULL AS BIGINT) AS next_row_id,
+       CAST(NULL AS BIGINT) AS file_size_bytes,
+       CAST(NULL AS BIT) AS contains_null,
+       CAST(NULL AS BIT) AS contains_nan,
+       CAST(NULL AS VARCHAR(MAX)) AS min_value,
+       CAST(NULL AS VARCHAR(MAX)) AS max_value,
+       CAST(NULL AS VARCHAR(MAX)) AS extra_stats
+FROM (SELECT TOP 1 * FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot ORDER BY snapshot_id DESC) s
 UNION ALL
-SELECT
-    NULL,
-    NULL,
-    NULL,
-    NULL,
-    NULL,
-    table_id,
-    column_id,
-    record_count,
-    next_row_id,
-    file_size_bytes,
-    contains_null,
-    contains_nan,
-    min_value,
-    max_value,
-    extra_stats
-FROM {METADATA_CATALOG}.ducklake_table_stats
-LEFT JOIN {METADATA_CATALOG}.ducklake_table_column_stats
-    USING (table_id)
-WHERE record_count IS NOT NULL
-    AND file_size_bytes IS NOT NULL
-ORDER BY table_id NULLS FIRST;
-	)";
+SELECT NULL, NULL, NULL, NULL, NULL,
+       ts.table_id, cs.column_id, ts.record_count, ts.next_row_id, ts.file_size_bytes,
+       cs.contains_null, cs.contains_nan, cs.min_value, cs.max_value, cs.extra_stats
+FROM {METADATA_SCHEMA_ESCAPED}.ducklake_table_stats ts
+LEFT JOIN {METADATA_SCHEMA_ESCAPED}.ducklake_table_column_stats cs ON cs.table_id = ts.table_id
+WHERE ts.record_count IS NOT NULL AND ts.file_size_bytes IS NOT NULL
+ORDER BY table_id'))";
 
 } // namespace
 

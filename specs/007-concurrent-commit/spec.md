@@ -67,44 +67,42 @@ first row of the result was a statistics row, and DuckLake read its NULL `snapsh
 
 Postgres does not have this because its scanner reads inside one transaction snapshot.
 
-**The fix** is one line of SQL. The replacement is DuckLake's query verbatim except for the snapshot
-branch:
+**The fix** is to ask the whole question as one statement the server answers by itself, through a
+single `mssql_scan` — the pattern `GetLatestSnapshotQuery` already uses here:
 
 ```sql
-FROM ( SELECT * FROM {METADATA_CATALOG}.ducklake_snapshot ORDER BY snapshot_id DESC LIMIT 1 ) latest_snapshot
+SELECT * FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, '… TOP 1 … UNION ALL … ORDER BY table_id')
 ```
 
-One reference to the table, therefore one scan — confirmed by the same debug output, 2 scans down to
-1 — and one scan cannot contradict itself no matter what commits in parallel. `ORDER BY … DESC LIMIT
-1` picks the same row as `= (SELECT MAX(…))` because `snapshot_id` is the primary key, so there are
-no ties to break. Everything else is untouched, because DuckLake's parser depends on the column list,
-the column order and both branches.
+One statement is evaluated against one consistent state, so no part of it can disagree with any other
+part. That is a stronger guarantee than the first version of this fix, which only stopped the
+snapshot branch from reading its table twice: this one keeps holding if DuckLake's query ever reads
+any table twice again.
+
+It is also a round trip instead of five. The DuckDB-SQL form sends a separate `SELECT` per table —
+`ducklake_snapshot`, `ducklake_snapshot_changes`, `ducklake_table_stats`,
+`ducklake_table_column_stats` — measured at **25 batches against 14** for the same conflict check
+inside a transaction, and after the change the debug log shows **no** separate `ducklake_snapshot`
+scan at all. And `TOP 1` now reaches the server, so the snapshot branch stops reading every row of a
+table that grows by one per commit.
+
+The T-SQL differences from DuckLake's version are all forced, none discretionary: `JOIN … ON` because
+`USING` is not T-SQL; `TOP 1` inside a derived table because a `UNION ALL` branch may not carry its
+own `ORDER BY`; `CAST(NULL AS …)` so the union resolves its column types instead of guessing from an
+untyped NULL; and no `NULLS FIRST`, which SQL Server neither has nor needs, since ascending order puts
+NULLs first — which is what leaves the snapshot row where DuckLake's parser expects it. The column
+list, the column order and both branches are otherwise unchanged, because the parser depends on all
+of them; the types were checked coming back through the scan (`contains_null` arrives as a boolean,
+`record_count` as a bigint, not as text).
 
 Measured after the change, same fourteen alternating rounds: **mssql 0 of 14, postgres 0 of 14.**
 
-The replacement is still DuckDB SQL, not T-SQL: DuckLake's own query with one clause changed. DuckDB
-still executes it, still sends a separate SELECT per table, and still reads every snapshot row to
-take the top one locally — the scan that reaches the server is `SELECT snapshot_id, schema_version,
-next_catalog_id, next_file_id FROM ducklake_snapshot`, with no `TOP` and no `ORDER BY`. It is half of
-what the original did, which read that table twice, so this is strictly cheaper as well as correct.
-
-The form that *would* push the limit down is the whole query as T-SQL inside a single `mssql_scan`,
-the way `GetLatestSnapshotQuery` does it. That is available — it was written and verified to work,
-including inside a transaction on the pinned connection, where it satisfies v0.2.5's rule that an
-`mssql_scan` be the sole source of its query. It was not taken, and the measurement is why. Cost of
-the whole conflict query against the depth of `ducklake_snapshot`, rounds alternated:
-
-| snapshots | `= (SELECT MAX(…))` | `ORDER BY … LIMIT 1` |
-| ---: | ---: | ---: |
-| 1,000 | 0.002s | 0.002s |
-| 10,000 | 0.003s | 0.002s |
-| 100,000 | 0.016s | 0.015s |
-
-At a hundred thousand snapshots the query costs fifteen milliseconds and the two forms are level, so
-carrying `TOP 1` to the server would save on the order of fifteen milliseconds — on a commit retry,
-not on a commit. That does not pay for making the whole query ours to translate and keep in step with
-every ducklake bump, nor for moving the result's types from DuckDB's reading of the catalog to the
-server's, on the one path that is only reached when two writers collide.
+Measured cost, for the record: the whole conflict query takes 0.002s against a thousand snapshots,
+0.003s against ten thousand and 0.016s against a hundred thousand, and the `MAX` subquery and the
+`TOP 1` forms are level on that axis. So `TOP 1` is not where the win is — the round trips are. An
+earlier draft of this spec rejected the `mssql_scan` form by counting only the `TOP 1` saving, called
+it "unavailable", and contradicted its own D2, which recorded the form as verified to work. It is
+available, it does work, and it is what shipped.
 
 **Why interception, and how it fails safe.** `GetSnapshotAndStatsAndChangesQuery()` is `static`, so
 there is no virtual to override — but the executor reaches it through `metadata_manager->Query(…)`,
@@ -126,14 +124,11 @@ regression.
   would fix this whole class rather than one query. It needs `ALLOW_SNAPSHOT_ISOLATION` on the
   database, which is an `ALTER DATABASE` that cannot run inside a transaction and needs rights this
   extension should not assume. Worth doing in the mssql extension; not a reason to leave the crash.
-- **The whole query as one `mssql_scan`** — verified to work: rewritten into T-SQL (`JOIN … ON`
-  instead of `USING`, no `NULLS FIRST`, which SQL Server neither has nor needs since it sorts NULLs
-  first ascending, and `CAST(NULL AS …)` so the `UNION ALL` resolves its types) it runs as a single
-  server-side statement, atomically consistent, with the snapshot row first. The translation was not
-  the obstacle — it worked first try. It was rejected on what it buys, measured above: fifteen
-  milliseconds per retry at a hundred thousand snapshots, against making the whole query ours to keep
-  in step with ducklake and moving the result's types to the server on a path only concurrent writers
-  reach. Reading one table once achieves the correctness guarantee with one changed line.
+- **Patching only the snapshot branch** — `FROM (SELECT * FROM ducklake_snapshot ORDER BY snapshot_id
+  DESC LIMIT 1)` in DuckLake's own SQL. This was the first version, and it is correct: it took the
+  concurrent-writer failures from 6 of 14 rounds to 0 of 14. It was replaced because it fixes the one
+  branch that happens to read a table twice rather than the reason two reads can disagree, and
+  because it leaves the query as five statements where one will do.
 - **Fixing it in the mssql extension** — several materialised catalog scans in one plan on a pinned
   connection should share a consistent read. That is the real cure and it belongs there; this spec is
   what makes the lake correct in the meantime.
