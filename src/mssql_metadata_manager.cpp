@@ -313,6 +313,21 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 		                                      entry.first, entry.first, schema, entry.first, entry.second);
 	}
 
+	// The per-column statistics a filtered read prunes with. It is the largest table in the catalog -
+	// a row per file per column - and the read asks for `column_id = ? AND table_id = ?`, which the
+	// primary key cannot answer: that key is (data_file_id, column_id), and its leading column is not
+	// in the predicate at all. There is no filtered form here because the table has no end_snapshot;
+	// stats belong to a file, and the file is what expires.
+	//
+	// Keys only, no INCLUDE. min_value and max_value are VARCHAR(MAX) - DuckLake declares them
+	// without a length and does not bound what it writes, so MAX is the only spelling that cannot
+	// fail on a long value - and a MAX column is a LOB, which can be neither an index key nor a
+	// sensible thing to duplicate into one.
+	constraints_ddl += StringUtil::Format(
+	    "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_ducklake_file_column_stats_lookup') "
+	    "CREATE INDEX ix_ducklake_file_column_stats_lookup ON %s.ducklake_file_column_stats(table_id, column_id);\n",
+	    schema);
+
 	// Two batches: inside one, a column's new NOT NULL is not yet visible to the constraint that
 	// needs it, and the server answers "cannot define PRIMARY KEY on a nullable column".
 	RunServerSide(columns_ddl, "Failed to prepare the DuckLake catalog columns for SQL Server: ");
