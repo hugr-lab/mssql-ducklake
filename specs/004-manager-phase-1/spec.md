@@ -98,18 +98,24 @@ DuckLake's own DDL runs first, through DuckDB — it owns the shape of its catal
 twenty-eight `CREATE TABLE`s here would be a copy to re-audit on every submodule bump. What follows
 is the part DuckDB cannot express, applied as our T-SQL:
 
-- **Primary keys** on the catalog tables, so a future non-passthrough path is not blocked and the
-  server can enforce what DuckLake assumes.
+- **Primary keys** on every table DuckLake updates or deletes from — twenty-three of them. Not only
+  the ones a commit touches: expiry, cleanup, compaction and a repeated `set_option` write to
+  another dozen, and each would fail the same way.
 - **Filtered indexes** `WHERE end_snapshot IS NULL` on the versioned tables — the condition almost
   every read carries. Neither postgres nor sqlite has indexes here; this is the first place we can
   be faster rather than equal.
 - The keys and the column changes go in **two batches**: inside one T-SQL batch a column's new
   `NOT NULL` is not yet visible to the constraint that needs it, and the server answers "cannot
   define PRIMARY KEY on a nullable column".
-- **A server gate**: SQL Server 2019 or newer, checked with
-  `CAST(SERVERPROPERTY('ProductMajorVersion') AS INT)` (uncast it returns `sql_variant`, which the
-  mssql extension cannot decode — it tears the connection). Older servers have no UTF-8 collation
-  and are refused with a message naming the reason.
+- **A capability gate**, asked as the question it actually is: does this server have the UTF-8
+  collation, via `sys.fn_helpcollations()`. The version number is a bad proxy — Azure SQL Database
+  reports major version 12 while supporting it. (Were we to ask, `SERVERPROPERTY` must be cast
+  server-side: uncast it returns `sql_variant`, which the mssql extension cannot decode — it tears
+  the connection.)
+- **Applied on every attach, not only on creation.** The statements are written to be idempotent and
+  run again from `ProbeServerCapabilities`, so a catalog made by an older build of this extension —
+  or by a run that failed between DuckLake's DDL and ours — is brought up to shape instead of
+  attaching read-write and failing at the first commit.
 - **Explicit `COLLATE` on every VARCHAR column** (D4), never the database default: DuckLake pushes
   string comparisons against `min_value`/`max_value` computed by DuckDB in UTF-8 byte order, so the
   column has to compare binary. A UTF-8 `_BIN2_` collation is exactly that; a CI/AS one prunes
@@ -118,7 +124,14 @@ is the part DuckDB cannot express, applied as our T-SQL:
 
 ### D4 — the inlining type matrix
 
-`TypeIsNativelySupported` and `GetColumnTypeInternal` per the research note's matrix: BOOLEAN→BIT,
+The matrix has two spellings, and keeping them apart is the subtle part. `GetColumnTypeInternal`
+must return **DuckDB** type names, because DuckLake puts that string into the `CAST(<value> AS
+<type>)` it writes into the commit batch — and that batch is parsed by duckdb, so a T-SQL name there
+fails outright ("Type with name DATETIME2 does not exist"). The **T-SQL** names live in a private
+`TSQLColumnType`, which only our own DDL uses. The postgres manager can spell its dialect in
+`GetColumnTypeInternal` only because it intercepts the batch; we deliberately do not.
+
+The types, per the research note's matrix: BOOLEAN→BIT,
 UTINYINT→TINYINT, TINYINT→SMALLINT, DECIMAL(p≤38), BLOB→VARBINARY(MAX), DATE, TIME(6),
 DATETIME2(6), DATETIMEOFFSET, UUID→UNIQUEIDENTIFIER. Not native, so stored as text and cast back by
 `TransformInlinedData`: FLOAT/DOUBLE (SQL Server has no NaN/±Inf), TIMESTAMP_NS (DATETIME2(7) is
@@ -128,7 +141,12 @@ Strings — the inlined user columns and the text fallbacks — are
 `VARCHAR(MAX) COLLATE Latin1_General_100_BIN2_UTF8`: the server stores the UTF-8 bytes DuckDB
 already has, so a read is a copy rather than a UTF-16 transcode, and the ordering matches DuckDB's.
 `MSSQL_VARCHAR(n)` cannot say MAX (mssql-extension#321), which is why the DDL is ours rather than a
-cast on a CTAS.
+cast on a CTAS. Nested columns take the same text type: DuckLake's non-virtual `GetColumnType`
+returns a bare `VARCHAR` for them without consulting the manager, and a bare `VARCHAR` is
+`VARCHAR(1)` in T-SQL — so our DDL maps the column itself rather than trusting that string.
+
+`SupportsInlining` refuses VARIANT: DuckLake aborts a commit for a VARIANT it cannot store natively
+rather than falling back to a data file, so the column has to be declared un-inlinable up front.
 
 ### D5 — the hot reads through `mssql_scan`
 
@@ -180,6 +198,10 @@ unquoted that would not have reached the generic path the same way.
   `COPY … (FORMAT 'bcp')` on a second connection, moved into place by the commit batch.
 - Bench against the postgres backend on the same dataset; the target is "not worse", and the
   filtered indexes are where it should be better.
+- An inlined data table created on a retried commit is orphaned: the name carries the schema
+  version, which the retry bumps, so the abandoned table is never registered and never cleaned up.
+  Harmless (an empty table) but it accumulates; cleanup should drop unregistered
+  `ducklake_inlined_data_%` tables of its own catalog.
 - `docker/init/sqlserver.sql` creates `lake_meta` with the database default collation, which on the
   image is `SQL_Latin1_General_CP1_CI_AS` — create it UTF-8 so the tests exercise what the README
   recommends.
