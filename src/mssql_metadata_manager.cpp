@@ -313,16 +313,20 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 		                                      entry.first, entry.first, schema, entry.first, entry.second);
 	}
 
-	// The per-column statistics a filtered read prunes with. It is the largest table in the catalog -
-	// a row per file per column - and the read asks for `column_id = ? AND table_id = ?`, which the
-	// primary key cannot answer: that key is (data_file_id, column_id), and its leading column is not
-	// in the predicate at all. There is no filtered form here because the table has no end_snapshot;
-	// stats belong to a file, and the file is what expires.
+	// The per-column statistics a filtered read prunes with: the largest table in the catalog, a row
+	// per file per column, asked for as `column_id = ? AND table_id = ?`. The primary key is
+	// (data_file_id, column_id) and its leading column is not in that predicate, so nothing served
+	// it. Measured over 1000 tables holding 1.23M stats rows between them, asking one table for one
+	// column: 0.001s against 0.015s, and the server seeks this index rather than scanning the key.
+	//
+	// The distribution is what makes it matter, and measuring it wrong is easy: with every row under
+	// a single table_id the same query matches 30,000 rows, a scan is competitive, and the index
+	// measures as worthless. A real catalog spreads its rows over its tables.
 	//
 	// Keys only, no INCLUDE. min_value and max_value are VARCHAR(MAX) - DuckLake declares them
-	// without a length and does not bound what it writes, so MAX is the only spelling that cannot
-	// fail on a long value - and a MAX column is a LOB, which can be neither an index key nor a
-	// sensible thing to duplicate into one.
+	// without a length and bounds nothing it writes - and a MAX column is a LOB, so it can be
+	// neither an index key nor something worth duplicating into one. No filtered form either: stats
+	// have no end_snapshot, they belong to a file and the file is what expires.
 	constraints_ddl += StringUtil::Format(
 	    "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_ducklake_file_column_stats_lookup') "
 	    "CREATE INDEX ix_ducklake_file_column_stats_lookup ON %s.ducklake_file_column_stats(table_id, column_id);\n",
