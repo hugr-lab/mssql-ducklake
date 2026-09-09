@@ -51,6 +51,11 @@ DDL in specs/004 D2). Empty tables are skipped, which is most of them for a typi
 The staging tables themselves are permanent, created once by `InitializeDuckLake` and named per
 session so two concurrent commits cannot collide.
 
+Checked before committing to this, because it is the assumption the design rests on: every one of
+the seventeen staged tables is flat — `BIGINT`, `VARCHAR` and `BOOLEAN` columns only, no nested
+types anywhere (`DuckLakeStagedTable::Columns`). DuckLake normalizes a commit into scalars before it
+stages it, which is exactly what BCP can carry.
+
 ### D3 — `ducklake_commit`, in T-SQL
 
 The procedure is ours to write, versioned with the manager, and recreated whenever its recorded
