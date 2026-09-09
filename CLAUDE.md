@@ -123,11 +123,13 @@ rewrites anything else and the distribution's format check fails on it.
   the manager owns the inlined-table DDL/types via the type hooks. The matrix and edge cases
   (FLOAT NaN, TIMESTAMP_NS, HUGEINT, STRUCT) are in the research note §5.
 - **Performance target: ≥ postgres backend.** Phase 1 parity (Execute passthrough,
-  `GetLatestSnapshotQuery` via `mssql_scan`, own `InitializeDuckLake` with PKs + filtered
-  `WHERE end_snapshot IS NULL` indexes, `MaxIdentifierLength=128`, `SupportsAppender=false`);
-  phase 2 beats it with a server-side `ducklake_commit` T-SQL procedure — data-only commits in one
-  round trip with server-side retry. Research note §7 is the plan; both phases are entirely ours
-  (no upstream involved).
+  `GetLatestSnapshotQuery` via `mssql_scan`, own `InitializeDuckLake` with PKs + indexes,
+  `MaxIdentifierLength=128`); phase 2 beats it with a server-side `ducklake_commit` T-SQL
+  procedure — data-only commits in one round trip with server-side retry. Research note §7 is the
+  plan; both phases are entirely ours (no upstream involved). Spec 006 then turned
+  `SupportsAppender` on — measured, the appender does work against a remote catalog, contrary to
+  what postgres and sqlite answering `false` suggested — and made the catalog's own storage
+  `VARCHAR` under a UTF-8 BIN2 collation rather than `NVARCHAR`.
 - **Both lakes at once**: `ducklake:postgres:` works through the embedded copy too — one extension
   serves postgres-cataloged and mssql-cataloged lakes in the same process.
 - **Attach syntax**: `ducklake:mssql:<ADO connection string>` — duckdb strips `mssql:` as an

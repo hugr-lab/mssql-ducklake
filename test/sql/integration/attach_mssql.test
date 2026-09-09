@@ -202,9 +202,12 @@ SELECT ts, d, u, f, h, s, st FROM lake.types ORDER BY s;
 NULL	NULL	NULL	1.5	-7	второй	{'a': 2}
 2026-09-09 12:00:00	2026-09-09	01a084b5-b223-7a16-b2c5-7e06e34411fd	nan	42	привет 😀 ü	{'a': 1}
 
-# what the manager declared on the server: the native types as real columns, the rest as text
+# what the manager declared on the server: the native types as real columns, the rest as text.
+# The join needs COLLATE DATABASE_DEFAULT: the catalog's own string columns carry the UTF-8 BIN2
+# collation (specs/006 D4) while sys.tables.name carries the database's, and SQL Server refuses to
+# compare two explicit collations without being told which one wins.
 query II
-SELECT name, typ FROM mssql_scan('srv', 'SELECT c.name, ty.name AS typ FROM dbo.ducklake_inlined_data_tables idt JOIN dbo.ducklake_table lt ON lt.table_id = idt.table_id AND lt.table_name = ''types'' JOIN sys.tables t ON t.name = idt.table_name JOIN sys.columns c ON c.object_id = t.object_id JOIN sys.types ty ON ty.user_type_id = c.user_type_id WHERE c.column_id > 3') ORDER BY name;
+SELECT name, typ FROM mssql_scan('srv', 'SELECT c.name, ty.name AS typ FROM dbo.ducklake_inlined_data_tables idt JOIN dbo.ducklake_table lt ON lt.table_id = idt.table_id AND lt.table_name = ''types'' JOIN sys.tables t ON t.name = idt.table_name COLLATE DATABASE_DEFAULT JOIN sys.columns c ON c.object_id = t.object_id JOIN sys.types ty ON ty.user_type_id = c.user_type_id WHERE c.column_id > 3') ORDER BY name;
 ----
 d	date
 f	varchar
@@ -220,40 +223,291 @@ SELECT count(*) FROM mssql_scan('srv', 'SELECT c.name FROM sys.columns c JOIN sy
 ----
 0
 
+# Non-ASCII through the catalog's VARCHAR columns (specs/006 D4). The conversion off NVARCHAR only
+# holds because the collation is a UTF-8 one - under a single-byte collation VARCHAR would mangle
+# exactly this. Identifiers and values both, since both are stored in those columns.
+statement ok
+CREATE TABLE lake."таблица_табло"("колонка" VARCHAR, emoji VARCHAR);
+
+statement ok
+INSERT INTO lake."таблица_табло" VALUES ('значение — ünïcode', '🦆🏔️');
+
+query TT
+SELECT "колонка", emoji FROM lake."таблица_табло";
+----
+значение — ünïcode	🦆🏔️
+
+# past the inlining limit too, so the name travels through ducklake_table and the file path rather
+# than through an inlined table
+statement ok
+INSERT INTO lake."таблица_табло" SELECT 'строка' || r::VARCHAR, '漢字テスト' FROM range(200) t(r);
+
+query II
+SELECT count(*), count(DISTINCT "колонка") FROM lake."таблица_табло";
+----
+201	201
+
+# the name reached ducklake_table intact. The literal is N-prefixed because a bare T-SQL literal is
+# read in the database's own collation codepage, which here cannot hold Cyrillic - the column's UTF-8
+# collation governs the comparison, not the literal's spelling.
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT table_name FROM dbo.ducklake_table WHERE table_name = N''таблица_табло''');
+----
+1
+
+# A non-ASCII PARTITION key, which is where the VARCHAR(200) bound and the collation meet: the value
+# is an index key now, and under UTF-8 a Cyrillic character costs two of those 200 bytes.
+statement ok
+CREATE TABLE lake.parted_by_text(id BIGINT, ключ VARCHAR, v BIGINT);
+
+statement ok
+ALTER TABLE lake.parted_by_text SET PARTITIONED BY (ключ);
+
+statement ok
+INSERT INTO lake.parted_by_text SELECT r, 'раздел' || (r % 5)::VARCHAR, r FROM range(100) t(r);
+
+# the pruned read, which is what the partition index serves
+query II
+SELECT count(*), sum(v) FROM lake.parted_by_text WHERE ключ = 'раздел3';
+----
+20	1010
+
+# and the values are in the catalog as written, not mangled into the database's codepage
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT DISTINCT partition_value FROM dbo.ducklake_file_partition_value WHERE partition_value LIKE N''раздел%''');
+----
+5
+
+# The appender path (specs/006 D1). A commit's data files go through DuckLake's appender rather than
+# into the one SQL batch, which is what SupportsAppender() now answers. It is not a second transport
+# - duckdb turns the appender into an INSERT that mssql plans as its own batched insert - but the
+# batch resolves each file's path with an uncached query PER FILE where the appender resolves it
+# once, so a large commit stops paying per file. What has to hold is that the rows are the same.
+statement ok
+CREATE TABLE lake.parts(part BIGINT, v BIGINT);
+
+statement ok
+ALTER TABLE lake.parts SET PARTITIONED BY (part);
+
+# one commit, fifty data files
+statement ok
+INSERT INTO lake.parts SELECT r % 50, r FROM range(1000) t(r);
+
+query III
+SELECT count(*), sum(v), count(DISTINCT part) FROM lake.parts;
+----
+1000	499500	50
+
+# fifty rows in the catalog to match, written by the appender inside the commit's own transaction
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT f.data_file_id FROM dbo.ducklake_data_file f JOIN dbo.ducklake_table t ON t.table_id = f.table_id WHERE t.table_name = ''parts'' AND f.end_snapshot IS NULL');
+----
+50
+
+# a table created and filled in ONE transaction: the appender writes ducklake_data_file rows for a
+# table the catalog does not know yet, resolving its path from the commit's own new-table list
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE TABLE lake.made_and_filled(part BIGINT, v BIGINT);
+
+statement ok
+INSERT INTO lake.made_and_filled SELECT r % 10, r FROM range(200) t(r);
+
+statement ok
+COMMIT;
+
+query III
+SELECT count(*), sum(v), count(DISTINCT part) FROM lake.made_and_filled;
+----
+200	19900	10
+
+# and a rollback takes the appended rows with it - it writes through the metadata connection, so it
+# is in the same transaction as everything else the commit does
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO lake.parts SELECT r % 50, r FROM range(1000, 2000) t(r);
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT count(*), sum(v) FROM lake.parts;
+----
+1000	499500
+
+# no orphaned file rows in any snapshot state, only the fifty that committed
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT f.data_file_id FROM dbo.ducklake_data_file f JOIN dbo.ducklake_table t ON t.table_id = f.table_id WHERE t.table_name = ''parts''');
+----
+50
+
+# MERGE INTO on lake tables (specs/006 D3). DuckLake plans it itself; what it produces here is a
+# commit carrying a delete file beside a data file - a shape the phase-2 server-side apply declines
+# and the client commit loop has to take. All three match clauses, on a file-backed table.
+statement ok
+CREATE TABLE lake.merged AS SELECT r AS id, r AS v FROM range(1000) t(r);
+
+statement ok
+CREATE TABLE upserts AS SELECT r AS id, r * 10 AS v FROM range(500, 1500) t(r);
+
+statement ok
+MERGE INTO lake.merged AS t USING upserts AS s ON t.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
+
+query II
+SELECT count(*), sum(v) FROM lake.merged;
+----
+1500	10119750
+
+statement ok
+MERGE INTO lake.merged AS t USING (SELECT r AS id FROM range(0, 100) t(r)) AS s ON t.id = s.id
+  WHEN MATCHED THEN DELETE;
+
+query II
+SELECT count(*), sum(v) FROM lake.merged;
+----
+1400	10114800
+
+statement ok
+MERGE INTO lake.merged AS t USING (SELECT r AS id FROM range(1000, 1500) t(r)) AS s ON t.id = s.id
+  WHEN NOT MATCHED BY SOURCE THEN DELETE;
+
+query II
+SELECT count(*), sum(v) FROM lake.merged;
+----
+500	6247500
+
+# and on an inlined table, where the rows live in the catalog itself rather than in a parquet file
+statement ok
+CREATE TABLE lake.merged_small AS SELECT r AS id, r AS v FROM range(4) t(r);
+
+statement ok
+MERGE INTO lake.merged_small AS t USING (SELECT 2 AS id, 99 AS v) AS s ON t.id = s.id
+  WHEN MATCHED THEN UPDATE SET v = s.v
+  WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v);
+
+query II
+SELECT count(*), sum(v) FROM lake.merged_small;
+----
+4	103
+
 statement ok
 DETACH lake;
 
-# the catalog carries the keys and indexes the manager put on it (specs/004 D3)
+# The catalog carries the keys and indexes the manager put on it (specs/004 D3). Every count here is
+# scoped to dbo: sys.indexes and sys.key_constraints are per database, and a second lake in another
+# schema of the same database - which this file creates below - would otherwise be counted too.
 query I
-SELECT count(*) > 20 FROM mssql_scan('srv', 'SELECT name FROM sys.key_constraints WHERE type = ''PK''');
+SELECT count(*) > 20 FROM mssql_scan('srv', 'SELECT name FROM sys.key_constraints WHERE type = ''PK'' AND schema_id = SCHEMA_ID(''dbo'')');
 ----
 true
 
 # three filtered indexes, on tables whose hot read is the catalog load and so only ever asks for the
 # current state
 query I
-SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.indexes WHERE has_filter = 1');
+SELECT count(*) FROM mssql_scan('srv', 'SELECT i.name FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id WHERE i.has_filter = 1 AND o.schema_id = SCHEMA_ID(''dbo'')');
 ----
 3
 
 # and the two file tables keyed on the whole visibility condition instead, so a read at an older
 # snapshot seeks rather than scanning the table - a filtered index cannot serve one at all
 query I
-SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.indexes WHERE name LIKE ''ix_ducklake_%_visible''');
+SELECT count(*) FROM mssql_scan('srv', 'SELECT i.name FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id WHERE i.name LIKE ''ix_ducklake_%_visible'' AND o.schema_id = SCHEMA_ID(''dbo'')');
 ----
 2
 
 # the per-column statistics a filtered read prunes with, on the predicate that read carries
 query I
-SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.indexes WHERE name = ''ix_ducklake_file_column_stats_lookup''');
+SELECT count(*) FROM mssql_scan('srv', 'SELECT i.name FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id WHERE i.name = ''ix_ducklake_file_column_stats_lookup'' AND o.schema_id = SCHEMA_ID(''dbo'')');
 ----
 1
+
+# and the partition values a pruned read seeks, on the predicate DuckLake builds for one
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT i.name FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id WHERE i.name = ''ix_ducklake_file_partition_value_lookup'' AND o.schema_id = SCHEMA_ID(''dbo'')');
+----
+1
+
+# No NVARCHAR anywhere in the catalog (specs/006 D4). mssql maps DuckDB's VARCHAR to NVARCHAR - UTF-16,
+# two bytes per character for content that is paths and identifiers, under a linguistic
+# case-insensitive collation. DuckDB has neither, so the manager converts every string column to
+# VARCHAR under the UTF-8 BIN2 collation, generated from sys.columns so a column added by a ducklake
+# bump is converted too.
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT c.name FROM sys.columns c JOIN sys.tables t ON t.object_id = c.object_id JOIN sys.schemas s ON s.schema_id = t.schema_id JOIN sys.types ty ON ty.user_type_id = c.user_type_id WHERE s.name = ''dbo'' AND t.name LIKE ''ducklake%'' AND ty.name IN (''nvarchar'', ''nchar'', ''ntext'')');
+----
+0
+
+# and every string column in the catalog carries that one collation, not just the statistics ones
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT c.name FROM sys.columns c JOIN sys.tables t ON t.object_id = c.object_id JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''dbo'' AND t.name LIKE ''ducklake%'' AND c.collation_name IS NOT NULL AND c.collation_name <> ''Latin1_General_100_BIN2_UTF8''');
+----
+0
+
+# the partition value is bounded so it can be an index key at all - unbounded it is a LOB, and a LOB
+# can be neither a key nor an INCLUDE (max_length is in bytes for VARCHAR, so 200 is VARCHAR(200))
+query II
+SELECT t, l FROM mssql_scan('srv', 'SELECT ty.name AS t, CAST(c.max_length AS BIGINT) AS l FROM sys.columns c JOIN sys.tables tb ON tb.object_id = c.object_id JOIN sys.types ty ON ty.user_type_id = c.user_type_id WHERE tb.name = ''ducklake_file_partition_value'' AND tb.schema_id = SCHEMA_ID(''dbo'') AND c.name = ''partition_value''');
+----
+varchar	200
+
+# the shape version this build wrote, which is what CatalogShapeIsCurrent reads on the next attach
+query I
+SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM sys.extended_properties WHERE class = 3 AND major_id = SCHEMA_ID(''dbo'') AND name = ''mssql_ducklake_shape''');
+----
+2
+
+# A catalog shaped by an OLDER build is brought up to the current shape on attach. It was not: the
+# marker used to be the presence of one constraint, which answers "some build shaped this" - so a
+# catalog with the wrong column types and missing indexes read as current and was left alone. Here
+# the stamp is removed and a column put back the way DuckLake declares it, as an older build left it.
+statement ok
+SELECT mssql_exec('srv', 'EXEC sp_dropextendedproperty @name = N''mssql_ducklake_shape'', @level0type = N''SCHEMA'', @level0name = N''dbo'';
+DROP INDEX ix_ducklake_file_partition_value_lookup ON dbo.ducklake_file_partition_value;
+ALTER TABLE dbo.ducklake_file_partition_value ALTER COLUMN partition_value NVARCHAR(MAX) NULL;');
+
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT c.name FROM sys.columns c JOIN sys.tables t ON t.object_id = c.object_id JOIN sys.types ty ON ty.user_type_id = c.user_type_id WHERE t.name = ''ducklake_file_partition_value'' AND c.name = ''partition_value'' AND ty.name = ''nvarchar''');
+----
+1
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS upgraded (DATA_PATH '__TEST_DIR__/lake');
+
+# the attach noticed and re-applied: the column is back to VARCHAR(200) and the index is back
+query II
+SELECT t, l FROM mssql_scan('srv', 'SELECT ty.name AS t, CAST(c.max_length AS BIGINT) AS l FROM sys.columns c JOIN sys.tables tb ON tb.object_id = c.object_id JOIN sys.types ty ON ty.user_type_id = c.user_type_id WHERE tb.name = ''ducklake_file_partition_value'' AND tb.schema_id = SCHEMA_ID(''dbo'') AND c.name = ''partition_value''');
+----
+varchar	200
+
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT i.name FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id WHERE i.name = ''ix_ducklake_file_partition_value_lookup'' AND o.schema_id = SCHEMA_ID(''dbo'')');
+----
+1
+
+statement ok
+DETACH upgraded;
 
 # A second lake in another schema of the same database gets its own indexes. It did not: index names
 # embed the table but not the schema, and `sys.indexes.name` is unique per table rather than per
 # database, so an existence check that did not scope by schema saw the first lake's index and skipped
 # creating the second lake's. The catalog then worked but read without indexes, which nothing would
 # have noticed.
+# tables first: a run that died after creating this lake leaves the schema populated, and DROP SCHEMA
+# refuses a schema that still owns objects - which would wedge every later run on this server
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id
+WHERE s.name = ''lake_second'';
+EXEC sp_executesql @sql;');
+
 statement ok
 SELECT mssql_exec('srv', 'DROP SCHEMA IF EXISTS lake_second;');
 
@@ -274,12 +528,12 @@ SELECT count(*) FROM second.t;
 ----
 1
 
-# both schemas, the same six indexes each
+# both schemas, the same seven indexes each
 query II
 SELECT s, n FROM mssql_scan('srv', 'SELECT s.name AS s, COUNT(*) AS n FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE i.name LIKE ''ix_ducklake%'' GROUP BY s.name ORDER BY s.name') ORDER BY s;
 ----
-dbo	6
-lake_second	6
+dbo	7
+lake_second	7
 
 statement ok
 DETACH second;

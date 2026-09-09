@@ -18,9 +18,17 @@ public:
 		return make_uniq<MSSQLMetadataManager>(transaction);
 	}
 
-	//! file inserts join the single commit batch instead (like postgres)
+	//! Write a commit's data files through DuckLake's appender rather than as one SQL batch
+	//! (specs/006 D1). Postgres and sqlite answer false here and we read that as "remote catalogs
+	//! cannot" - measured, it is not so. The appender is not a second transport: duckdb v1.5.5 turns
+	//! it into `INSERT INTO <table> FROM <chunk>` (duckdb/src/main/appender.cpp), which mssql plans
+	//! as its own batched insert, the same wire shape the SQL batch uses. What it avoids is the
+	//! path resolution: the batch resolves every file's path through DuckLake's UNCACHED static
+	//! helper, one `ducklake_table` and one `ducklake_schema` query PER FILE, where the appender
+	//! goes through the manager's cached one. Round trips per commit stop growing with its size -
+	//! 65 flat against 2065 for a thousand data files, and 1.7x faster at that size.
 	bool SupportsAppender() const override {
-		return false;
+		return true;
 	}
 	//! SQL Server sysname is 128 characters
 	idx_t MaxIdentifierLength() const override {
@@ -37,6 +45,9 @@ public:
 	//! table (specs/004 D2). Scoped to the tables actually created where we know them - see the
 	//! definition for why that is worth the bookkeeping.
 	void ClearCache() override;
+	//! Refresh the extension's cached metadata for ONE table, at the moment it is created rather
+	//! than at the end of the commit - see the call site for why the timing matters.
+	void InvalidateTableCache(const string &table_name);
 
 	//! Overridden only to learn the name: this is the other place DuckLake creates a table behind
 	//! the mssql extension's back, and ClearCache needs to know which one.
@@ -100,8 +111,13 @@ private:
 	//! Is that shaping already applied? Asked on every attach, so it is one query rather than the
 	//! whole idempotent batch.
 	bool CatalogShapeIsCurrent();
-	//! The constraint the shaping adds last, and therefore the marker that all of it is present.
-	static constexpr const char *SHAPE_MARKER_CONSTRAINT = "pk_ducklake_schema_versions";
+	//! The shape this build of the extension wants. Bumped whenever EnsureCatalogShape changes what
+	//! it produces - a column type, a key, an index - so that a catalog shaped by an older build is
+	//! brought up to it on the next attach instead of being left as it was.
+	static constexpr int64_t SHAPE_VERSION = 2;
+	//! Where that version is recorded: an extended property on the catalog's schema, which is
+	//! per-schema (two lakes in one database keep their own) and invisible to DuckLake's own tables.
+	static constexpr const char *SHAPE_VERSION_PROPERTY = "mssql_ducklake_shape";
 	//! Run T-SQL through `mssql_exec` on a connection of the caller's choosing.
 	void RunOn(Connection &connection, const string &tsql, const string &context);
 	//! On this transaction's connection.
