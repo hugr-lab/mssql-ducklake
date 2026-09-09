@@ -97,12 +97,27 @@ of them; the types were checked coming back through the scan (`contains_null` ar
 
 Measured after the change, same fourteen alternating rounds: **mssql 0 of 14, postgres 0 of 14.**
 
-What it does **not** buy is throughput, and the measurement says so. Six writers, ten commits each,
-three rounds per timing, the two builds alternated: 19.49 / 19.54 / 20.69s for the five-statement
-form against 18.46 / 19.96 / 18.32s for the one-statement form. The ranges overlap — the new form is
-slower in one of the three rounds — so there is no wall-clock signal here, and the arithmetic agrees:
-eleven round trips at about a millisecond, on the fraction of commits that retry, is roughly half a
-second inside nineteen. The justification is the round trips and the guarantee, not the clock.
+**What it buys in wall clock depends entirely on the depth of the catalog**, and measuring only the
+shallow case is how this nearly got recorded as "no effect".
+
+On a young catalog there is no signal. Six writers, ten commits each, the two builds alternated:
+19.49 / 19.54 / 20.69s for the five-statement form against 18.46 / 19.96 / 18.32s for the
+one-statement one — overlapping ranges, the new form losing one of the three rounds. Eleven round
+trips at about a millisecond, on the fraction of commits that retry, is half a second inside
+nineteen, and the measurement cannot resolve it.
+
+Pad `ducklake_snapshot` to **100,000 rows** first — a snapshot per commit makes that weeks of a busy
+lake, not years — and the same comparison separates cleanly:
+
+| round | full read of `ducklake_snapshot` | `TOP 1` server-side |
+| --- | ---: | ---: |
+| 1 (discarded) | 2.61s | 2.36s |
+| 2 | 3.08s | 2.69s |
+| 3 | 3.02s | 2.23s |
+
+Which is the regime that matters: the old form's cost *is* the full read, so of course it is invisible
+where there is nothing to read. Correctness was the reason to make this change; on a production-depth
+catalog it is also 15-25% of the concurrent-writer wall clock.
 
 Nor does it move `make bench` or `make bench-scale` at all, and it cannot: `CheckForConflicts` runs
 only when `i > 0`, so a single-writer benchmark never executes this query once. That is also why the
