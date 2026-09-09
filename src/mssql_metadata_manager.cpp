@@ -199,10 +199,6 @@ static string TSQLLiteral(const string &value) {
 	return "N'" + StringUtil::Replace(value, "'", "''") + "'";
 }
 
-static string TSQLLiteral(const Value &value) {
-	return value.IsNull() ? "NULL" : TSQLLiteral(value.ToString());
-}
-
 void MSSQLMetadataManager::EnsureCatalogShape() {
 	const string schema = SchemaIdentifier();
 	const string schema_literal = DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName());
@@ -325,15 +321,11 @@ void MSSQLMetadataManager::InitializeDuckLake(bool has_explicit_schema, DuckLake
 // Phase 2: staging a commit on the server (specs/005)
 //===--------------------------------------------------------------------===//
 
-//! The server-side apply. Bump this whenever the body below changes: the procedure is recreated
-//! when the version recorded in ducklake_metadata differs, which is how a catalog written by an
-//! older build of this extension gets the current one.
-static constexpr const char *COMMIT_PROCEDURE_VERSION = "1";
-
-//! What the procedure covers today: a commit that adds data files and nothing else. Every other
-//! staged shape - delete files, inlined data, compactions, name maps - still goes to the client
-//! loop, and the caller checks that before using this (specs/005 D4).
-//! The server-side apply, as a batch rather than a stored procedure. A procedure would be the
+//! The server-side apply. It covers a commit that adds data files and nothing else - every other
+//! staged shape (delete files, inlined data, compactions, name maps) still goes to the client loop,
+//! and the caller checks that before using this (specs/005 D4).
+//!
+//! It is a batch rather than a stored procedure. A procedure would be the
 //! natural home for it - versioned, compiled once - but calling one desynchronizes the mssql
 //! extension's TDS parser (hugr-lab/mssql-extension#323: RETURNSTATUS is read as if it carried a
 //! length), and a desynchronized connection cannot be recovered mid-commit. A batch produces no
@@ -378,15 +370,33 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
            table_id
     FROM #ducklake_staged_data_file;
 
+    -- Row ids are assigned HERE, not by the client. A staged file carries a row_id_start only when
+    -- it is a flush of inlined data, which keeps the ids those rows already had; every other file
+    -- is a fresh insert and takes the table's current next_row_id, files in staging order (the
+    -- staged id increases with file_order within a table, so it reproduces the client's order).
+    -- Left NULL - as the first cut left it - the catalog reads back a NULL next_row_id and every
+    -- later scan of the table dies estimating cardinality.
+    DROP TABLE IF EXISTS #ducklake_assigned_row_id;
+    SELECT s.data_file_id AS local_id,
+           COALESCE(s.row_id_start,
+                    COALESCE(ts.next_row_id, 0)
+                    + SUM(CASE WHEN s.partial_max IS NULL THEN s.record_count ELSE 0 END)
+                          OVER (PARTITION BY s.table_id ORDER BY s.data_file_id ROWS UNBOUNDED PRECEDING)
+                    - CASE WHEN s.partial_max IS NULL THEN s.record_count ELSE 0 END) AS row_id_start
+    INTO #ducklake_assigned_row_id
+    FROM #ducklake_staged_data_file s
+    LEFT JOIN {SCHEMA}.ducklake_table_stats ts ON ts.table_id = s.table_id;
+
     INSERT INTO {SCHEMA}.ducklake_data_file
         (data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path, path_is_relative,
          file_format, record_count, file_size_bytes, footer_size, row_id_start, partition_id,
          encryption_key, mapping_id, partial_max)
     SELECT f.data_file_id, s.table_id, @snapshot_id, NULL, s.file_order, s.path, s.path_is_relative,
-           s.file_format, s.record_count, s.file_size_bytes, s.footer_size, s.row_id_start,
+           s.file_format, s.record_count, s.file_size_bytes, s.footer_size, r.row_id_start,
            s.partition_id, s.encryption_key, s.mapping_id, s.partial_max
     FROM #ducklake_staged_data_file s
-    JOIN @files f ON f.local_id = s.data_file_id;
+    JOIN @files f ON f.local_id = s.data_file_id
+    JOIN #ducklake_assigned_row_id r ON r.local_id = s.data_file_id;
 
     INSERT INTO {SCHEMA}.ducklake_file_column_stats
         (data_file_id, table_id, column_id, column_size_bytes, value_count, null_count, min_value,
@@ -402,21 +412,23 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
     JOIN @files f ON f.local_id = s.data_file_id;
 
     -- Table totals: a table this commit is the first to write gets a row, the rest are added to.
+    -- next_row_id is monotonic - carried forward and advanced by what was inserted, never
+    -- recomputed from the files present (DuckLakeTableStats::MergeFileStats). A file that only
+    -- rewrites inlined rows into parquet (partial_max set) adds bytes but neither records nor ids.
     MERGE {SCHEMA}.ducklake_table_stats AS t
     USING (
         SELECT table_id,
-               SUM(record_count) AS added_records,
-               SUM(file_size_bytes) AS added_bytes,
-               MAX(row_id_start + record_count) AS next_row_id
+               SUM(CASE WHEN partial_max IS NULL THEN record_count ELSE 0 END) AS added_records,
+               SUM(file_size_bytes) AS added_bytes
         FROM #ducklake_staged_data_file
         GROUP BY table_id
     ) AS s ON t.table_id = s.table_id
     WHEN MATCHED THEN UPDATE SET
         record_count = t.record_count + s.added_records,
         file_size_bytes = t.file_size_bytes + s.added_bytes,
-        next_row_id = CASE WHEN s.next_row_id > t.next_row_id THEN s.next_row_id ELSE t.next_row_id END
+        next_row_id = t.next_row_id + s.added_records
     WHEN NOT MATCHED THEN INSERT (table_id, record_count, next_row_id, file_size_bytes)
-        VALUES (s.table_id, s.added_records, s.next_row_id, s.added_bytes);
+        VALUES (s.table_id, s.added_records, s.added_records, s.added_bytes);
 
     -- Per-column totals: widen the range, and remember a null or a NaN once one appears.
     MERGE {SCHEMA}.ducklake_table_column_stats AS t
@@ -532,8 +544,8 @@ bool IsDataOnlyCommit(const TransactionChangeInformation &c) {
 } // namespace
 
 bool MSSQLMetadataManager::CanSkipSnapshotFetch(const TransactionChangeInformation &changes) const {
-	// Not yet: the server-side apply is still being built (specs/005 D3), and until it exists the
-	// client has to fetch its own snapshot.
+	// Not yet: the apply covers only data-file commits (specs/005 D4), so the client still has to
+	// fetch its own snapshot for everything else. Skipping the fetch is part of arming phase 2.
 	return false;
 }
 
@@ -585,10 +597,23 @@ void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_tra
 	if (!chunk || chunk->size() == 0) {
 		throw IOException("The server-side DuckLake commit returned no snapshot");
 	}
+	// A NULL here means the batch ran but decided nothing - most likely it found no snapshot to build
+	// on. Say so, rather than letting duckdb raise an internal error out of a NULL Value.
+	if (chunk->GetValue(0, 0).IsNull() || chunk->GetValue(1, 0).IsNull()) {
+		throw IOException("The server-side DuckLake commit reported no snapshot (snapshot_id=%s, schema_version=%s)",
+		                  chunk->GetValue(0, 0).ToString(), chunk->GetValue(1, 0).ToString());
+	}
 	auto committed_snapshot_id = chunk->GetValue(0, 0).GetValue<int64_t>();
 	auto committed_schema_version = chunk->GetValue(1, 0).GetValue<int64_t>();
+	auto had_flushes = !chunk->GetValue(2, 0).IsNull() && chunk->GetValue(2, 0).GetValue<bool>();
 	flush_transaction.GetCatalog().SetCommittedSnapshotId(static_cast<idx_t>(committed_snapshot_id));
 	flush_transaction.ApplyServerSideCommit(static_cast<idx_t>(committed_schema_version));
+	if (had_flushes) {
+		flush_transaction.DropEmptySupersededInlinedTablesClientSide();
+	}
+	// the same two calls quack makes after a server-side commit: the catalog cache cannot have seen
+	// what the server just wrote
+	ClearCache();
 }
 
 void MSSQLMetadataManager::ProbeServerCapabilities() {
@@ -601,10 +626,10 @@ void MSSQLMetadataManager::ProbeServerCapabilities() {
 	if (!CatalogShapeIsCurrent()) {
 		EnsureCatalogShape();
 	}
-	// Phase 2 is off by default while it is unfinished (specs/005 D6). Staging works and the
-	// procedure applies a data-file commit correctly when called on its own, but calling it on the
-	// pinned connection after the bulk loads tears the TDS stream, and DuckLake then retries a
-	// commit that cannot succeed. MSSQL_DUCKLAKE_SERVER_COMMIT=1 turns it on for that investigation.
+	// Phase 2 is off by default because it is incomplete, not because it is wrong: the apply is
+	// correct for the commits it accepts - it produces a catalog identical to the client loop's -
+	// but it accepts only data files (specs/005 D4), and below a threshold the staging costs more
+	// than the loop it would replace (D5). MSSQL_DUCKLAKE_SERVER_COMMIT=1 turns it on for that work.
 	if (getenv("MSSQL_DUCKLAKE_SERVER_COMMIT")) {
 		transaction.GetCatalog().SetRetrialsServerSide(true);
 	}

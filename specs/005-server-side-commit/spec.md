@@ -108,6 +108,28 @@ additionally verifies that the procedure exists at the manager's version, and on
 `SetRetrialsServerSide(true)`. A catalog whose procedure is missing or stale simply stays on phase 1
 until the next initialization refreshes it.
 
+### D6 — the server assigns row ids, and next_row_id is carried forward
+
+A staged data file carries a `row_id_start` only when it is a **flush of inlined data**, which keeps
+the ids those rows already had. For every ordinary insert the column is NULL by design: the client
+assigns row ids from the table's current `next_row_id` at commit time, so whoever applies the commit
+has to do the same. The apply therefore computes them itself, per table, files in staging order (the
+staged file id increases with `file_order` within a table, which reproduces the client's order), and
+a file that only rewrites inlined rows into parquet (`partial_max` set) adds bytes but neither
+records nor ids — `DuckLakeTableStats::MergeFileStats`, exactly.
+
+`next_row_id` is **monotonic**: carried forward from the existing row and advanced by what was
+inserted, never recomputed from the files present.
+
+Passing the staged NULL straight through, as the first cut did, writes a NULL `next_row_id` into
+`ducklake_table_stats`. Nothing complains at commit time — `GlobalTableStatsQuery` filters on
+`record_count`/`file_size_bytes` being non-NULL but not on that column — and the failure surfaces
+much later and nowhere near the cause: the next scan of the table reads the stats to estimate
+cardinality and dies in `TransformGlobalStatsRow` with `Calling GetValueInternal on a value that is
+NULL`, which invalidates the database. The lesson is the general one for this phase: **the apply
+owes DuckLake every derived value the client would have computed**, and the catalog will not tell us
+which ones we missed.
+
 ### D5 — what the staging costs, measured before the procedure exists
 
 The staging half landed first and was benchmarked on its own, with the client loop still applying
@@ -141,18 +163,24 @@ commit that is not data-only) falls back to phase 1 rather than failing the comm
 
 Landed and exercised on every data-only commit: the staging (D1, D2), measured in D5.
 
-Written but **off by default** behind `MSSQL_DUCKLAKE_SERVER_COMMIT=1`: the apply. It gets further
-than that phrasing suggests — against the server the batch applies a data-file commit correctly and
-hands back the right values (`snapshot=2 schema_version=1`), which is the hard half — but the full
-cycle then fails with `INTERNAL Error: Calling GetValueInternal on a value that is NULL`, after our
-own reads have succeeded, and the database is invalidated. So the fault is in what happens on the
-DuckLake side of a server-side commit: `ApplyServerSideCommit`, or the transaction state we leave
-behind. quack does two things there we do not — `ClearCache()` and, on flushes,
-`DropEmptySupersededInlinedTablesClientSide()` — and that is the first place to look. It wants a
-debugger and a fresh head, not another guess.
+Written and **correct**, but still off by default behind `MSSQL_DUCKLAKE_SERVER_COMMIT=1`: the
+apply. Against the server it now runs the full cycle, and the catalog it produces is **byte-identical
+to the one the client loop produces** for the same workload — the same snapshots, the same
+`changes_made`, the same `row_id_start` and `next_row_id`, checked by diffing both catalogs after
+running the same script on each path. The integration suite passes on both paths, unchanged.
 
-Until then `ProbeServerCapabilities` does not arm the fast path, so DuckLake never takes it and the
-default build is exactly phase 1, which stays green.
+What stood between "the batch applies correctly" and "the cycle works" was D6: the apply was not
+assigning row ids. It is worth naming how that presented, because it cost a session — the commit
+succeeded, our own reads of the result succeeded, and the exception arrived later from DuckLake's
+cardinality estimation over parquet, three frames deep in the optimizer. The stack trace named the
+cause on the first read; the guesses that preceded reading it did not.
+
+It stays off for the reasons in D4 and D5, not for want of correctness: the apply still covers only
+data files, and below a threshold the staging costs more than the client loop it would replace.
+`ProbeServerCapabilities` does not arm it, so DuckLake never takes it and the default build is
+exactly phase 1, which stays green. Arming it means finishing the scope (delete files, inlined data
+and deletes, compactions, name maps), the server-side retry, and that threshold — then `make bench`
+decides.
 
 Two lessons already paid for, both about SQL Server rather than about DuckLake:
 
