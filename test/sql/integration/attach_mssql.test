@@ -90,23 +90,37 @@ SELECT table_name FROM mssql_scan('srv', 'SELECT table_name FROM dbo.ducklake_in
 ----
 ducklake_inlined_data_1_1
 
-# The boundary today, and it is per table rather than per operation: the FIRST write to a table
-# commits, every later one fails. Once a table has stats, the commit batch UPDATEs
-# ducklake_table_stats; that UPDATE goes through duckdb's DML path, and mssql requires a primary key
-# for UPDATE/DELETE. A DELETE of an inlined row fails the same way on the inlined table itself.
-# The manager's Execute passthrough (the batch as raw T-SQL through mssql_exec) is what removes that
-# path - research note §4, spec 004.
-statement error
+# Every later write to the same table commits too, which is what the Execute passthrough bought
+# (specs/004 D1): the batch goes to the server as raw T-SQL through mssql_exec, so duckdb's DML
+# path - and its primary-key requirement on ducklake_table_stats - is never involved.
+statement ok
 INSERT INTO lake.t VALUES (3, 'c');
-----
-Table 'dbo.ducklake_table_stats' has no primary key
 
-# the failed commit rolled back whole: the rows, the snapshot and the stats are as they were
+statement ok
+UPDATE lake.t SET s = 'updated' WHERE i = 2;
+
+statement ok
+DELETE FROM lake.t WHERE i = 1;
+
 query II
 SELECT * FROM lake.t ORDER BY i;
 ----
-1	a
-2	b
+2	updated
+3	c
+
+# past the inlining limit the rows go to a parquet file, and the catalog records it
+statement ok
+INSERT INTO lake.t SELECT range, 'row' || range FROM range(10, 40);
+
+query I
+SELECT count(*) FROM lake.t;
+----
+32
+
+query I
+SELECT count(*) > 0 FROM mssql_scan('srv', 'SELECT data_file_id FROM dbo.ducklake_data_file');
+----
+true
 
 statement ok
 DETACH lake;
@@ -116,21 +130,32 @@ DETACH lake;
 statement ok
 ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/lake');
 
+# one snapshot per committed statement: schema, table, and the five writes above
 query I
 SELECT snapshot_id FROM ducklake_snapshots('lake') ORDER BY 1;
 ----
 0
 1
 2
+3
+4
+5
+6
 
 # and they are physically in dbo, where this attach found them
 query I
 SELECT count(*) FROM mssql_scan('srv', 'SELECT snapshot_id FROM dbo.ducklake_snapshot');
 ----
-3
+7
 
+query I
+SELECT count(*) FROM lake.t;
+----
+32
+
+# time travel still reads the older snapshots of the same table
 query II
-SELECT * FROM lake.t ORDER BY i;
+SELECT * FROM lake.t AT (VERSION => 2) ORDER BY i;
 ----
 1	a
 2	b
@@ -149,9 +174,9 @@ ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake2 (DATA_PATH '__TEST_D
 statement ok
 DETACH lake;
 
-# TODO(specs/004): with the Execute passthrough the second-write error pinned above turns green, and
-# this file grows the rest of the cycle - UPDATE, DELETE (both inlined and file-backed), an insert
-# past the inlining limit, expire/cleanup, and the inlining type matrix (research note §5).
+# TODO(specs/004): the type matrix (research note §5 - FLOAT NaN, TIMESTAMP_NS, HUGEINT, STRUCT, a
+# non-ASCII string round trip), our own InitializeDuckLake (keys, filtered indexes, the 2019+ gate,
+# the UTF-8 collation), and expire/cleanup.
 
 statement ok
 DETACH srv;
