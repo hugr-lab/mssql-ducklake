@@ -543,6 +543,15 @@ same point at which the metadata is loaded. Every source of a statement is bound
 is executed, so scans in one statement collide however the plan later chooses to evaluate them.
 Materialisation reorders execution, and the constraint is not in execution.
 
+**Postgres does the same pinning and does not have the problem**, which locates the difference
+precisely. The same statement - two direct scans plus a catalog scan, inside an explicit transaction
+- works on postgres and fails here; and both postgres scans report the *same* `pg_backend_pid()`, so
+it is one connection there too. What differs is that libpq buffers a result set fully client-side, so
+the connection is idle again before the second scan binds, while the TDS path streams and leaves it
+`Executing` until drained. Filed as hugr-lab/mssql-extension#329, where the closest fix is machinery
+the extension already has: spec 003's R2 materialises *catalog* scans inside a transaction, and the
+same treatment for `mssql_scan` would close it.
+
 What holds the connection, and therefore what would have to change: the extension pins one pooled
 connection to an explicit transaction, issues `BEGIN TRANSACTION` on it and binds the 8-byte
 transaction descriptor to it, so every later statement must go there. That connection then carries
