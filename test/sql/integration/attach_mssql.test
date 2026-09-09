@@ -90,9 +90,10 @@ SELECT table_name FROM mssql_scan('srv', 'SELECT table_name FROM dbo.ducklake_in
 ----
 ducklake_inlined_data_1_1
 
-# Every later write to the same table commits too, which is what the Execute passthrough bought
-# (specs/004 D1): the batch goes to the server as raw T-SQL through mssql_exec, so duckdb's DML
-# path - and its primary-key requirement on ducklake_table_stats - is never involved.
+# Every later write to the same table commits too. What bought that is not a rewritten batch but the
+# primary keys this manager puts on the catalog (specs/004 D3): the mssql extension builds a row
+# identity out of a key, and without one it refuses the UPDATE of ducklake_table_stats that every
+# commit past the first carries. DuckLake's own SQL runs through duckdb, unchanged.
 statement ok
 INSERT INTO lake.t VALUES (3, 'c');
 
@@ -177,6 +178,61 @@ DETACH lake;
 # TODO(specs/004): the type matrix (research note §5 - FLOAT NaN, TIMESTAMP_NS, HUGEINT, STRUCT, a
 # non-ASCII string round trip), our own InitializeDuckLake (keys, filtered indexes, the 2019+ gate,
 # the UTF-8 collation), and expire/cleanup.
+
+# The inlining type matrix (specs/004 D4). These are the types that decide it: ones SQL Server holds
+# natively, ones it cannot hold exactly and so are stored as text and cast back, and a nested one
+# DuckLake stores as text itself. The column types are ours and are T-SQL, while the CAST DuckLake
+# writes into the commit batch has to stay DuckDB's - a regression either way fails here.
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/lake');
+
+statement ok
+CREATE TABLE lake.types(ts TIMESTAMP, d DATE, u UUID, f DOUBLE, h HUGEINT, s VARCHAR, st STRUCT(a INT));
+
+statement ok
+INSERT INTO lake.types VALUES (TIMESTAMP '2026-09-09 12:00:00', DATE '2026-09-09', '01a084b5-b223-7a16-b2c5-7e06e34411fd', 'nan'::DOUBLE, 42, 'привет 😀 ü', {'a': 1});
+
+# a second insert, so the statistics go through their update path as well
+statement ok
+INSERT INTO lake.types VALUES (NULL, NULL, NULL, 1.5, -7, 'второй', {'a': 2});
+
+query IIIIIII
+SELECT ts, d, u, f, h, s, st FROM lake.types ORDER BY s;
+----
+NULL	NULL	NULL	1.5	-7	второй	{'a': 2}
+2026-09-09 12:00:00	2026-09-09	01a084b5-b223-7a16-b2c5-7e06e34411fd	nan	42	привет 😀 ü	{'a': 1}
+
+# what the manager declared on the server: the native types as real columns, the rest as text
+query II
+SELECT name, typ FROM mssql_scan('srv', 'SELECT c.name, ty.name AS typ FROM dbo.ducklake_inlined_data_tables idt JOIN dbo.ducklake_table lt ON lt.table_id = idt.table_id AND lt.table_name = ''types'' JOIN sys.tables t ON t.name = idt.table_name JOIN sys.columns c ON c.object_id = t.object_id JOIN sys.types ty ON ty.user_type_id = c.user_type_id WHERE c.column_id > 3') ORDER BY name;
+----
+d	date
+f	varchar
+h	varchar
+s	varchar
+st	varchar
+ts	datetime2
+u	uniqueidentifier
+
+# and every text column of it carries the binary UTF-8 collation the comparisons need
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT c.name FROM sys.columns c JOIN sys.tables t ON t.object_id = c.object_id WHERE t.name LIKE ''ducklake_inlined_data[_][0-9]%'' AND c.collation_name IS NOT NULL AND c.collation_name <> ''Latin1_General_100_BIN2_UTF8''');
+----
+0
+
+statement ok
+DETACH lake;
+
+# the catalog carries the keys and filtered indexes the manager put on it (specs/004 D3)
+query I
+SELECT count(*) > 20 FROM mssql_scan('srv', 'SELECT name FROM sys.key_constraints WHERE type = ''PK''');
+----
+true
+
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.indexes WHERE has_filter = 1');
+----
+5
 
 statement ok
 DETACH srv;

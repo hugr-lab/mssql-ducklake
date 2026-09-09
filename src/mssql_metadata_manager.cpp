@@ -9,16 +9,24 @@
 
 namespace duckdb {
 
+// the out-of-line definition the pre-C++17 build needs, since the constant is passed by reference
+constexpr const char *MSSQLMetadataManager::VARCHAR_COLLATION;
+
 MSSQLMetadataManager::MSSQLMetadataManager(DuckLakeTransaction &transaction) : DuckLakeMetadataManager(transaction) {
 }
+
+//===--------------------------------------------------------------------===//
+// The inlining type matrix (specs/004 D4)
+//===--------------------------------------------------------------------===//
 
 bool MSSQLMetadataManager::TypeIsNativelySupported(const LogicalType &type) {
 	switch (type.id()) {
 	// SQL Server has no NaN and no infinities, so a float column cannot round trip
 	case LogicalTypeId::FLOAT:
 	case LogicalTypeId::DOUBLE:
-	// DATETIME2(7) is 100ns, so nanoseconds are lossy
+	// DATETIME2/TIME(7) resolve to 100ns, so nanoseconds are lossy
 	case LogicalTypeId::TIMESTAMP_NS:
+	case LogicalTypeId::TIME_NS:
 	// wider than DECIMAL(38, 0), the widest exact numeric SQL Server has
 	case LogicalTypeId::UBIGINT:
 	case LogicalTypeId::HUGEINT:
@@ -42,7 +50,27 @@ bool MSSQLMetadataManager::TypeIsNativelySupported(const LogicalType &type) {
 	}
 }
 
+bool MSSQLMetadataManager::SupportsInlining(const LogicalType &type) {
+	if (type.id() == LogicalTypeId::VARIANT) {
+		// DuckLake throws mid-commit for a VARIANT it cannot store natively rather than falling back
+		// to a data file, so the column has to be refused before the write starts
+		return false;
+	}
+	return DuckLakeMetadataManager::SupportsInlining(type);
+}
+
 string MSSQLMetadataManager::GetColumnTypeInternal(const LogicalType &column_type) {
+	// DuckDB names, not T-SQL ones. DuckLake writes this string into the `CAST(<value> AS <type>)`
+	// it puts in the commit batch, and that batch is executed by duckdb against the attached
+	// catalog - a T-SQL name there fails to parse ("Type with name DATETIME2 does not exist").
+	// The server-side spelling belongs to TSQLColumnType, which only our own DDL uses.
+	if (!TypeIsNativelySupported(column_type)) {
+		return "VARCHAR";
+	}
+	return DuckLakeMetadataManager::GetColumnTypeInternal(column_type);
+}
+
+string MSSQLMetadataManager::TSQLColumnType(const LogicalType &column_type) const {
 	switch (column_type.id()) {
 	case LogicalTypeId::BOOLEAN:
 		return "BIT";
@@ -79,13 +107,17 @@ string MSSQLMetadataManager::GetColumnTypeInternal(const LogicalType &column_typ
 	case LogicalTypeId::UUID:
 		return "UNIQUEIDENTIFIER";
 	default:
-		// Everything else - the types above that are not natively supported, and DuckLake's own
-		// text storage for nested values. MAX rather than a bound: DuckLake states no length, and a
-		// bare VARCHAR means VARCHAR(1) in T-SQL. The collation is explicit rather than inherited
-		// from the database, whose own is often a legacy CI_AS one.
+		// The types above that SQL Server cannot hold exactly, and the nested ones DuckLake stores
+		// as text anyway. MAX rather than a bound, because DuckLake states no length and a bare
+		// VARCHAR is VARCHAR(1) in T-SQL; the collation is explicit rather than inherited, because a
+		// database's own is often a legacy CI_AS one.
 		return StringUtil::Format("VARCHAR(MAX) COLLATE %s", VARCHAR_COLLATION);
 	}
 }
+
+//===--------------------------------------------------------------------===//
+// Talking to the server
+//===--------------------------------------------------------------------===//
 
 string MSSQLMetadataManager::SchemaIdentifier() const {
 	return DuckLakeUtil::SQLIdentifierToString(transaction.GetCatalog().MetadataSchemaName());
@@ -95,78 +127,59 @@ string MSSQLMetadataManager::CatalogLiteral() const {
 	return DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataDatabaseName());
 }
 
-void MSSQLMetadataManager::RunServerSide(const string &tsql, const string &context) {
-	auto &connection = transaction.GetConnection();
+void MSSQLMetadataManager::RunOn(Connection &connection, const string &tsql, const string &context) {
 	auto result = connection.Query(StringUtil::Format("SELECT mssql_exec(%s, %s)", CatalogLiteral(), SQLString(tsql)));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw(context);
 	}
+}
+
+void MSSQLMetadataManager::RunServerSide(const string &tsql, const string &context) {
+	RunOn(transaction.GetConnection(), tsql, context);
 }
 
 void MSSQLMetadataManager::RunServerSideOutsideTransaction(const string &tsql, const string &context) {
 	// A table this transaction creates but has not committed is locked against the metadata query
 	// the mssql extension runs to discover it - and that query takes its own connection, so it waits
-	// on us until it times out. Creating the table on a connection of its own, in autocommit, makes
-	// it visible immediately and holds no lock. The statement is `IF OBJECT_ID(...) IS NULL`-shaped,
-	// so a rolled back commit leaves at worst an empty table that the next attempt reuses.
+	// on us until it times out. Created in autocommit the table is visible at once and holds no lock.
 	auto client_context = transaction.context.lock();
 	if (!client_context) {
 		throw InternalException("MSSQLMetadataManager: the client context is gone");
 	}
 	Connection connection(*client_context->db);
-	auto result = connection.Query(StringUtil::Format("SELECT mssql_exec(%s, %s)", CatalogLiteral(), SQLString(tsql)));
-	if (result->HasError()) {
-		result->GetErrorObject().Throw(context);
-	}
+	RunOn(connection, tsql, context);
 }
 
 void MSSQLMetadataManager::ClearCache() {
 	// The mssql extension caches catalog metadata, and a table created behind its back through
 	// mssql_exec is invisible to the duckdb reads that follow - they miss it silently rather than
-	// failing. DuckLake already knows when that has happened (`MarkPendingCacheClear` on creating an
-	// inlined table) and calls this after the commit, which is the only safe moment: a refresh
-	// issued mid-transaction queries the catalog on a second connection and blocks on the schema
-	// locks the transaction itself is holding. The extension's own setting for this is global and
-	// fires on every DML; this is the point version.
+	// failing. DuckLake tracks when that has happened and calls this at the end of a commit; issuing
+	// it earlier deadlocks, because the refresh queries the catalog on a second connection and waits
+	// on the schema locks this transaction holds. Scoped to our schema rather than the whole
+	// catalog, which would drop every table's metadata on every inlined-table creation.
 	auto &connection = transaction.GetConnection();
-	auto result = connection.Query(StringUtil::Format("SELECT mssql_invalidate_cache(%s)", CatalogLiteral()));
+	auto schema = DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName());
+	auto result =
+	    connection.Query(StringUtil::Format("SELECT mssql_invalidate_cache(%s, %s)", CatalogLiteral(), schema));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to refresh the SQL Server catalog cache: ");
 	}
 }
 
-void MSSQLMetadataManager::InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) {
-	auto &connection = transaction.GetConnection();
-	// SQL Server 2019 is the floor: older servers have no UTF-8 collation, so the catalog could not
-	// store the strings DuckLake puts in it without lossy conversion. SERVERPROPERTY returns
-	// sql_variant, which the mssql extension cannot decode - hence the cast, server-side.
-	auto version = connection.Query(StringUtil::Format(
-	    "SELECT major FROM mssql_scan(%s, 'SELECT CAST(SERVERPROPERTY(''ProductMajorVersion'') AS INT) AS major')",
-	    CatalogLiteral()));
-	if (version->HasError()) {
-		version->GetErrorObject().Throw("Failed to read the SQL Server version: ");
-	}
-	auto major = version->Fetch();
-	if (!major || major->size() == 0 || major->GetValue(0, 0).IsNull() ||
-	    major->GetValue(0, 0).GetValue<int32_t>() < 15) {
-		throw NotImplementedException("A DuckLake catalog needs SQL Server 2019 or newer: its string columns are "
-		                              "stored with a UTF-8 collation, which older versions do not have.");
-	}
+//===--------------------------------------------------------------------===//
+// Initialization (specs/004 D3)
+//===--------------------------------------------------------------------===//
 
-	// DuckLake's own DDL first, through duckdb - it owns the shape of its catalog, and reproducing
-	// it here would be a copy to re-audit on every submodule bump.
-	DuckLakeMetadataManager::InitializeDuckLake(has_explicit_schema, encryption);
-
+void MSSQLMetadataManager::EnsureCatalogShape() {
 	const string schema = SchemaIdentifier();
-	// Two phases, because within one T-SQL batch a column's new NOT NULL is not yet visible to a
-	// constraint that needs it - the server answers "cannot define PRIMARY KEY on a nullable column".
-	string columns_ddl;
-	string constraints_ddl;
+	const string schema_literal = DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName());
 
 	// Primary keys. DuckLake declares a few itself; the rest are ours, and they are what make the
-	// catalog writable: the mssql extension builds a row identity out of the primary key, and
-	// without one it refuses every UPDATE and DELETE - which a commit is full of.
+	// catalog writable at all: the mssql extension builds a row identity out of the primary key, and
+	// without one it refuses every UPDATE and DELETE - which commits, expiry, cleanup and compaction
+	// are full of. The list is every table DuckLake updates or deletes from.
 	const vector<pair<string, string>> keys = {
+	    {"ducklake_metadata", "[key]"},
 	    {"ducklake_table_stats", "table_id"},
 	    {"ducklake_table_column_stats", "table_id, column_id"},
 	    {"ducklake_table", "table_id, begin_snapshot"},
@@ -175,25 +188,47 @@ void MSSQLMetadataManager::InitializeDuckLake(bool has_explicit_schema, DuckLake
 	    {"ducklake_tag", "object_id, begin_snapshot, [key]"},
 	    {"ducklake_column_tag", "table_id, column_id, begin_snapshot, [key]"},
 	    {"ducklake_partition_info", "partition_id"},
+	    {"ducklake_partition_column", "partition_id, partition_key_index"},
 	    {"ducklake_sort_info", "sort_id"},
+	    {"ducklake_sort_expression", "sort_id, sort_key_index"},
 	    {"ducklake_macro", "macro_id, begin_snapshot"},
+	    {"ducklake_macro_impl", "macro_id, impl_id"},
+	    {"ducklake_macro_parameters", "macro_id, impl_id, column_id"},
 	    {"ducklake_inlined_data_tables", "table_id, schema_version"},
 	    {"ducklake_files_scheduled_for_deletion", "data_file_id"},
+	    {"ducklake_file_column_stats", "data_file_id, column_id"},
+	    {"ducklake_file_variant_stats", "data_file_id, column_id, variant_path"},
+	    {"ducklake_file_partition_value", "data_file_id, partition_key_index"},
+	    {"ducklake_column_mapping", "mapping_id"},
+	    {"ducklake_name_mapping", "mapping_id, column_id"},
+	    {"ducklake_schema_versions", "begin_snapshot, schema_version"},
 	};
+	// The tag tables and the metadata table key on a name rather than an id. A primary key cannot be
+	// over MAX, so those are capped - 200 bytes of UTF-8 is a long name and well inside the
+	// 900-byte index limit.
+	auto key_column_type = [&](const string &name) {
+		if (name == "[key]" || name == "variant_path") {
+			return StringUtil::Format("VARCHAR(200) COLLATE %s", VARCHAR_COLLATION);
+		}
+		return string("BIGINT");
+	};
+
+	string columns_ddl;
+	string constraints_ddl;
 	for (auto &entry : keys) {
 		for (auto &column : StringUtil::Split(entry.second, ',')) {
 			auto name = column;
 			StringUtil::Trim(name);
-			// a key column has to be NOT NULL, and DuckLake declares none of them so. The tag tables
-			// key on a name rather than an id; a primary key cannot be over MAX, so it is capped -
-			// 200 bytes of UTF-8 is a long tag name and well inside the 900-byte index limit.
-			const bool is_name = name == "[key]";
-			columns_ddl += StringUtil::Format(
-			    "ALTER TABLE %s.%s ALTER COLUMN %s %s NOT NULL;\n", schema, entry.first, name,
-			    is_name ? StringUtil::Format("VARCHAR(200) COLLATE %s", VARCHAR_COLLATION) : string("BIGINT"));
+			// a key column has to be NOT NULL, and DuckLake declares none of them so
+			columns_ddl += StringUtil::Format("ALTER TABLE %s.%s ALTER COLUMN %s %s NOT NULL;\n", schema, entry.first,
+			                                  name, key_column_type(name));
 		}
-		constraints_ddl += StringUtil::Format("ALTER TABLE %s.%s ADD CONSTRAINT pk_%s PRIMARY KEY (%s);\n", schema,
-		                                      entry.first, entry.first, entry.second);
+		// idempotent, so that an existing catalog can be brought up to shape on attach and a run
+		// that failed partway can be resumed
+		constraints_ddl += StringUtil::Format(
+		    "IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE name = 'pk_%s' AND schema_id = SCHEMA_ID(%s)) "
+		    "ALTER TABLE %s.%s ADD CONSTRAINT pk_%s PRIMARY KEY (%s);\n",
+		    entry.first, schema_literal, schema, entry.first, entry.first, entry.second);
 	}
 
 	// The statistics DuckLake compares server-side. Its min/max values are the bytes DuckDB computed
@@ -216,40 +251,80 @@ void MSSQLMetadataManager::InitializeDuckLake(bool has_explicit_schema, DuckLake
 	    {"ducklake_column", "table_id"},    {"ducklake_view", "schema_id"},
 	};
 	for (auto &entry : live_indexes) {
-		constraints_ddl += StringUtil::Format("CREATE INDEX ix_%s_live ON %s.%s(%s) WHERE end_snapshot IS NULL;\n",
-		                                      entry.first, schema, entry.first, entry.second);
+		constraints_ddl += StringUtil::Format("IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_%s_live') "
+		                                      "CREATE INDEX ix_%s_live ON %s.%s(%s) WHERE end_snapshot IS NULL;\n",
+		                                      entry.first, entry.first, schema, entry.first, entry.second);
 	}
 
+	// Two batches: inside one, a column's new NOT NULL is not yet visible to the constraint that
+	// needs it, and the server answers "cannot define PRIMARY KEY on a nullable column".
 	RunServerSide(columns_ddl, "Failed to prepare the DuckLake catalog columns for SQL Server: ");
 	RunServerSide(constraints_ddl, "Failed to key and index the DuckLake catalog for SQL Server: ");
 }
 
+void MSSQLMetadataManager::InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) {
+	auto &connection = transaction.GetConnection();
+	// The catalog's string columns are stored with a UTF-8 collation, so the server has to have one.
+	// Asking for the collation itself rather than the version: Azure SQL Database reports major
+	// version 12 while supporting it, and the version was only ever a proxy for this question.
+	auto probe = connection.Query(StringUtil::Format(
+	    "SELECT collations FROM mssql_scan(%s, 'SELECT COUNT(*) AS collations FROM sys.fn_helpcollations() "
+	    "WHERE name = ''%s''')",
+	    CatalogLiteral(), VARCHAR_COLLATION));
+	if (probe->HasError()) {
+		probe->GetErrorObject().Throw("Failed to ask SQL Server for its collations: ");
+	}
+	auto row = probe->Fetch();
+	if (!row || row->size() == 0 || row->GetValue(0, 0).IsNull() || row->GetValue(0, 0).GetValue<int64_t>() == 0) {
+		throw NotImplementedException(
+		    "This SQL Server has no %s collation, which a DuckLake catalog needs to store its strings without loss. "
+		    "UTF-8 collations arrived in SQL Server 2019.",
+		    VARCHAR_COLLATION);
+	}
+
+	// DuckLake's own DDL first, through duckdb - it owns the shape of its catalog, and reproducing
+	// it here would be a copy to re-audit on every submodule bump.
+	DuckLakeMetadataManager::InitializeDuckLake(has_explicit_schema, encryption);
+	EnsureCatalogShape();
+}
+
+void MSSQLMetadataManager::ProbeServerCapabilities() {
+	// Runs once per attach, including for a catalog this manager did not create - one made by an
+	// older build, or by a run that failed between DuckLake's DDL and ours. Without the keys such a
+	// catalog is readable but not writable, and the failure would surface much later as "requires a
+	// table with a primary key". The statements are idempotent, so this costs two round trips.
+	EnsureCatalogShape();
+}
+
+//===--------------------------------------------------------------------===//
+// The inlined data table (specs/004 D2)
+//===--------------------------------------------------------------------===//
+
 string MSSQLMetadataManager::GetInlinedTableQueries(DuckLakeSnapshot commit_snapshot, const DuckLakeTableInfo &table,
                                                     string &inlined_tables, string &inlined_table_queries) {
-	// Let the base build the registration tuple and the DDL, then take the DDL out of the batch and
-	// run it ourselves: it carries our column types, which are T-SQL and would not parse in the
-	// duckdb batch the rest of the commit travels in.
-	string ddl;
-	auto table_name = DuckLakeMetadataManager::GetInlinedTableQueries(commit_snapshot, table, inlined_tables, ddl);
-	if (!ddl.empty()) {
-		auto statement = StringUtil::Replace(ddl, "{METADATA_CATALOG}", SchemaIdentifier());
-		// IF NOT EXISTS is DuckDB's spelling; T-SQL asks the question with OBJECT_ID
-		statement = StringUtil::Replace(statement, "CREATE TABLE IF NOT EXISTS ", "CREATE TABLE ");
-		// An inlined row is updated (its end_snapshot is set) and deleted, so this table needs a key
-		// for the same reason the catalog's own tables do - the mssql extension builds a row identity
-		// out of it. (row_id, begin_snapshot) is what identifies a version of an inlined row.
-		statement = StringUtil::Replace(statement, "row_id BIGINT, begin_snapshot BIGINT,",
-		                                "row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL,");
-		const auto close_paren = statement.rfind(')');
-		if (close_paren != string::npos) {
-			statement.insert(close_paren,
-			                 StringUtil::Format(", CONSTRAINT pk_%s PRIMARY KEY (row_id, begin_snapshot)", table_name));
-		}
-		statement = StringUtil::Format("IF OBJECT_ID('%s.%s') IS NULL %s",
-		                               transaction.GetCatalog().MetadataSchemaName(), table_name, statement);
-		RunServerSideOutsideTransaction(statement, "Failed to create the inlined data table: ");
+	// The base registers the table and builds DuckDB DDL for it; we keep the registration and write
+	// the DDL ourselves, because the column types are T-SQL and could not travel in the duckdb batch.
+	string base_ddl;
+	auto table_name = DuckLakeMetadataManager::GetInlinedTableQueries(commit_snapshot, table, inlined_tables, base_ddl);
+	if (base_ddl.empty()) {
+		return table_name;
 	}
-	(void)inlined_table_queries;
+
+	string columns;
+	for (auto &column : table.columns) {
+		columns += StringUtil::Format(", %s %s", SQLIdentifier(column.name),
+		                              TSQLColumnType(DuckLakeTypes::FromString(column.type)));
+	}
+	// An inlined row is updated (its end_snapshot is set) and deleted, so this table needs a key for
+	// the same reason the catalog's own tables do.
+	auto statement = StringUtil::Format(
+	    "IF OBJECT_ID(QUOTENAME(%s) + '.' + QUOTENAME(%s)) IS NULL "
+	    "CREATE TABLE %s.%s(row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT%s, "
+	    "CONSTRAINT %s PRIMARY KEY (row_id, begin_snapshot));",
+	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName()),
+	    DuckLakeUtil::SQLLiteralToString(table_name), SchemaIdentifier(), SQLIdentifier(table_name), columns,
+	    SQLIdentifier("pk_" + table_name));
+	RunServerSideOutsideTransaction(statement, "Failed to create the inlined data table: ");
 	return table_name;
 }
 

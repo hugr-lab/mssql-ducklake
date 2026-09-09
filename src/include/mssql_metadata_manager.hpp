@@ -1,12 +1,15 @@
 #pragma once
 
+#include "duckdb/main/connection.hpp"
 #include "storage/ducklake_metadata_manager.hpp"
 
 namespace duckdb {
 
 // The SQL Server metadata manager (specs/002, phase 1 in specs/004). Like the postgres manager it
 // only generates SQL - the mssql extension resolves `mssql_exec`/`mssql_scan` at runtime, so
-// nothing here links it.
+// nothing here links it. Unlike the postgres manager it does not intercept the commit batch: with
+// the catalog keyed (see InitializeDuckLake) duckdb executes DuckLake's own SQL against SQL Server,
+// so this class rewrites no SQL at all.
 class MSSQLMetadataManager : public DuckLakeMetadataManager {
 public:
 	explicit MSSQLMetadataManager(DuckLakeTransaction &transaction);
@@ -30,19 +33,28 @@ public:
 	//! a commit run through duckdb, which is why this manager needs no SQL rewriting at all.
 	void InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) override;
 
-	//! Drop the mssql extension's catalog cache, which DuckLake asks for after a commit that created
-	//! an inlined table - the one moment it is safe to (specs/004 D2).
+	//! Runs once per attach, and is where a catalog created before this manager existed - or by a
+	//! run that failed partway through the DDL below - is brought up to shape.
+	void ProbeServerCapabilities() override;
+
+	//! Drop the mssql extension's catalog cache, which DuckLake asks for after creating an inlined
+	//! table (specs/004 D2).
 	void ClearCache() override;
 
-	//! The inlined table's DDL is ours (its types and collation are), and T-SQL cannot travel in a
-	//! batch duckdb parses - so it is executed here, on the transaction's connection, and left out
-	//! of the batch (specs/004 D2).
+	//! The inlined table's DDL is ours: its column types are T-SQL, which the duckdb-parsed commit
+	//! batch could not carry, so it is executed separately (specs/004 D2).
 	string GetInlinedTableQueries(DuckLakeSnapshot commit_snapshot, const DuckLakeTableInfo &table,
 	                              string &inlined_tables, string &inlined_table_queries) override;
 
 	//! The inlining type matrix (specs/004 D4). A type SQL Server cannot hold exactly is stored as
-	//! text and cast back on read; everything else gets a real column type.
+	//! text and cast back on read.
 	bool TypeIsNativelySupported(const LogicalType &type) override;
+	//! VARIANT has no inlined representation here - DuckLake would abort the commit rather than
+	//! fall back to a data file, so the column is declared un-inlinable up front (as postgres does).
+	bool SupportsInlining(const LogicalType &type) override;
+	//! DuckDB type names, deliberately: DuckLake puts this string into the `CAST(... AS <type>)` it
+	//! writes into the commit batch, and that batch is parsed by duckdb. The T-SQL names live in
+	//! TSQLColumnType, which only our own DDL uses.
 	string GetColumnTypeInternal(const LogicalType &type) override;
 
 	//! The collation every VARCHAR column of the catalog carries. UTF-8, so the server stores the
@@ -50,24 +62,17 @@ public:
 	//! which is what makes the min/max statistics DuckLake pushes into the server prune correctly.
 	static constexpr const char *VARCHAR_COLLATION = "Latin1_General_100_BIN2_UTF8";
 
-	//! The result of rewriting one commit batch: the T-SQL to send, and whether it contains DDL -
-	//! the mssql extension caches catalog metadata, and a table this batch creates is invisible to
-	//! the reads that follow until that cache is dropped.
-	struct TranspiledBatch {
-		string sql;
-		bool changes_schema = false;
-	};
-
-	//! Rewrite the DuckDB SQL that ducklake's non-virtual generators produced into T-SQL. Public
-	//! for the unit tests; see specs/004 D2 for why a rewrite is unavoidable and why it is a
-	//! scanner rather than a regex.
-	static TranspiledBatch TranspileBatch(const string &query);
-
 private:
-	//! Run T-SQL on the metadata server through `mssql_exec`, on this transaction's connection.
+	//! The T-SQL column type for an inlined column, from the matrix.
+	string TSQLColumnType(const LogicalType &type) const;
+	//! Keys, indexes and collations, written so that running them twice is a no-op.
+	void EnsureCatalogShape();
+	//! Run T-SQL through `mssql_exec` on a connection of the caller's choosing.
+	void RunOn(Connection &connection, const string &tsql, const string &context);
+	//! On this transaction's connection.
 	void RunServerSide(const string &tsql, const string &context);
-	//! The same, on a connection of its own in autocommit - for DDL whose table duckdb has to
-	//! discover before this transaction commits.
+	//! On a connection of its own, in autocommit - for DDL whose table duckdb has to discover
+	//! before this transaction commits.
 	void RunServerSideOutsideTransaction(const string &tsql, const string &context);
 	//! The schema the catalog lives in, quoted for T-SQL.
 	string SchemaIdentifier() const;
