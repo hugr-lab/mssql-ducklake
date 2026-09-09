@@ -503,18 +503,21 @@ rows straight into the catalog under an unused `table_id` - the queries under te
 two tables, so nothing else needs to exist - the gap grows with the catalog rather than staying
 where the 301-file table left it:
 
-| files | stats rows | through the catalog | one server-side scan | ratio |
-| ---: | ---: | ---: | ---: | ---: |
-| 1,000 | 41,000 | 0.007s | 0.005s | 1.40x |
-| 10,000 | 410,000 | 0.043s | 0.014s | **3.07x** |
+| files | stats rows | filter returns | through the catalog | one server-side scan | ratio |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 41,000 | 6 rows | 0.007s | 0.005s | 1.40x |
+| 10,000 | 410,000 | 6 rows | 0.043s | 0.014s | 3.07x |
+| 30,000 | 1,230,000 | 11 rows | 0.038s | 0.005s | **7.0x** |
+| 30,000 | 1,230,000 | 30,000 rows | 0.039s | 0.035s | 1.1x |
 
-The mechanism says why, and says it keeps going: the catalog path transfers every stats row to the
-client and joins there, while the server-side form joins and returns the survivors. At 10,000 files
-that filtered read moved **410,000 rows across the wire to produce 6**. The ratio tracks rows
-transferred over rows returned, so it widens with both the catalog and the selectivity of the
-filter - which is to say it is worst exactly where a lake is most useful. (A 30,000-file point was
-attempted and the synthetic insert of 1.23M rows would not complete, so the curve stops at two
-points.)
+The last two rows are the same catalog and the same query differing only in how much the filter
+throws away, and together they say what actually drives this: **the catalog path costs what the
+catalog holds, the server-side form costs what the answer holds.** Through the catalog every stats
+row crosses the wire and the join happens on the client, so 0.04s whether eleven rows survive or
+thirty thousand. Server-side the join happens where the rows are and only the survivors travel.
+
+So it widens with catalog size *and* with selectivity, and a lake read is normally selective - that
+is what file pruning is for. It is worth nothing on a read that keeps everything.
 
 `GetFilesForTable` is virtual, so the whole query could be generated as one server-side statement
 and sidestep all of this. What stops that today is not the cost of the copy but its shape: of the
