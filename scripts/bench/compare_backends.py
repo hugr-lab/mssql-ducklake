@@ -32,6 +32,30 @@ PHASE = re.compile(r"^phase:(?P<name>[a-z_]+)$")
 TIMING = re.compile(r"Run Time \(s\): real (?P<real>[0-9.]+)")
 
 
+def warmup(kind: str, mssql_dsn: str, pg_dsn: str) -> str:
+    """Warm THIS process, not just the server.
+
+    A discarded run in another process warms the server - its plan cache, its buffer pool, the file
+    growth a fresh container has not done yet - and nothing else, because a connection pool does not
+    outlive the process that made it. That matters here: an mssql attach performs three TDS logins
+    at ~175ms each on loopback, and they are the pool warming up (measured, specs/005 D8).
+
+    So each arm opens its backend, touches it and lets it go before the first phase marker. The
+    timings of these statements are never parsed - `run` only attributes a timing once it has seen a
+    marker - so this costs wall clock and appears in no column. Both backends get the same treatment,
+    which is the point: postgres defers connection setup where SQL Server front-loads it, and a
+    comparison that lets one of them pay at measurement time and the other not is not a comparison."""
+    # NOT detached. A connection pool belongs to the attached catalog, so detaching the warm one
+    # throws away exactly what was warmed; left attached, the extension's connection cache can hand
+    # its connections to the lake's own catalog on the same connection string.
+    if kind == "postgres":
+        return ("INSTALL postgres; LOAD postgres;\n"
+                f"ATTACH '{pg_dsn}' AS warm (TYPE postgres);\n"
+                "SELECT 1;\n")
+    return (f"ATTACH '{mssql_dsn}' AS warm (TYPE mssql);\n"
+            "SELECT count(*) FROM mssql_scan('warm', 'SELECT 1 AS x');\n")
+
+
 def workload(rows: int, commits: int, file_rows: int, partitions: int) -> str:
     """The statements, with a marker before each phase. Metadata cost dominates the small commits;
     the bulk insert and the filtered reads are where the data path and the indexes show up.
@@ -53,6 +77,7 @@ def workload(rows: int, commits: int, file_rows: int, partitions: int) -> str:
         for i in range(commits)
     )
     return f"""
+{{WARMUP}}
 SELECT 'phase:attach';
 {{ATTACH}}
 SELECT 'phase:create_table';
@@ -169,6 +194,8 @@ def main() -> None:
     mssql_attach = f"ATTACH 'ducklake:mssql:{args.mssql_dsn}' AS lake (DATA_PATH '{args.data_path}/mssql');"
     # the two mssql arms differ ONLY by this variable, which is what makes the comparison a
     # comparison of commit paths rather than of two runs that happen to differ somewhere
+    warm = {k: warmup("postgres" if k == "postgres" else "mssql", args.mssql_dsn, args.pg_dsn)
+            for k in ("mssql", "mssql-fast", "mssql-fast-nofetch", "postgres")}
     spec = {
         "mssql": (reset_mssql, mssql_attach, {}),
         "mssql-fast": (reset_mssql, mssql_attach, {"MSSQL_DUCKLAKE_SERVER_COMMIT": "1"}),
@@ -187,7 +214,7 @@ def main() -> None:
     for round_no in range(args.warmup):
         for name in arms:
             reset, attach, env = spec[name]
-            script = load + reset + body.replace("{ATTACH}", attach)
+            script = load + reset + body.replace("{WARMUP}", warm[name]).replace("{ATTACH}", attach)
             print(f"warmup {round_no + 1}/{args.warmup}: {name} ...", file=sys.stderr)
             run(args.duckdb, script, env)
 
@@ -200,7 +227,7 @@ def main() -> None:
         order = arms if round_no % 2 == 0 else list(reversed(arms))
         for name in order:
             reset, attach, env = spec[name]
-            script = load + reset + body.replace("{ATTACH}", attach)
+            script = load + reset + body.replace("{WARMUP}", warm[name]).replace("{ATTACH}", attach)
             print(f"round {round_no + 1}/{args.repeat}: running {name} ...", file=sys.stderr)
             timings = run(args.duckdb, script, env)
             for phase, seconds in timings.items():
@@ -236,8 +263,9 @@ def main() -> None:
     for _, num, den in ratios:
         row += f"  {totals[num] / totals[den]:10.2f}x" if totals[den] else f"  {'-':>11}"
     print(row)
-    print(f"\nFastest of {args.repeat} rounds per phase, arms alternated each round, "
-          f"after {args.warmup} discarded warmup run(s) per arm.")
+    print(f"\nFastest of {args.repeat} rounds per phase, arms alternated each round. Each measured run "
+          f"warms its own\nconnection pool first; {args.warmup} whole run(s) per arm are also discarded "
+          f"before timing starts.")
     print("Ratios below 1.00 favour the numerator. The target of specs/004 is mssql/pg not worse")
     print("than 1.00; specs/005 is about fast/phase1, and only file_commits and bulk_insert are")
     print("commits the server-side apply accepts - the rest measure what its staging costs.")

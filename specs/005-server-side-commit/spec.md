@@ -210,14 +210,25 @@ anything after staging.
 pays for the server's plan cache, its buffer pool and its file growth; alternating the arms per round
 removed the rest of the ordering bias.
 
-Warmed, against the postgres backend on the same workload, the SQL Server backend is **7.5x slower
-overall** — and almost none of that is the commit:
+The warmup is now **in the measured process**, not only a discarded run before it. A discarded run
+in another process warms the server; it cannot warm a connection pool, which does not outlive the
+process that made it — and the pool is exactly what an mssql attach spends its time building. Each
+arm therefore opens its backend, touches it, and **leaves it attached** before the first phase
+marker; detaching the warm catalog throws away what was warmed. That alone took attach from 2.10s to
+1.25s.
+
+Warmed, against the postgres backend on the same workload, over five rounds:
 
 | phase | mssql | postgres | ratio |
-| --- | --- | --- | --- |
-| attach (creates the catalog) | 1.715 | 0.055 | 31x |
-| reattach (opens an existing one) | 0.783 | 0.034 | 23x |
-| all the commit phases together | ~1.4 | ~0.3 | ~4x |
+| --- | ---: | ---: | ---: |
+| attach (creates the catalog) | 1.248 | 0.057 | 21.9x |
+| reattach (opens an existing one) | 0.860 | 0.034 | 25.3x |
+| small_commits | 0.646 | 0.110 | 5.9x |
+| file_commits | 0.518 | 0.105 | 4.9x |
+| wide_commit | 0.458 | 0.185 | 2.5x |
+| **total** | **5.699** | **0.721** | **7.9x** |
+
+Almost none of that is the commit.
 
 **Where that goes is TDS logins, and they are the connection pool warming up.** From the server's
 `Logins/sec` counter, a bare attach performs three (one with `catalog false`, none also with
@@ -257,6 +268,37 @@ Phase 1 grows with the number of files, phase 2 barely does — which is the sha
 and D5 could only assert. **The crossover is around 16 data files**, and that is the threshold the
 path-picking rule should use. The staged file count is local duckdb state, known before anything
 crosses the wire.
+
+### D9 — three ways the SQL Server side might have been made faster, measured
+
+All three came out of asking what the server itself could be told to do differently. Two are
+answered and the third is blocked; none of them is why the backend is slower.
+
+**The catalog's primary keys are all CLUSTERED, and it does not matter.** SQL Server makes a
+PRIMARY KEY the clustered index unless told otherwise, so DuckLake's own keys decide the physical
+order of 31 indexes — and four tables key on a `VARCHAR(200)`, giving clustering keys of 200-224
+bytes that every nonclustered index carries as its row locator. Declaring them `NONCLUSTERED`
+instead, leaving the tables as heaps, measured **1.02x** over the whole workload and 1.00-1.09x on
+every phase. Physical order is not the constraint here.
+
+**Waiting for the log is not it either.** `DELAYED_DURABILITY = FORCED` lets a commit return before
+its log record reaches disk — never a setting to ship, but a clean diagnostic. The commit phases did
+not move (4.801s against 4.465s in the same conditions, which is noise). Whatever the commits are
+waiting for, it is not the transaction log.
+
+**A narrow IDENTITY primary key is the promising one, and it is blocked upstream.** The idea is not
+about physical order but about the shape of the row identity: the mssql extension builds one out of
+the primary key, so a composite key becomes a multi-column predicate in every statement that
+identifies a row, and a 224-byte identity is expanded into every pushed-down filter. A `BIGINT
+IDENTITY` primary key with the natural key kept as a `UNIQUE` constraint would make that eight
+bytes.
+
+It cannot be done today. An IDENTITY column is invisible to DuckDB — the extension's column
+metadata does not read `sys.columns.is_identity` — so DuckDB counts it among the insertable columns
+and rejects `INSERT ... VALUES` without a column list, which is the form all 25 of DuckLake's
+catalog inserts use: *table ducklake_table has 9 columns but 8 values were supplied*. An explicit
+column list works, and raw T-SQL through `mssql_exec` works, so the fix is small and narrow, and is
+filed as hugr-lab/mssql-extension#327. Worth revisiting when that lands.
 
 ## Enforcement & security
 
