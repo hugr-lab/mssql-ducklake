@@ -69,6 +69,7 @@ build/release/test/unittest 'test/sql/*'    # the sqllogictest suite (what CI ru
 scripts/ci/smoke_load.sh                    # out-of-tree CLI: local-file lake round trip, both gates
 cp -n .env.example .env; make docker-up     # the SQL Server for the integration suite (creates the catalog db)
 make test-integration                       # test/sql/integration/* with the DSN exported; `make test` skips them
+make test-concurrent                        # concurrent writers (specs/007); the one regression sqllogictest cannot express
 find src \( -name '*.cpp' -o -name '*.hpp' \) | xargs clang-format -i   # pin: clang_format==11.0.1 (pip)
 make format-check                           # duckdb's format.py over src + test (needs black, cmake-format, clang_format 11.0.1 in PATH)
 make tidy-check                             # clang-tidy over src (TIDY_BINARY=... to pick one); what the distribution's code-quality job runs

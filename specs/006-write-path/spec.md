@@ -92,8 +92,14 @@ Two things it could plausibly have broken, checked rather than assumed:
 - **Concurrent writers**, since the appender changes what a commit sends. Four writers, ten
   file-backed commits each, five runs per arm: three of five runs lose one writer to
   `INTERNAL Error: Failed to commit DuckLake transaction` — **with the appender and without it
-  alike**. That is the pre-existing concurrent-commit failure (specs/005 D14, the conflict check
-  that depends on `UNION ALL` row order), not a regression, and the arms are indistinguishable.
+  alike**, so not a regression from this work, and the arms are indistinguishable.
+
+  This spec originally attributed that failure to a known upstream issue, "the conflict check that
+  depends on `UNION ALL` row order". **That was wrong** — carried over from an earlier session and
+  never checked. It is a defect of this manager, diagnosed and fixed in specs/007: the conflict check
+  reads `ducklake_snapshot` twice in one query, and the two reads can disagree. The control that
+  settled it is the one that should have been run first — postgres, another remote catalog under the
+  same DuckLake, lost no writer in fourteen rounds where mssql lost one in six of them.
 
 It is worth being explicit about one property this gives up. CLAUDE.md's "Execute-passthrough kills
 the PK problem" rested on duckdb's DML path never being involved in a catalog write; the appender is
@@ -310,5 +316,6 @@ partitioning.
   server-side retry.
 - Upstream findings, none of them ours to fix, to raise with DuckLake once asked: the uncached
   per-file path resolution in `write_data_files_sql` (D1 — the appender sidesteps it, the SQL batch
-  still pays it), the empty inlined tables left by a flush (specs/005 D10), the catalog reloaded once
-  per schema version (D12), and the conflict check that depends on `UNION ALL` row order (D14).
+  still pays it), the empty inlined tables left by a flush (specs/005 D10), and the catalog reloaded
+  once per schema version (D12). The concurrent-commit failure is off this list: it was ours, and
+  specs/007 fixes it.

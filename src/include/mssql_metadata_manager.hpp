@@ -79,6 +79,12 @@ public:
 	//! catalog queries a read makes (specs/005 D13).
 	string GetLatestSnapshotQuery() const override;
 
+	//! Intercepts exactly one of DuckLake's queries - the commit loop's conflict check - and swaps it
+	//! for a form that reads ducklake_snapshot once instead of twice (specs/007 D1). Everything else
+	//! goes to the base untouched. Both query texts are constants in the .cpp; nothing outside needs
+	//! them.
+	unique_ptr<QueryResult> Query(DuckLakeSnapshot snapshot, string &query) override;
+
 	bool CanSkipSnapshotFetch(const TransactionChangeInformation &changes) const override;
 	void FlushChangesServerSide(DuckLakeTransaction &transaction, DuckLakeSnapshot transaction_snapshot,
 	                            const TransactionChangeInformation &transaction_changes,
