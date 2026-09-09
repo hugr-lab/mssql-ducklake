@@ -36,74 +36,76 @@ which gives it no keys and no indexes — while almost every DuckLake read carri
 
 ## Design
 
-### D1 — `Execute` is a passthrough (the postgres precedent)
+### D1 — the statement matrix: what runs where, and why
 
-`Execute(snapshot, query)` substitutes the placeholders itself, transpiles the batch, and sends it
-as one statement:
+The first cut of this spec sent the whole commit batch through `mssql_exec` and rewrote DuckLake's
+SQL into T-SQL on the way. That worked — the cycle went green — but the price was six rewrite rules,
+three of which touched **values**, and one of those shipped a silent data bug: a bare `'text'`
+literal is parsed in the database's collation code page, so `привет 😀` reached a UTF-8 column as
+`?????? ??` with no error anywhere. Rewriting SQL we did not generate is not a foundation.
 
-```sql
-SELECT mssql_exec('<metadata catalog name>', '<the transpiled batch>')
-```
+So the question is not "how do we transpile" but "which statements actually need us". Taking the
+inventory rather than guessing, over the pinned submodule:
 
-Placeholder substitution copies `PostgresMetadataManager::ExecuteQuery` including its one
-divergence from the base: `{METADATA_CATALOG}` expands to the **schema identifier alone**, not
-`catalog.schema` — the SQL now runs inside SQL Server, where the catalog name is not a prefix.
-Reads keep the base `Query()` (DuckDB scans of the attached catalog, materialized by mssql v0.2.5
-when a plan holds several of them).
+| statement, and where it comes from | runs through | why |
+| --- | --- | --- |
+| `INSERT INTO ducklake_*` — the bulk of every commit: inlined rows, data files, stats, tags, snapshot changes | **duckdb** | DuckDB already writes into an attached mssql catalog correctly — values, types, quoting, Unicode. Nothing to rewrite, so nothing to get wrong. |
+| `UPDATE t SET end_snapshot = N WHERE end_snapshot IS NULL AND id IN (…)` — dropping schemas, tables, views, macros | **duckdb** | valid DuckDB SQL; the only thing that ever blocked it was the missing primary key (D3) |
+| `WITH cte(…) AS (VALUES …) UPDATE t SET … FROM cte` — table and column statistics, tags, dropped columns, inlined deletes | **duckdb** | same: DuckDB parses and plans it, and with a key on the target the mssql DML path can execute it |
+| `DELETE FROM t WHERE …` — expiry and cleanup | **duckdb** | same |
+| `CREATE TABLE IF NOT EXISTS ducklake_inlined_data_*` (`GetInlinedTableQueries`, virtual) and `…_inlined_delete_*` (`GetInlinedDeletionTableName`, virtual) | **ours, raw T-SQL** | we choose the column types and the collation (D4); DuckDB cannot express `VARCHAR(MAX) COLLATE …`, and letting it create the table would hand the choice to the mssql extension's global settings |
+| the catalog's own DDL (`InitializeDuckLake`, virtual) | **ours, raw T-SQL** | primary keys and filtered indexes, which DuckLake's DDL has none of (D3) |
+| reads: catalog load, file lists, snapshots, statistics | **duckdb scans** | correct as they are; mssql v0.2.5 materializes a plan that holds several of them on the pinned connection (spec 003) |
+| `GetLatestSnapshotQuery` — every transaction start | **`mssql_scan`** | the one hot read: one server-side statement instead of a scan of the whole table (D5) |
 
-Consequence: DuckDB's DML path is never involved in a lake write, so the primary-key requirement
-does not apply — the failure above disappears, and with it the retry storm behind it.
+Two things fall out of the matrix, and both are the point of it:
 
-### D2 — write our own T-SQL where a virtual exists; rewrite the rest, literal-aware
+- **There is no transpiler.** Not a smaller one — none. Every statement DuckLake generates runs as
+  DuckLake wrote it, and every statement in T-SQL is one we wrote ourselves.
+- **`Execute` is not overridden.** The base implementation is the duckdb path, which is what the
+  matrix asks for.
 
-The obvious design is to generate T-SQL ourselves and never rewrite a string. DuckLake does not
-allow it: **most of the batch generators are `static`, not virtual** — `WriteNewSchemas`,
-`WriteNewTables`, `WriteNewViews`, `WriteNewColumns`, `WriteNewTags`, `WriteNewPartitionKeys`,
-`DropTables`, `WriteNewDataFilesSqlBatch`, `InsertSnapshotSql` — and `DuckLakeTransactionState`
-calls them directly. Editing the submodule is out (CLAUDE.md's standing invariant). So for that
-majority the assembled batch text reaching `Execute` is the only seam there is.
+### D2 — the DDL is written, not rewritten
 
-The split is therefore:
+Both DDL sites are virtual, so the T-SQL is ours to emit directly. They are also the only statements
+in the batch that DuckDB could not carry, which is why they are the only ones that leave it.
 
-- **Ours, generated directly as T-SQL** — every place DuckLake left a virtual and the dialect or
-  the types matter: `GetInlinedTableQueries` (the inlined table's DDL, hence D4's collation and
-  types), `WriteNewInlinedData`, `WriteNewInlinedTables`, `WriteNewInlinedFileDeletes`,
-  `WriteNewDataFiles`, and `InitializeDuckLake` (D3). No rewriting is involved in any of them.
-- **Rewritten in `Execute`** — what the static generators produced. A closed list of five forms,
-  applied by a scanner that walks the batch and distinguishes code from data: it steps over `'...'`
-  literals (including `''` escapes) and quoted identifiers, and substitutes only in code positions.
-  This is the part a regex would get wrong — a user string containing `NOW()` or the word `true` is
-  data and must survive untouched — and it is why the scanner is worth its ~60 lines. An
-  unrecognized dialect marker throws rather than reaching the server.
+They are executed through `mssql_exec` at the moment the virtual is called, rather than returned into
+the batch: the batch is DuckDB SQL and a T-SQL statement inside it would not parse. Both are
+`IF OBJECT_ID(…) IS NULL`-shaped, so a commit retry — which regenerates the batch and calls the
+virtual again — is a no-op the second time.
 
-The forms, from an audit of `ducklake_metadata_manager.cpp` at the pinned submodule:
+Two things about *how* they run were found the hard way, and both are load-bearing:
 
-| DuckDB form | T-SQL |
-| --- | --- |
-| `NOW()` | `SYSDATETIMEOFFSET()` |
-| `true` / `false` as values | `1` / `0` |
-| `CREATE TABLE IF NOT EXISTS x(...)` | `IF OBJECT_ID('x') IS NULL CREATE TABLE x(...)` |
-| `WITH cte(a, b) AS (VALUES ...)` | `WITH cte(a, b) AS (SELECT * FROM (VALUES ...) v(a, b))` |
-| identifiers colliding with T-SQL reserved words (`key`) | quoted |
+- **On a connection of their own, in autocommit.** Run inside the transaction, the new table is
+  locked against the metadata query the mssql extension issues to discover it — and that query takes
+  its own connection, so it waits on us until it times out. Created in autocommit the table is
+  visible at once and holds nothing. A rolled-back commit then leaves an empty table behind, which
+  the next attempt reuses; DuckLake's own DDL is `IF NOT EXISTS`-shaped for the same reason.
+- **The cache is dropped after the commit, not after the DDL.** The extension caches catalog
+  metadata, and a table created behind its back is invisible to the reads that follow — they miss it
+  silently rather than failing. DuckLake already knows when that happened and calls `ClearCache()`
+  at the right moment, so that is where `mssql_invalidate_cache` goes. Called mid-transaction it
+  deadlocks the same way as the DDL did. The extension's own `mssql_exec_invalidate_cache` setting
+  does this globally and on every DML; this is the point version.
 
-`DROP TABLE IF EXISTS` and `UPDATE ... SET ... FROM ...` are valid T-SQL as generated. Statements
-that only appear in DuckLake's own migrations (`UPDATE t AS alias`, `LIST(...)`) are out of scope:
-`automatic_migration` is off and the metadata version is pinned.
-
-The list is small and lives in one place on purpose. A ducklake submodule bump re-runs the audit and
-the full smoke; that is the price of vendoring, and it is written down in CLAUDE.md. Every form the
-audit finds is also covered by a unit-level test over the scanner, including the cases where the
-same text appears inside a string literal and must not change.
+The inlined data table also gets a primary key, `(row_id, begin_snapshot)`, for the same reason the
+catalog's tables do (D3): its rows are updated and deleted.
 
 ### D3 — our own `InitializeDuckLake`
 
-Instead of DuckLake's DuckDB DDL:
+DuckLake's own DDL runs first, through DuckDB — it owns the shape of its catalog, and reproducing
+twenty-eight `CREATE TABLE`s here would be a copy to re-audit on every submodule bump. What follows
+is the part DuckDB cannot express, applied as our T-SQL:
 
 - **Primary keys** on the catalog tables, so a future non-passthrough path is not blocked and the
   server can enforce what DuckLake assumes.
 - **Filtered indexes** `WHERE end_snapshot IS NULL` on the versioned tables — the condition almost
   every read carries. Neither postgres nor sqlite has indexes here; this is the first place we can
   be faster rather than equal.
+- The keys and the column changes go in **two batches**: inside one T-SQL batch a column's new
+  `NOT NULL` is not yet visible to the constraint that needs it, and the server answers "cannot
+  define PRIMARY KEY on a nullable column".
 - **A server gate**: SQL Server 2019 or newer, checked with
   `CAST(SERVERPROPERTY('ProductMajorVersion') AS INT)` (uncast it returns `sql_variant`, which the
   mssql extension cannot decode — it tears the connection). Older servers have no UTF-8 collation
@@ -155,12 +157,15 @@ unquoted that would not have reached the generic path the same way.
 
 ## Alternatives considered
 
-- **Generate every statement ourselves and never rewrite a string.** Not available: the static
-  generators above have no seam, and patching the submodule is forbidden. What is reachable through
-  a virtual, we do generate ourselves (D2).
-- **Keep the generic manager and give the catalog primary keys only.** Enough to stop the observed
-  failure, but it leaves every statement its own round trip and hands DuckDB's DML path a rowid it
-  would have to build per row.
+- **Pass the whole batch through `mssql_exec`, rewriting it into T-SQL** (this spec's first cut,
+  implemented and measured). One round trip per commit instead of several, and the postgres manager
+  does exactly this — but postgres transpiles nothing, because DuckLake's SQL already is postgres's
+  dialect. For us it meant six rewrite rules over SQL we did not generate, three of them touching
+  values; one silently mangled every non-ASCII string. Reverted in favour of the matrix. The
+  round-trip count comes back in phase 2, where the server-side procedure earns it honestly.
+- **Let DuckDB create the inlined tables too**, and take whatever types the mssql extension maps.
+  Then the collation — which decides whether DuckLake's pushed-down `min`/`max` comparisons prune
+  correctly — would follow the extension's global settings rather than this manager's choice.
 - **Route every read through `mssql_scan` too.** That is the phase-3 transpiler over ~25 read
   queries with list aggregation and `NULLS FIRST`; correctness does not need it (v0.2.5 materializes
   multi-scan plans) and it would be re-audited on every bump.
