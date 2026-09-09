@@ -14,9 +14,9 @@ ATTACH 'ducklake:mssql:Server=host,1433;Database=lake_meta;User Id=…;Password=
 
 **mssql v0.2.5 or newer is required** — older versions answer DuckDB's `main` when DuckLake asks the
 catalog for its default schema, and the ATTACH above fails with `Schema 'main' not found in MSSQL
-database`. Until [community-extensions#2676](https://github.com/duckdb/community-extensions/pull/2676)
-lands, `INSTALL mssql FROM community` still gives v0.2.4; with that version, add
-`METADATA_SCHEMA 'dbo'` to the ATTACH.
+database`. `INSTALL mssql FROM community` now gives v0.2.5, so nothing extra is needed; on an older
+copy, `FORCE INSTALL mssql FROM community` replaces it, and `SELECT mssql_version()` says which one
+is loaded. With v0.2.4 the ATTACH needs `METADATA_SCHEMA 'dbo'`.
 
 The extension carries the complete, unmodified DuckLake source at a pinned release and registers a
 `MSSQLMetadataManager` beside the built-in postgres/sqlite ones — so everything DuckLake does
