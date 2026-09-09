@@ -88,6 +88,22 @@ Two things about *how* they run were found the hard way, and both are load-beari
   at the right moment, so that is where `mssql_invalidate_cache` goes. Called mid-transaction it
   deadlocks the same way as the DDL did. The extension's own `mssql_exec_invalidate_cache` setting
   does this globally and on every DML; this is the point version.
+- **`ducklake_file_column_stats` gets an index too, on the predicate the read carries.** It is the
+  largest table in the catalog - a row per file per column - and a filtered read asks it for
+  `column_id = ? AND table_id = ?`. The primary key is `(data_file_id, column_id)`, whose leading
+  column is not in that predicate at all, so nothing served it. Keys only, no `INCLUDE`: `min_value`
+  and `max_value` are `VARCHAR(MAX)`, because DuckLake declares them without a length and bounds
+  nothing it writes, and a MAX column is a LOB - it can be neither an index key nor a sensible thing
+  to duplicate into one. There is no filtered form either, since stats have no `end_snapshot`; they
+  belong to a file, and the file is what expires.
+
+  Added on the grounds that the predicate had no index rather than on a measured win: three attempts
+  to benchmark it disagreed with each other (0.195s→0.101s one way, 0.102s→0.124s the other), each
+  spoiled by measuring the two variants in sequence rather than alternating them. The honest state
+  is that the effect is unmeasured here, not that it is large.
+
+  `ducklake_snapshot` and `ducklake_snapshot_changes` need nothing: DuckLake gives both a clustered
+  primary key on `snapshot_id`, which is exactly what every query asks them for.
 - **And it names the table.** `mssql_invalidate_cache` takes a catalog, a schema, and a table, and
   the three-argument form is the one to use: it re-reads that table's columns *and* the schema's
   table list — which is what makes a newly created table visible — while keeping every other table's
