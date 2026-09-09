@@ -70,7 +70,7 @@ MSSQL_DUCKLAKE_PG_PASS ?= TestPassword1
 MSSQL_DUCKLAKE_PG_DB ?= lake_meta
 MSSQL_DUCKLAKE_PG_DSN ?= dbname=$(MSSQL_DUCKLAKE_PG_DB) host=$(MSSQL_DUCKLAKE_PG_HOST) port=$(MSSQL_DUCKLAKE_PG_PORT) user=$(MSSQL_DUCKLAKE_PG_USER) password=$(MSSQL_DUCKLAKE_PG_PASS)
 
-.PHONY: bench-up bench-down bench bench-paths
+.PHONY: bench-up bench-down bench bench-paths bench-scale
 bench-up docker-status: export MSSQL_DUCKLAKE_PG_PORT := $(MSSQL_DUCKLAKE_PG_PORT)
 bench-up:
 	$(DOCKER_COMPOSE) --profile bench up -d --wait postgres
@@ -85,6 +85,15 @@ bench: export MSSQL_DUCKLAKE_PG_DSN := $(MSSQL_DUCKLAKE_PG_DSN)
 bench:
 	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
 	python3 scripts/bench/compare_backends.py $(BENCH_ARGS)
+
+# A production-shaped catalog - many tables over many schemas, thousands of snapshots - and the
+# maintenance functions run against it. Needs both servers, like `bench`.
+#   make bench-scale BENCH_SCALE_ARGS='--tables 1000'
+bench-scale: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
+bench-scale: export MSSQL_DUCKLAKE_PG_DSN := $(MSSQL_DUCKLAKE_PG_DSN)
+bench-scale:
+	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
+	python3 scripts/bench/scale_catalog.py $(BENCH_SCALE_ARGS)
 
 # The comparison specs/005 is about: the same workload committed by DuckLake's own loop and by the
 # server-side apply, differing only by MSSQL_DUCKLAKE_SERVER_COMMIT. No postgres, so it needs only
