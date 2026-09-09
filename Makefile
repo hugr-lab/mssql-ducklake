@@ -70,7 +70,7 @@ MSSQL_DUCKLAKE_PG_PASS ?= TestPassword1
 MSSQL_DUCKLAKE_PG_DB ?= lake_meta
 MSSQL_DUCKLAKE_PG_DSN ?= dbname=$(MSSQL_DUCKLAKE_PG_DB) host=$(MSSQL_DUCKLAKE_PG_HOST) port=$(MSSQL_DUCKLAKE_PG_PORT) user=$(MSSQL_DUCKLAKE_PG_USER) password=$(MSSQL_DUCKLAKE_PG_PASS)
 
-.PHONY: bench-up bench-down bench
+.PHONY: bench-up bench-down bench bench-paths
 bench-up docker-status: export MSSQL_DUCKLAKE_PG_PORT := $(MSSQL_DUCKLAKE_PG_PORT)
 bench-up:
 	$(DOCKER_COMPOSE) --profile bench up -d --wait postgres
@@ -85,6 +85,14 @@ bench: export MSSQL_DUCKLAKE_PG_DSN := $(MSSQL_DUCKLAKE_PG_DSN)
 bench:
 	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
 	python3 scripts/bench/compare_backends.py
+
+# The comparison specs/005 is about: the same workload committed by DuckLake's own loop and by the
+# server-side apply, differing only by MSSQL_DUCKLAKE_SERVER_COMMIT. No postgres, so it needs only
+# `make docker-up`.
+bench-paths: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
+bench-paths:
+	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
+	python3 scripts/bench/compare_backends.py --arms mssql,mssql-fast
 
 # The server-backed suite (test/sql/integration/): gated on MSSQL_DUCKLAKE_TEST_DSN, so `make test`
 # skips it and this target is the one that provides it. The floor fails a run that skipped anyway.

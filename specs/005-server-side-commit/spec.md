@@ -150,6 +150,59 @@ Two things follow, and neither is a surprise once stated:
   loop rather than run beside it. Until it does, phase 2 is a slowdown — which is why it is armed
   but inert (D4), not because arming it is risky.
 
+### D7 — measured against phase 1, which found two defects and a threshold
+
+`make bench-paths` runs the same workload through both commit paths, differing only by the
+environment variable that arms the apply. Phases that cannot depend on the commit path — attach,
+reattach, a scan — come out within a few percent, which is the noise floor the rest is read against.
+Round trips are counted separately, from the server's own `Batch Requests/sec` counter, as the
+difference between a run of one commit and a run of twenty-one.
+
+The first measurement said the fast path was **1.47x slower overall** and slower in every phase that
+commits. Two causes, both real defects rather than costs of the design:
+
+- **It cleared the mssql extension's catalog cache after every commit.** Copied from quack, which
+  needs it because its apply creates inlined-data tables. Ours creates no table at all — it writes
+  rows into catalog tables that already exist. The clear cost the whole schema's metadata: of the 66
+  round trips an attach-plus-commit took, **39 were the extension re-reading table and column
+  metadata**, not DuckLake asking anything. Now cleared only when the server reports a flush.
+- **A commit the apply cannot take paid for both paths.** The shape was decided *after* staging, so
+  such a commit did the full staging, bulk-loaded it to the server, threw it away, and then ran the
+  entire client commit loop. It was the worst phase in the benchmark, 3.5x. The shape is knowable
+  before any of that: `TransactionChangeInformation` names each one separately, so
+  `IsDataFilesOnlyCommit` decides first and nothing is staged that will be abandoned.
+
+Deciding before staging also made the staging check meaningful as an assertion, and it immediately
+caught a third defect: a **partitioned** table's files carry partition values, which the apply did
+not write. That had been hidden by the old after-the-fact fallback, which quietly sent every
+partitioned commit to the client loop. The apply now writes `ducklake_file_partition_value`, reading
+the staged table through `sp_executesql` so the statement is compiled only when that table was
+loaded — an empty one is not bulk-loaded, and loading it would cost a round trip on every commit of
+an unpartitioned table.
+
+After the fixes, per commit: **16.0 round trips on phase 1, 15.2 on phase 2**, and by phase:
+
+| phase | phase 1 | phase 2 | ratio |
+| --- | --- | --- | --- |
+| one commit, many data files (`wide_commit`) | 0.546 | 0.292 | **0.53x** |
+| small file-backed commits (`file_commits`) | 0.610 | 1.045 | 1.71x |
+| inlined commits (`small_commits`) | 0.815 | 0.700 | 0.86x |
+| total | 6.125 | 6.007 | 0.98x |
+
+**This is the threshold D5 predicted, now with a number on it.** The apply wins where it was designed
+to — one commit carrying many data files, where a single bulk load replaces many rows of statement
+text — and loses on a commit carrying one small file, where the bulk load is pure overhead. Overall
+parity is not the goal; picking the path per commit is. The staging is local duckdb work until the
+first bulk load, so the count is knowable for free before anything crosses the wire.
+
+Skipping the snapshot fetch (`MSSQL_DUCKLAKE_SERVER_COMMIT_SKIP_FETCH=1`) is implemented and correct
+— the catalogs match — but measures no better, so it stays off. Its invariant is worth writing down
+because it is not obvious: DuckLake holds `snapshot_lock` across the flush call, and `GetSnapshot()`
+takes that same non-recursive mutex, so a commit that skipped the fetch can **never** ask for the
+snapshot afterwards. `CanSkipSnapshotFetch` must therefore answer for exactly the commits the apply
+finishes without falling back — which is why both now ask `IsDataFilesOnlyCommit` and neither decides
+anything after staging.
+
 ## Enforcement & security
 
 The procedure is created by us and takes no SQL from the client: its parameters are the schema name,
@@ -175,12 +228,12 @@ succeeded, our own reads of the result succeeded, and the exception arrived late
 cardinality estimation over parquet, three frames deep in the optimizer. The stack trace named the
 cause on the first read; the guesses that preceded reading it did not.
 
-It stays off for the reasons in D4 and D5, not for want of correctness: the apply still covers only
-data files, and below a threshold the staging costs more than the client loop it would replace.
-`ProbeServerCapabilities` does not arm it, so DuckLake never takes it and the default build is
-exactly phase 1, which stays green. Arming it means finishing the scope (delete files, inlined data
-and deletes, compactions, name maps), the server-side retry, and that threshold — then `make bench`
-decides.
+It stays off, but no longer for want of a result: measured (D7) it is **0.53x phase 1** on a commit
+carrying many data files and 1.71x on a commit carrying one small one, at 0.98x overall. What is
+missing is the rule that picks between them per commit, plus the scope the apply still does not
+cover (delete files, inlined data and deletes, compactions, name maps) and the server-side retry.
+`ProbeServerCapabilities` does not arm it, so the default build is exactly phase 1, which stays
+green — and CI now runs the suite on both paths, so the fast one cannot rot while it waits.
 
 Two lessons already paid for, both about SQL Server rather than about DuckLake:
 
