@@ -43,6 +43,18 @@ PHASES = [
     "merge_adjacent",
     "cleanup_files",
     "checkpoint",
+    "deep_history",
+    "deep_list_snapshots",
+    "deep_read_latest",
+    "deep_read_filtered",
+    "deep_time_travel_old",
+    "deep_time_travel_mid",
+    "deep_table_changes",
+    "deep_reattach",
+    "evolution",
+    "evolution_read_latest",
+    "evolution_time_travel",
+    "evolution_table_info",
 ]
 
 LOAD = (
@@ -91,7 +103,8 @@ def attach_sql(backend: str, mssql_dsn: str, pg_dsn: str, data_path: str) -> str
     return f"ATTACH 'ducklake:mssql:{mssql_dsn}' AS lake (DATA_PATH '{data_path}');"
 
 
-def build_and_measure_sql(tables: int, rows: int, schemas: int, columns: int, attach: str) -> str:
+def build_and_measure_sql(tables: int, rows: int, schemas: int, columns: int, deep_tables: int,
+                          deep_snapshots: int, evolutions: int, attach: str) -> str:
     """The catalog, then the questions asked of it.
 
     Every CREATE TABLE and every INSERT is its own DuckLake commit, so `tables` tables with two
@@ -137,6 +150,52 @@ def build_and_measure_sql(tables: int, rows: int, schemas: int, columns: int, at
     )
     # a table in the middle, so the read is not answered by whatever was touched last
     probe = qualified(tables // 2)
+
+    # Depth, not just breadth. A lake that has been running writes into the same tables over and
+    # over, so a few tables carry thousands of snapshots and thousands of small files between them -
+    # which is the state compaction exists for, and the state a read has to plan against. Each of
+    # these commits writes a file rather than inlining, because it is the data files a read has to
+    # prune, and an inlined commit leaves none.
+    deep = [qualified(i) for i in range(min(deep_tables, tables))]
+    deep_writes = "\n".join(
+        f"INSERT INTO {t} SELECT {n} * 100 + r, {column_values(f'({n} * 100 + r)')} FROM range(20) t(r);"
+        for n in range(deep_snapshots) for t in deep
+    )
+    deep_probe = deep[0] if deep else probe
+
+    # The versions to travel to are READ from the history rather than computed. The maintenance
+    # functions above commit as they see fit, so counting the statements we emit does not give the
+    # snapshot ids they land on - an earlier cut of this asked for version 52 of a table that did
+    # not exist until 61. A marker before each block records where it started, and the targets are
+    # offsets from that.
+    deep_commits = deep_tables * deep_snapshots
+    mark_deep_base = "SET VARIABLE deep_base = (SELECT max(snapshot_id) FROM ducklake_snapshots('lake'));"
+    pick_deep = (
+        f"SET VARIABLE deep_old = getvariable('deep_base') + {max(1, deep_commits // 10)};\n"
+        f"SET VARIABLE deep_mid = getvariable('deep_base') + {max(2, deep_commits // 2)};"
+    )
+    mark_ev_base = "SET VARIABLE ev_base = (SELECT max(snapshot_id) FROM ducklake_snapshots('lake'));"
+    pick_ev = f"SET VARIABLE ev_old = getvariable('ev_base') + {max(2, evolutions // 5)};"
+
+    # One table that keeps changing shape. Schema evolution is its own kind of load on the catalog:
+    # ducklake_column gains a row per column per VERSION rather than per column, ducklake_schema_versions
+    # grows with every change, and a read at an old snapshot has to resolve the columns as they were
+    # then rather than as they are now. A lake that has been in production has done this many times.
+    evolution_sql = ["CREATE TABLE lake.s0.ev(id BIGINT, c0 BIGINT);"]
+    live: list = []  # the added columns still present, under their current names
+    for i in range(evolutions):
+        evolution_sql.append(f"ALTER TABLE lake.s0.ev ADD COLUMN e{i} BIGINT;")
+        live.append(f"e{i}")
+        # written through an explicit column list, because the shape under it keeps moving
+        evolution_sql.append(f"INSERT INTO lake.s0.ev (id, c0) VALUES ({i}, {i});")
+        if i % 3 == 2 and len(live) > 1:
+            # the oldest goes, so the table keeps a moving window rather than growing without end
+            evolution_sql.append(f"ALTER TABLE lake.s0.ev DROP COLUMN {live.pop(0)};")
+        if i % 5 == 4 and live:
+            # by current name: a column renamed here must not be dropped by its old one later
+            evolution_sql.append(f"ALTER TABLE lake.s0.ev RENAME COLUMN {live[-1]} TO r{i};")
+            live[-1] = f"r{i}"
+    evolution_ddl = "\n".join(evolution_sql)
     return f"""
 SELECT 'phase:create_schemas';
 {schema_ddl}
@@ -165,6 +224,36 @@ SELECT 'phase:cleanup_files';
 SELECT count(*) FROM ducklake_cleanup_old_files('lake', dry_run => true, cleanup_all => true);
 SELECT 'phase:checkpoint';
 CHECKPOINT;
+{mark_deep_base}
+SELECT 'phase:deep_history';
+{deep_writes}
+{pick_deep}
+SELECT 'phase:deep_list_snapshots';
+SELECT count(*) FROM ducklake_snapshots('lake');
+SELECT 'phase:deep_read_latest';
+SELECT count(*), sum(c0) FROM {deep_probe};
+SELECT 'phase:deep_read_filtered';
+SELECT count(*), sum(c0) FROM {deep_probe} WHERE id BETWEEN 5 AND 9;
+SELECT 'phase:deep_time_travel_old';
+SELECT count(*) FROM {deep_probe} AT (VERSION => getvariable('deep_old'));
+SELECT 'phase:deep_time_travel_mid';
+SELECT count(*) FROM {deep_probe} AT (VERSION => getvariable('deep_mid'));
+SELECT 'phase:deep_table_changes';
+SELECT count(*) FROM ducklake_table_changes('lake', 's0', 't0', getvariable('deep_old'), getvariable('deep_mid'));
+SELECT 'phase:deep_reattach';
+DETACH lake;
+{attach}
+SELECT count(*) FROM {deep_probe};
+{mark_ev_base}
+SELECT 'phase:evolution';
+{evolution_ddl}
+{pick_ev}
+SELECT 'phase:evolution_read_latest';
+SELECT count(*), sum(c0) FROM lake.s0.ev;
+SELECT 'phase:evolution_time_travel';
+SELECT count(*) FROM lake.s0.ev AT (VERSION => getvariable('ev_old'));
+SELECT 'phase:evolution_table_info';
+SELECT count(*) FROM ducklake_table_info('lake');
 SELECT 'phase:end';
 SELECT count(*) FROM {probe};
 """
@@ -212,6 +301,12 @@ def main() -> None:
     parser.add_argument("--schemas", type=int, default=10, help="schemas the tables are spread over")
     parser.add_argument("--columns", type=int, default=40,
                         help="columns per table beyond the id; width is what grows the catalog")
+    parser.add_argument("--deep-tables", type=int, default=3,
+                        help="tables given a deep snapshot history, so reads can be measured against one")
+    parser.add_argument("--deep-snapshots", type=int, default=1000,
+                        help="file-backed commits into EACH deep table; this is what makes reads interesting")
+    parser.add_argument("--evolutions", type=int, default=100,
+                        help="schema changes on one table, each followed by a commit")
     parser.add_argument("--backends", default="mssql,postgres", help="comma-separated: mssql, postgres")
     args = parser.parse_args()
 
@@ -232,7 +327,8 @@ def main() -> None:
                   + reset_sql(backend, args.mssql_dsn, args.pg_dsn)
                   + warmup_sql(backend, args.mssql_dsn, args.pg_dsn)
                   + attach + "\n"
-                  + build_and_measure_sql(args.tables, args.rows, args.schemas, args.columns, attach))
+                  + build_and_measure_sql(args.tables, args.rows, args.schemas, args.columns,
+                                          args.deep_tables, args.deep_snapshots, args.evolutions, attach))
         print(f"building {args.tables} tables on {backend} ...", file=sys.stderr)
         # the probe table holds one inlined row plus the file-backed insert
         results[backend] = run(args.duckdb, script, args.rows + 1)
@@ -245,7 +341,11 @@ def main() -> None:
     stats_rows = args.tables * (args.columns + 1)
     print(f"\n{args.tables} tables over {args.schemas} schemas, {args.columns + 1} columns each, "
           f"~{3 * args.tables + args.schemas} snapshots,\n{args.rows} rows per file-backed insert, so "
-          f"~{stats_rows} rows in ducklake_column and ~{stats_rows} per round in file column stats")
+          f"~{stats_rows} rows in ducklake_column and ~{stats_rows} per round in file column stats.\n"
+          f"{args.deep_tables} tables then take {args.deep_snapshots} file-backed commits each, so the reads "
+          f"below run against\n~{args.deep_tables * args.deep_snapshots} data files and a history that deep.\n"
+          f"One table then takes {args.evolutions} schema changes, so a read at an old version has to "
+          f"rebuild the schema as it was")
     print(f"\n{header}")
     print("-" * len(header))
     totals = {b: 0.0 for b in backends}
