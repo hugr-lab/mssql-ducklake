@@ -63,6 +63,10 @@ public:
 	//! one call; until that call exists these hand back to the client-side loop, so the fast path is
 	//! opt-in and every refusal is a fallback rather than a failure.
 	void ProbeServerCapabilities() override;
+	//! Read the latest snapshot through `mssql_scan` rather than through the attached catalog - the
+	//! postgres manager's trick, and worth four times the query (specs/005 D13).
+	string GetLatestSnapshotQuery() const override;
+
 	bool CanSkipSnapshotFetch(const TransactionChangeInformation &changes) const override;
 	void FlushChangesServerSide(DuckLakeTransaction &transaction, DuckLakeSnapshot transaction_snapshot,
 	                            const TransactionChangeInformation &transaction_changes,
