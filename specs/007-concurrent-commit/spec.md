@@ -82,6 +82,15 @@ the column order and both branches.
 
 Measured after the change, same fourteen alternating rounds: **mssql 0 of 14, postgres 0 of 14.**
 
+What it does not fix, and should be said plainly: neither form pushes the limit down. The scan that
+goes to the server is `SELECT snapshot_id, schema_version, next_catalog_id, next_file_id FROM
+ducklake_snapshot` with no `TOP` and no `ORDER BY` — DuckDB reads every snapshot row and takes the
+top one locally. On a catalog with a deep history that is a full read of `ducklake_snapshot` on every
+commit retry. It is half of what the original did, which read the table twice, so this is strictly
+cheaper as well as correct; but the cheap form is the one `GetLatestSnapshotQuery` uses — `TOP 1`
+inside an `mssql_scan` — and that is unavailable here, because on mssql v0.2.5 an `mssql_scan` has to
+be the sole source of its query and this one also reads three other tables.
+
 **Why interception, and how it fails safe.** `GetSnapshotAndStatsAndChangesQuery()` is `static`, so
 there is no virtual to override — but the executor reaches it through `metadata_manager->Query(…)`,
 which is virtual and ours. The match is against DuckLake's template *before* any placeholder is
@@ -121,7 +130,8 @@ two placeholders the base substitutes, and no part of it is built from user inpu
 
 `make test-concurrent` (`scripts/bench/concurrent_writers.py`) — six writers, ten file-backed commits
 each, ten rounds, every writer into its own table so none of them genuinely conflict. Any writer that
-does not finish with all of its rows fails the run.
+does not finish with all of its rows fails the run. CI runs it beside the integration suites, because
+a regression test nothing runs is barely better than none; it costs about seventy seconds.
 
 It cannot be a sqllogictest: the failure needs two processes committing at once.
 

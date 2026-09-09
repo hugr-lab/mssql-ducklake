@@ -930,10 +930,12 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Query(DuckLakeSnapshot snapshot, s
 	// An exact match, so a ducklake bump that edits the query stops matching rather than applying a
 	// rewrite to something that no longer says what we think. ProbeServerCapabilities turns that
 	// mismatch into an error at attach, because the alternative is a silent return of the crash.
+	//
 	// The switch exists so the regression test can be shown to fail without the rewrite - a test that
-	// cannot fail proves nothing, and this one was written before its sensitivity was checked. It is
-	// read on every call rather than cached because it is only ever set by that test.
-	if (getenv("MSSQL_DUCKLAKE_NO_CONFLICT_REWRITE") == nullptr && query == DUCKLAKE_CONFLICT_CHECK_QUERY) {
+	// cannot fail proves nothing, and this one did pass without it until its sensitivity was checked.
+	// It is asked only after the query has already matched, which is once per commit retry rather
+	// than on every metadata query this override sees.
+	if (query == DUCKLAKE_CONFLICT_CHECK_QUERY && getenv("MSSQL_DUCKLAKE_NO_CONFLICT_REWRITE") == nullptr) {
 		query = MSSQL_CONFLICT_CHECK_QUERY;
 	}
 	return DuckLakeMetadataManager::Query(snapshot, query);
@@ -1079,9 +1081,9 @@ void MSSQLMetadataManager::ProbeServerCapabilities() {
 	// the query fails the integration suite rather than shipping a correctness regression.
 	if (DuckLakeMetadataManager::GetSnapshotAndStatsAndChangesQuery() != DUCKLAKE_CONFLICT_CHECK_QUERY) {
 		throw InvalidInputException(
-		    "mssql_ducklake: DuckLake's conflict-check query has changed in this ducklake pin. "
-		    "the manager rewrites that query so it reads ducklake_snapshot "
-		    "once instead of twice (specs/007); re-audit the rewrite against the new text and update "
+		    "mssql_ducklake: DuckLake's conflict-check query has changed in this ducklake pin. This "
+		    "manager rewrites that query so it reads ducklake_snapshot once instead of twice "
+		    "(specs/007); re-audit the rewrite against the new text and update "
 		    "DUCKLAKE_CONFLICT_CHECK_QUERY.");
 	}
 }
