@@ -595,6 +595,60 @@ The read path therefore has two separate causes, not one:
 | first read of a session | 0.69s vs 0.15s | metadata volume, 1054 empty leftover tables | DuckLake |
 | every read after it | 26ms vs 13ms | ~4 catalog-path queries at ~10ms instead of ~2.5ms | here |
 
+### D14 — concurrent writers, and a conflict check that depends on row order
+
+Four writers, ten file-backed commits each into their own tables of one lake. It works, and it is
+not fast or slow in an interesting way - the commits serialise on allocating the next snapshot id,
+so wall clock is about what four sequential writers would take. `OPTIMIZE_FOR_SEQUENTIAL_KEY`, which
+exists for exactly the last-page contention these ever-increasing keys should cause, measures
+nothing: 3.78s off, 3.18s on, 2.90s off again - the last run being the fastest is the tell. Queueing
+behind the snapshot id hides any queueing behind a latch.
+
+**What the runs did find is a writer dying outright, in two runs of six**, with
+`INTERNAL Error: Failed to commit DuckLake transaction.` and, underneath it, `Calling
+GetValueInternal on a value that is NULL`. The stack:
+
+```
+Value::GetValueInternal<uint64_t>
+DuckLakeMetadataManager::ParseSnapshotAndStatsAndChanges
+DuckLakeMetadataManager::GetSnapshotAndStatsAndChanges
+DuckLakeTransactionState::CheckForConflicts
+DuckLakeTransactionState::Commit
+```
+
+The conflict check runs only when another snapshot appeared while this transaction was open, which
+is why nothing single-threaded reaches it. Its query is a `UNION ALL`: one branch returns the latest
+snapshot with the stats columns as `NULL`, the other returns the stats rows with the snapshot
+columns as `NULL`. The parser then does this:
+
+```cpp
+bool first_row = true;
+for (auto &row : result) {
+    if (first_row) {
+        current_snapshot.snapshot.snapshot_id = row.GetValue<idx_t>(0);
+        ...
+    } else {
+        TransformGlobalStatsRow(row, current_snapshot.stats, 5);
+    }
+    first_row = false;
+}
+```
+
+**It takes the first row to be the snapshot row, and the query has no `ORDER BY`.** A `UNION ALL`
+guarantees no order. If the stats branch is returned first, `GetValue<idx_t>(0)` reads that branch's
+`NULL` snapshot id and the commit dies - and dies for good, because the message contains none of
+`primary key`, `unique`, `conflict` or `concurrent`, which is the whole of `RetryOnError`'s
+vocabulary, so DuckLake does not retry what is in fact a concurrency failure.
+
+Asked directly, SQL Server returns the branches in order for this shape, so it could not be forced
+on demand; the reordering that must be happening is plan-dependent, which fits a failure that
+appears in two runs out of six. The unsound assumption is not in doubt either way - it is visible in
+the code, and the crash lands exactly on the read it would produce.
+
+Backend-independent: nothing here is SQL Server specific beyond it being a server free to choose its
+plan. It belongs upstream in DuckLake, as an `ORDER BY` on the discriminator or a parser that tests
+which kind of row it has rather than counting.
+
 ## Enforcement & security
 
 The procedure is created by us and takes no SQL from the client: its parameters are the schema name,
