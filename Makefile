@@ -84,7 +84,7 @@ bench: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
 bench: export MSSQL_DUCKLAKE_PG_DSN := $(MSSQL_DUCKLAKE_PG_DSN)
 bench:
 	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
-	python3 scripts/bench/compare_backends.py
+	python3 scripts/bench/compare_backends.py $(BENCH_ARGS)
 
 # The comparison specs/005 is about: the same workload committed by DuckLake's own loop and by the
 # server-side apply, differing only by MSSQL_DUCKLAKE_SERVER_COMMIT. No postgres, so it needs only
