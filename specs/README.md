@@ -39,4 +39,5 @@ specs are the shareable distillation of that work.
 | [001](001-bridge-extension/spec.md) | the bridge extension — DuckLake metadata on SQL Server | superseded by 002 |
 | [002](002-embedded-ducklake/spec.md) | the standalone extension — embedded ducklake + mssql manager | accepted |
 | [003](003-mssql-extension-v0.2.5/spec.md) | mssql-extension v0.2.5 — what the manager needs from the runtime pair | implemented (mssql v0.2.5) |
-| [004](004-manager-phase-1/spec.md) | the SQL Server metadata manager, phase 1 — parity with postgres | accepted (in progress) |
+| [004](004-manager-phase-1/spec.md) | the SQL Server metadata manager, phase 1 — parity with postgres | implemented (target missed, see Measured) |
+| [005](005-server-side-commit/spec.md) | phase 2 — the commit as one call to the server | draft |
