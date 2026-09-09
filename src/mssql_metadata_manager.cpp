@@ -160,15 +160,43 @@ void MSSQLMetadataManager::ClearCache() {
 	// mssql_exec is invisible to the duckdb reads that follow - they miss it silently rather than
 	// failing. DuckLake tracks when that has happened and calls this at the end of a commit; issuing
 	// it earlier deadlocks, because the refresh queries the catalog on a second connection and waits
-	// on the schema locks this transaction holds. Scoped to our schema rather than the whole
-	// catalog, which would drop every table's metadata on every inlined-table creation.
+	// on the schema locks this transaction holds.
+	//
+	// Named down to the table wherever we know it, because a schema-wide clear is not cheap: the
+	// catalog holds 23 tables plus an inlined table per lake table, and re-reading their columns and
+	// keys measured 39 round trips - more than the commit that triggered it (specs/005 D7). There are
+	// exactly two places a table appears behind the extension's back, and both record the name here.
+	// Nothing recorded means we do not know what changed - the attach-time clear - and the schema is
+	// the honest answer then.
 	auto &connection = transaction.GetConnection();
 	auto schema = DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName());
-	auto result =
-	    connection.Query(StringUtil::Format("SELECT mssql_invalidate_cache(%s, %s)", CatalogLiteral(), schema));
-	if (result->HasError()) {
-		result->GetErrorObject().Throw("Failed to refresh the SQL Server catalog cache: ");
+	vector<string> calls;
+	if (tables_pending_cache_refresh.empty()) {
+		calls.push_back(StringUtil::Format("SELECT mssql_invalidate_cache(%s, %s)", CatalogLiteral(), schema));
+	} else {
+		for (auto &table_name : tables_pending_cache_refresh) {
+			calls.push_back(StringUtil::Format("SELECT mssql_invalidate_cache(%s, %s, %s)", CatalogLiteral(), schema,
+			                                   DuckLakeUtil::SQLLiteralToString(table_name)));
+		}
 	}
+	tables_pending_cache_refresh.clear();
+	for (auto &call : calls) {
+		auto result = connection.Query(call);
+		if (result->HasError()) {
+			result->GetErrorObject().Throw("Failed to refresh the SQL Server catalog cache: ");
+		}
+	}
+}
+
+string MSSQLMetadataManager::GetInlinedDeletionTableName(TableIndex table_id, DuckLakeSnapshot snapshot,
+                                                         bool create_if_not_exists) {
+	auto table_name = DuckLakeMetadataManager::GetInlinedDeletionTableName(table_id, snapshot, create_if_not_exists);
+	if (create_if_not_exists && !table_name.empty()) {
+		// The base may have created it or found it cached; we cannot tell, and recording a name that
+		// did not need refreshing costs one precise invalidation, while missing one costs correctness.
+		tables_pending_cache_refresh.push_back(table_name);
+	}
+	return table_name;
 }
 
 //===--------------------------------------------------------------------===//
@@ -716,6 +744,8 @@ string MSSQLMetadataManager::GetInlinedTableQueries(DuckLakeSnapshot commit_snap
 	    DuckLakeUtil::SQLLiteralToString(table_name), SchemaIdentifier(), SQLIdentifier(table_name), columns,
 	    SQLIdentifier("pk_" + table_name));
 	RunServerSideOutsideTransaction(statement, "Failed to create the inlined data table: ");
+	// The base marked the cache pending for exactly this; tell ClearCache which table it was.
+	tables_pending_cache_refresh.push_back(table_name);
 	return table_name;
 }
 
