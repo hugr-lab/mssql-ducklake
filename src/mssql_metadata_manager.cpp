@@ -569,12 +569,11 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
 	return sql;
 }
 
-void MSSQLMetadataManager::StageCommit(DuckLakeTransaction &flush_transaction, const DuckLakeSnapshot &snapshot,
-                                       const DuckLakeRetryConfig &retry_config) {
-	// DuckLake already knows how to turn a transaction into staged rows - seventeen flat tables of
-	// scalars - and doing that ourselves would be a copy to re-audit on every submodule bump. Its
-	// batch ends with the call to its own ducklake_commit; we keep the staging half and supply the
-	// call ourselves, in T-SQL.
+idx_t MSSQLMetadataManager::StageCommitLocally(DuckLakeTransaction &flush_transaction, const DuckLakeSnapshot &snapshot,
+                                               const DuckLakeRetryConfig &retry_config) {
+	// The local half: DuckLake's own staging into duckdb TEMPORARY tables, and a count of what
+	// landed. Nothing crosses the wire here, which is the point - the decision about whether the
+	// server-side apply is worth its bulk loads can be taken before paying for any of them.
 	DuckLakeStagedCommit staged;
 	auto batch = staged.Build(flush_transaction, snapshot, retry_config);
 	auto call = batch.rfind("SELECT * FROM ducklake_commit(");
@@ -583,14 +582,29 @@ void MSSQLMetadataManager::StageCommit(DuckLakeTransaction &flush_transaction, c
 	}
 	auto staging_sql = batch.substr(0, call);
 
-	// The staging tables are duckdb TEMPORARY tables, so they live on the connection that creates
-	// them - which has to be the one the bulk load reads from, and the one holding the transaction.
 	auto &connection = flush_transaction.GetConnection();
 	auto result = connection.Query(staging_sql);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to stage the DuckLake commit: ");
 	}
+	auto rows = connection.Query(StringUtil::Format(
+	    "SELECT count(*) FROM %s", SQLIdentifier(DuckLakeStagedTable::BaseName(DuckLakeStagedTableType::DATA_FILE))));
+	if (rows->HasError()) {
+		rows->GetErrorObject().Throw("Failed to inspect the staged DuckLake commit: ");
+	}
+	auto chunk = rows->Fetch();
+	if (!chunk || chunk->size() == 0) {
+		return 0;
+	}
+	return static_cast<idx_t>(chunk->GetValue(0, 0).GetValue<int64_t>());
+}
 
+void MSSQLMetadataManager::StageCommit(DuckLakeTransaction &flush_transaction, const DuckLakeSnapshot &snapshot,
+                                       const DuckLakeRetryConfig &retry_config) {
+	// The half that crosses the wire. The rows are already staged locally by StageCommitLocally;
+	// this bulk-loads each non-empty table into a `#temp` on the transaction's own connection, which
+	// is where the apply batch will read them from.
+	auto &connection = flush_transaction.GetConnection();
 	const auto catalog_name = flush_transaction.GetCatalog().MetadataDatabaseName();
 	for (auto type : DuckLakeStagedTable::AllTypes()) {
 		const string name = DuckLakeStagedTable::BaseName(type);
@@ -661,6 +675,25 @@ static bool ServerCommitEnabled() {
 	return enabled;
 }
 
+//! The commit size at which the server-side apply starts paying for its bulk loads. Measured at
+//! about sixteen data files (specs/005 D7); a setting because the crossover moves with latency, and
+//! on a link slower than a loopback socket it moves down.
+static idx_t ServerCommitMinFiles() {
+	static const idx_t threshold = []() -> idx_t {
+		auto *env = getenv("MSSQL_DUCKLAKE_SERVER_COMMIT_MIN_FILES");
+		if (!env) {
+			return 16;
+		}
+		try {
+			auto value = std::stoll(env);
+			return value < 0 ? 0 : static_cast<idx_t>(value);
+		} catch (const std::exception &) {
+			return 16;
+		}
+	}();
+	return threshold;
+}
+
 static bool SkipSnapshotFetchEnabled() {
 	static const bool enabled = getenv("MSSQL_DUCKLAKE_SERVER_COMMIT_SKIP_FETCH") != nullptr;
 	return enabled;
@@ -708,6 +741,20 @@ void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_tra
 	// which was the worst shape in the benchmark (specs/005 D7). This is also exactly what
 	// CanSkipSnapshotFetch answers, which is what makes skipping the fetch safe; see there.
 	if (!IsDataFilesOnlyCommit(transaction_changes) || flush_transaction.GetRequiresNewInlinedTable()) {
+		flush_transaction.RunCommitLoop(transaction_snapshot, transaction_changes, retry_config);
+		return;
+	}
+
+	// Stage locally first and count what came out. The apply is worth its bulk loads only above a
+	// size: measured per commit, phase 2 is 1.34x the client loop at one data file and 0.40x at 256,
+	// crossing over at about sixteen (specs/005 D5, D7). Below that the loop is simply the cheaper
+	// answer, and this is the only point at which that can still be chosen - nothing has crossed the
+	// wire yet.
+	auto staged_files = StageCommitLocally(flush_transaction, transaction_snapshot, retry_config);
+	if (staged_files < ServerCommitMinFiles() && !SkipSnapshotFetchEnabled()) {
+		// Local staging leaves the transaction untouched, so the loop reads exactly what it would
+		// have read. (With the snapshot fetch skipped there is no falling back - see
+		// CanSkipSnapshotFetch - so that switch takes the apply whatever the size.)
 		flush_transaction.RunCommitLoop(transaction_snapshot, transaction_changes, retry_config);
 		return;
 	}
