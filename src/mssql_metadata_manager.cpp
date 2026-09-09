@@ -7,6 +7,8 @@
 #include "duckdb/main/database.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_metadata_info.hpp"
+#include "storage/ducklake_staged_commit.hpp"
+#include "storage/ducklake_transaction_changes.hpp"
 #include "storage/ducklake_transaction.hpp"
 
 namespace duckdb {
@@ -310,6 +312,89 @@ void MSSQLMetadataManager::InitializeDuckLake(bool has_explicit_schema, DuckLake
 	EnsureCatalogShape();
 }
 
+//===--------------------------------------------------------------------===//
+// Phase 2: staging a commit on the server (specs/005)
+//===--------------------------------------------------------------------===//
+
+void MSSQLMetadataManager::StageCommit(DuckLakeTransaction &flush_transaction, const DuckLakeSnapshot &snapshot,
+                                       const DuckLakeRetryConfig &retry_config) {
+	// DuckLake already knows how to turn a transaction into staged rows - seventeen flat tables of
+	// scalars - and doing that ourselves would be a copy to re-audit on every submodule bump. Its
+	// batch ends with the call to its own ducklake_commit; we keep the staging half and supply the
+	// call ourselves, in T-SQL.
+	DuckLakeStagedCommit staged;
+	auto batch = staged.Build(flush_transaction, snapshot, retry_config);
+	auto call = batch.rfind("SELECT * FROM ducklake_commit(");
+	if (call == string::npos) {
+		throw InternalException("MSSQLMetadataManager: ducklake's staged commit no longer ends with its own call");
+	}
+	auto staging_sql = batch.substr(0, call);
+
+	// The staging tables are duckdb TEMPORARY tables, so they live on the connection that creates
+	// them - which has to be the one the bulk load reads from, and the one holding the transaction.
+	auto &connection = flush_transaction.GetConnection();
+	auto result = connection.Query(staging_sql);
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to stage the DuckLake commit: ");
+	}
+
+	const auto catalog_name = flush_transaction.GetCatalog().MetadataDatabaseName();
+	for (auto type : DuckLakeStagedTable::AllTypes()) {
+		const string name = DuckLakeStagedTable::BaseName(type);
+		// most of the seventeen are empty in any one commit; a bulk load of nothing is still a round
+		// trip, and the count is local
+		auto rows = connection.Query(StringUtil::Format("SELECT count(*) FROM %s", SQLIdentifier(name)));
+		if (rows->HasError()) {
+			rows->GetErrorObject().Throw("Failed to inspect the staged DuckLake commit: ");
+		}
+		auto chunk = rows->Fetch();
+		if (!chunk || chunk->size() == 0 || chunk->GetValue(0, 0).GetValue<int64_t>() == 0) {
+			continue;
+		}
+		// `#name` is a session temp table: private to this connection, and gone if the transaction
+		// rolls back. REPLACE, because the connection may have staged an earlier commit already.
+		auto copy = connection.Query(
+		    StringUtil::Format("COPY %s TO 'mssql://%s/#%s' (FORMAT 'bcp', CREATE_TABLE true, REPLACE true)",
+		                       SQLIdentifier(name), catalog_name, name));
+		if (copy->HasError()) {
+			copy->GetErrorObject().Throw("Failed to bulk-load the staged DuckLake commit: ");
+		}
+	}
+}
+
+namespace {
+
+//! quack's definition, and the scope of the fast path: a commit that touches only data, so the
+//! server can apply it without any of the catalog's schema bookkeeping (specs/005 D4).
+bool IsDataOnlyCommit(const TransactionChangeInformation &c) {
+	return c.created_schemas.empty() && c.dropped_schemas.empty() && c.created_tables.empty() &&
+	       c.created_scalar_macros.empty() && c.created_table_macros.empty() && c.altered_tables.empty() &&
+	       c.altered_tables_with_schema_version_changes.empty() && c.altered_views.empty() &&
+	       c.dropped_tables.empty() && c.dropped_views.empty() && c.dropped_scalar_macros.empty() &&
+	       c.dropped_table_macros.empty();
+}
+
+} // namespace
+
+bool MSSQLMetadataManager::CanSkipSnapshotFetch(const TransactionChangeInformation &changes) const {
+	// Not yet: the server-side apply is still being built (specs/005 D3), and until it exists the
+	// client has to fetch its own snapshot.
+	return false;
+}
+
+void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_transaction,
+                                                  DuckLakeSnapshot transaction_snapshot,
+                                                  const TransactionChangeInformation &transaction_changes,
+                                                  const DuckLakeRetryConfig &retry_config) {
+	// Being built (specs/005 D3): the rows are staged on the server, and then the client loop still
+	// applies them, so this is exercised on every data commit while it cannot yet be trusted with
+	// one. When the procedure lands it replaces the loop below rather than joining it.
+	if (IsDataOnlyCommit(transaction_changes) && !flush_transaction.GetRequiresNewInlinedTable()) {
+		StageCommit(flush_transaction, transaction_snapshot, retry_config);
+	}
+	flush_transaction.RunCommitLoop(transaction_snapshot, transaction_changes, retry_config);
+}
+
 void MSSQLMetadataManager::ProbeServerCapabilities() {
 	// Runs once per attach, including for a catalog this manager did not create - one made by an
 	// older build, or by a run that failed between DuckLake's DDL and ours. Without the keys such a
@@ -320,6 +405,9 @@ void MSSQLMetadataManager::ProbeServerCapabilities() {
 	if (!CatalogShapeIsCurrent()) {
 		EnsureCatalogShape();
 	}
+	// Phase 2 is opt-in from here, and safe to arm before it is finished: every path through
+	// FlushChangesServerSide still ends in the client-side loop (specs/005 D4).
+	transaction.GetCatalog().SetRetrialsServerSide(true);
 }
 
 //===--------------------------------------------------------------------===//

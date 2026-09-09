@@ -33,10 +33,6 @@ public:
 	//! a commit run through duckdb, which is why this manager needs no SQL rewriting at all.
 	void InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) override;
 
-	//! Runs once per attach, and is where a catalog created before this manager existed - or by a
-	//! run that failed partway through the DDL below - is brought up to shape.
-	void ProbeServerCapabilities() override;
-
 	//! Drop the mssql extension's catalog cache, which DuckLake asks for after creating an inlined
 	//! table (specs/004 D2).
 	void ClearCache() override;
@@ -57,12 +53,27 @@ public:
 	//! TSQLColumnType, which only our own DDL uses.
 	string GetColumnTypeInternal(const LogicalType &type) override;
 
+	//! Phase 2 (specs/005), being built. The commit's rows are staged on the server and applied by
+	//! one call; until that call exists these hand back to the client-side loop, so the fast path is
+	//! opt-in and every refusal is a fallback rather than a failure.
+	void ProbeServerCapabilities() override;
+	bool CanSkipSnapshotFetch(const TransactionChangeInformation &changes) const override;
+	void FlushChangesServerSide(DuckLakeTransaction &transaction, DuckLakeSnapshot transaction_snapshot,
+	                            const TransactionChangeInformation &transaction_changes,
+	                            const DuckLakeRetryConfig &retry_config) override;
+
 	//! The collation every VARCHAR column of the catalog carries. UTF-8, so the server stores the
 	//! bytes DuckDB already has; BIN2, so comparisons order by code point exactly as DuckDB does -
 	//! which is what makes the min/max statistics DuckLake pushes into the server prune correctly.
 	static constexpr const char *VARCHAR_COLLATION = "Latin1_General_100_BIN2_UTF8";
 
 private:
+	//! Put the commit's rows into `#temp` tables on this transaction's connection: DuckLake stages
+	//! them into local duckdb tables, and each non-empty one is bulk-loaded across (specs/005 D1,
+	//! D2). Inside the transaction, so a rollback takes the staging with it.
+	void StageCommit(DuckLakeTransaction &transaction, const DuckLakeSnapshot &snapshot,
+	                 const DuckLakeRetryConfig &retry_config);
+
 	//! The T-SQL column type for an inlined column, from the matrix.
 	string TSQLColumnType(const LogicalType &type) const;
 	//! Keys, indexes and collations, written so that running them twice is a no-op.
