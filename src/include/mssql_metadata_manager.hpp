@@ -113,7 +113,9 @@ private:
 	bool CatalogShapeIsCurrent();
 	//! The shape this build of the extension wants. Bumped whenever EnsureCatalogShape changes what
 	//! it produces - a column type, a key, an index - so that a catalog shaped by an older build is
-	//! brought up to it on the next attach instead of being left as it was.
+	//! brought up to it on the next attach instead of being left as it was. Starts at 2 because 1 is
+	//! implicitly every catalog shaped before this stamp existed: those carry no property at all,
+	//! read as older, and are converted once.
 	static constexpr int64_t SHAPE_VERSION = 2;
 	//! Where that version is recorded: an extended property on the catalog's schema, which is
 	//! per-schema (two lakes in one database keep their own) and invisible to DuckLake's own tables.

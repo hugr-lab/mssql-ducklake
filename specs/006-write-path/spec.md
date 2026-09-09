@@ -84,6 +84,24 @@ SQL batch, and both are now in the integration test:
 - a **rollback**, where the appended rows have to go with it — they do, since the appender writes
   through the metadata connection.
 
+Two things it could plausibly have broken, checked rather than assumed:
+
+- **The phase-2 server-side apply**, whose staging bulk-loads through BCP and is therefore sensitive
+  to the column types D4 changes: the whole suite passes with `MSSQL_DUCKLAKE_SERVER_COMMIT=1`
+  (`make test-integration-fast-path`), all 163 assertions.
+- **Concurrent writers**, since the appender changes what a commit sends. Four writers, ten
+  file-backed commits each, five runs per arm: three of five runs lose one writer to
+  `INTERNAL Error: Failed to commit DuckLake transaction` — **with the appender and without it
+  alike**. That is the pre-existing concurrent-commit failure (specs/005 D14, the conflict check
+  that depends on `UNION ALL` row order), not a regression, and the arms are indistinguishable.
+
+It is worth being explicit about one property this gives up. CLAUDE.md's "Execute-passthrough kills
+the PK problem" rested on duckdb's DML path never being involved in a catalog write; the appender is
+now the exception, because it INSERTs rather than passing raw T-SQL through `Execute`. That is safe
+for the specific reason that mssql requires a key for UPDATE and DELETE but not for INSERT, and the
+four tables the appender writes carry primary keys regardless — but the blanket statement was no
+longer true and has been corrected.
+
 ### D2 — `INSERT … SELECT` does not use BCP, and never did
 
 Checked at plan formation, because the claim kept being repeated: `MSSQLCatalog::PlanInsert` has no
@@ -146,7 +164,16 @@ D3) — the rest simply had not been.
 Every string column is now `VARCHAR` under `Latin1_General_100_BIN2_UTF8`. The conversion is
 **generated from `sys.columns`** rather than listed in our source: the list is DuckLake's, it moves
 with every submodule bump, and a column added upstream would otherwise silently keep the wrong type.
-Once converted the sweep matches nothing, so it costs one statement on later attaches.
+`ducklake%` in the metadata schema is the extension's namespace rather than a guess — DuckLake
+creates and drops tables under that prefix there itself, so a table of someone else's answering to it
+would already be colliding with DuckLake.
+
+Once converted the sweep matches nothing, so it costs one statement on later attaches — but
+`ALTER COLUMN` **rewrites the table**, so the first attach after an upgrade walks the whole catalog.
+Measured on a 198 MB catalog holding 500,001 file-column-stats rows: **7.65s for that attach against
+2.65s for the next one**, so about five seconds of one-time conversion, after which the lake reads
+normally and no `nvarchar` column is left. It is a one-time cost on the first attach, not a per-attach
+one, but it is not free and an operator upgrading a large catalog should expect it.
 
 Non-ASCII is what makes this safe or not, and it is now asserted: a table name, a column name and
 values in Cyrillic, an accented Latin string, CJK and a 4-byte emoji all round trip.

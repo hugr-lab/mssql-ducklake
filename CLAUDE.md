@@ -115,10 +115,13 @@ rewrites anything else and the distribution's format check fails on it.
   This extension is loaded explicitly first; after that the prefix is taken and no autoload fires.
 - **The manager only generates SQL** — like the postgres manager (the in-tree precedent) it never
   links its scanner; `mssql_exec('…', sql)` resolves at runtime.
-- **Execute-passthrough kills the PK problem**: every ducklake write (commit batch, inlined flush,
-  expire/cleanup) flows through one `Execute` seam; passed through as raw T-SQL server-side,
-  duckdb's DML path (rowid/PK) is never involved — mssql's PK-required UPDATE/DELETE limitation
-  never applies to the lake catalog.
+- **Execute-passthrough kills the PK problem**: every ducklake write that carries an UPDATE or a
+  DELETE (commit batch, inlined flush, expire/cleanup) flows through one `Execute` seam; passed
+  through as raw T-SQL server-side, duckdb's DML path (rowid/PK) is not involved — mssql's
+  PK-required UPDATE/DELETE limitation never applies to the lake catalog. The one write that does
+  take duckdb's DML path is the appender's, since spec 006 turned it on: it INSERTs a commit's data
+  files, statistics and partition values, and mssql needs a key for UPDATE and DELETE but not for
+  INSERT — so the exception is safe, and those four tables carry primary keys regardless.
 - **Inlining is in scope**: DuckLake inlines small inserts into catalog tables (default limit 10);
   the manager owns the inlined-table DDL/types via the type hooks. The matrix and edge cases
   (FLOAT NaN, TIMESTAMP_NS, HUGEINT, STRUCT) are in the research note §5.

@@ -338,7 +338,15 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	//
 	// Generated from sys.columns rather than listed here: the list is DuckLake's, it moves with every
 	// submodule bump, and a column added upstream would otherwise silently keep the wrong type. Once
-	// converted the sweep matches nothing, so it costs a single statement on every later attach.
+	// converted the sweep matches nothing, so it costs a single statement on every later attach - but
+	// the FIRST attach after an upgrade converts in place, and ALTER COLUMN rewrites the table, so
+	// that one attach walks the whole catalog (specs/006 D4 measures it).
+	//
+	// `ducklake%` in the metadata schema is the extension's namespace, not a guess: DuckLake creates
+	// and drops tables under that prefix there by itself (every `ducklake_inlined_data_<t>_<v>`), so
+	// a table of someone else's answering to it would already be colliding with DuckLake. The scope
+	// is deliberately the same one the integration suite's reset uses.
+	//
 	// Column-by-column because ALTER COLUMN cannot restate a whole table, and nullability has to be
 	// restated or the column silently becomes nullable.
 	columns_ddl += StringUtil::Format(R"(

@@ -278,11 +278,14 @@ SELECT count(*) FROM mssql_scan('srv', 'SELECT DISTINCT partition_value FROM dbo
 ----
 5
 
-# The appender path (specs/006 D1). A commit's data files go through DuckLake's appender rather than
-# into the one SQL batch, which is what SupportsAppender() now answers. It is not a second transport
-# - duckdb turns the appender into an INSERT that mssql plans as its own batched insert - but the
-# batch resolves each file's path with an uncached query PER FILE where the appender resolves it
-# once, so a large commit stops paying per file. What has to hold is that the rows are the same.
+# The appender path (specs/006 D1). A commit's data files now go through DuckLake's appender rather
+# than into the one SQL batch, which is what SupportsAppender() answers. What these assertions check
+# is that the rows are the same either way - they would pass on the SQL batch too, and deliberately
+# so: the appender is worth taking only because it changes nothing about the result. Which path ran
+# is measured, not asserted (round trips per commit, specs/006 D1); a test that read the plan cache
+# to tell them apart would be reading state every other test on the server writes to.
+#
+# The commit below is fifty data files, comfortably past the size where the two paths diverge.
 statement ok
 CREATE TABLE lake.parts(part BIGINT, v BIGINT);
 
