@@ -190,9 +190,17 @@ Two lessons already paid for, both about SQL Server rather than about DuckLake:
 
 ## Testing
 
-- The integration suite gains a data-only commit cycle asserted twice: once with the procedure in
-  place and once with `SetRetrialsServerSide` disabled, with identical results — the fast path must
-  be indistinguishable from the slow one.
+- **The suite runs twice, once per path.** `make test-integration` is the default (phase 1) and
+  `make test-integration-fast-path` re-runs the identical file with the apply armed; CI runs both.
+  The suite drives five data-only commits through the apply, so the two paths have to agree on
+  every assertion — the fast path must be indistinguishable from the slow one. This is the check
+  that was missing when D6's bug landed: it was invisible to the default path and fatal on the
+  other, and nothing in CI ever took the other.
+- Beyond the suite, the two catalogs are compared directly: the same script run on each path, then
+  `ducklake_snapshot`, `ducklake_snapshot_changes`, `ducklake_data_file` and `ducklake_table_stats`
+  diffed. They come out byte-identical, for single-file commits and for a partitioned table writing
+  several files in one commit. The server's plan cache confirms the batch actually ran, so an
+  identical diff cannot be a silent fallback.
 - Conflict handling: two connections committing to the same table, one of which must retry
   server-side and succeed.
 - `make bench` is the acceptance criterion. The target is the one specs/004 missed: not worse than

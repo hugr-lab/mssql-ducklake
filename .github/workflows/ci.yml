@@ -119,6 +119,7 @@ jobs:
         run: |
           make docker-up
           make test-integration
+          make test-integration-fast-path
 
       - name: Upload extension artifact
         if: github.event_name != 'pull_request'
