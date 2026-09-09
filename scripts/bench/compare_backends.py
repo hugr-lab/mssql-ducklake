@@ -128,6 +128,8 @@ def main() -> None:
                         help="partitions in the wide_commit phase - one commit writing that many data files")
     parser.add_argument("--repeat", type=int, default=3,
                         help="rounds over the arms; the reported time is the fastest round per phase")
+    parser.add_argument("--warmup", type=int, default=1,
+                        help="full workload runs per arm, discarded, before timing starts")
     args = parser.parse_args()
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     unknown = [a for a in arms if a not in ("mssql", "mssql-fast", "mssql-fast-nofetch", "postgres")]
@@ -177,10 +179,22 @@ def main() -> None:
                      {}),
     }
 
-    # Rounds, not one run per arm. Whichever arm goes first pays for a cold server - plan cache,
-    # buffer pool, the extension's own catalog cache - and the phases that cannot depend on the
-    # commit path at all (attach, snapshots) showed that bias plainly when this ran once per arm.
-    # Alternating the order and keeping the fastest round per phase takes it back out.
+    # A cold server is not the thing under test. Each arm runs the whole workload once with its
+    # result thrown away: the first run pays for the server's plan cache, its buffer pool, the
+    # catalog metadata neither backend has read yet, and - on a freshly started container - file
+    # growth. Postgres is warmed the same way, so the comparison specs/004 states its target against
+    # is between two warm servers rather than between whichever went second and whichever went first.
+    for round_no in range(args.warmup):
+        for name in arms:
+            reset, attach, env = spec[name]
+            script = load + reset + body.replace("{ATTACH}", attach)
+            print(f"warmup {round_no + 1}/{args.warmup}: {name} ...", file=sys.stderr)
+            run(args.duckdb, script, env)
+
+    # Rounds, not one run per arm. Whichever arm goes first still pays a little more - and the
+    # phases that cannot depend on the commit path at all (attach, snapshots) showed that bias
+    # plainly when this ran once per arm. Alternating the order and keeping the fastest round per
+    # phase takes out what the warmup does not.
     results = {a: {} for a in arms}
     for round_no in range(args.repeat):
         order = arms if round_no % 2 == 0 else list(reversed(arms))
@@ -222,7 +236,8 @@ def main() -> None:
     for _, num, den in ratios:
         row += f"  {totals[num] / totals[den]:10.2f}x" if totals[den] else f"  {'-':>11}"
     print(row)
-    print(f"\nFastest of {args.repeat} rounds per phase, arms alternated each round.")
+    print(f"\nFastest of {args.repeat} rounds per phase, arms alternated each round, "
+          f"after {args.warmup} discarded warmup run(s) per arm.")
     print("Ratios below 1.00 favour the numerator. The target of specs/004 is mssql/pg not worse")
     print("than 1.00; specs/005 is about fast/phase1, and only file_commits and bulk_insert are")
     print("commits the server-side apply accepts - the rest measure what its staging costs.")
