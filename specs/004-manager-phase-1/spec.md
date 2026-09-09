@@ -134,6 +134,16 @@ Two things about *how* they run were found the hard way, and both are load-beari
 
   `ducklake_table`, `ducklake_column` and `ducklake_view` keep the filtered form: their hot read is
   the catalog load, which asks for the current state and nothing else.
+- **The optimizer was asked what else it wanted, and answered nothing.** Guessing which predicate
+  lacks an index is what went wrong three times over; SQL Server keeps the answer itself in
+  `sys.dm_db_missing_index_details`, which records every plan it could have improved with an index
+  that does not exist. Run over a catalog of 300 tables with three of them 200 commits deep and one
+  30 schema changes deep, through the shapes a lake actually runs - a current read, a filtered read,
+  a listing, table info, expiry and cleanup - it recorded **nothing**.
+
+  That is only worth stating because the instrument was checked rather than assumed: a deliberately
+  uncovered predicate on the same server does register, so the empty result means the workload's
+  predicates are covered rather than that the DMV is asleep.
 - **Page compression is not worth it, measured.** The catalog looks like a good candidate - ids
   repeated per file, short encoded min/max - so it was tried on the same 1.23M-row table, rounds
   alternated:
