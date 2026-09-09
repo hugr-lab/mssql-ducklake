@@ -87,6 +87,12 @@ private:
 	void StageCommit(DuckLakeTransaction &transaction, const DuckLakeSnapshot &snapshot,
 	                 const DuckLakeRetryConfig &retry_config);
 
+	//! The local half of the above: DuckLake's staging into duckdb temporary tables, and the number
+	//! of data files it produced. Nothing crosses the wire, so the count is free and the choice
+	//! between the two commit paths can be made before paying for either.
+	idx_t StageCommitLocally(DuckLakeTransaction &transaction, const DuckLakeSnapshot &snapshot,
+	                         const DuckLakeRetryConfig &retry_config);
+
 	//! The T-SQL column type for an inlined column, from the matrix.
 	string TSQLColumnType(const LogicalType &type) const;
 	//! Keys, indexes and collations, written so that running them twice is a no-op.

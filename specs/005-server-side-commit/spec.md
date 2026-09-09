@@ -681,9 +681,18 @@ cardinality estimation over parquet, three frames deep in the optimizer. The sta
 cause on the first read; the guesses that preceded reading it did not.
 
 It stays off, but no longer for want of a result: measured (D7) it is **0.53x phase 1** on a commit
-carrying many data files and 1.71x on a commit carrying one small one, at 0.98x overall. What is
-missing is the rule that picks between them per commit, plus the scope the apply still does not
-cover (delete files, inlined data and deletes, compactions, name maps) and the server-side retry.
+carrying many data files and 1.71x on a commit carrying one small one, at 0.98x overall.
+
+**The rule that picks between them now exists.** The staging happens in two halves: the local one
+runs DuckLake's own staging into duckdb temporary tables and counts the data files, which costs no
+round trip at all, and only then does the second half bulk-load them. Below
+`MSSQL_DUCKLAKE_SERVER_COMMIT_MIN_FILES` files - sixteen by default, where D7 put the crossover -
+the commit falls back to the client loop having sent nothing. Local staging leaves the transaction
+untouched, so the loop reads exactly what it would have read. The threshold is a knob because the
+crossover moves with latency: on a link slower than a loopback socket it moves down.
+
+What is still missing is the scope the apply does not cover (delete files, inlined data and deletes,
+compactions, name maps) and the server-side retry.
 `ProbeServerCapabilities` does not arm it, so the default build is exactly phase 1, which stays
 green — and CI now runs the suite on both paths, so the fast one cannot rot while it waits.
 
