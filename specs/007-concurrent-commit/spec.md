@@ -82,14 +82,29 @@ the column order and both branches.
 
 Measured after the change, same fourteen alternating rounds: **mssql 0 of 14, postgres 0 of 14.**
 
-What it does not fix, and should be said plainly: neither form pushes the limit down. The scan that
-goes to the server is `SELECT snapshot_id, schema_version, next_catalog_id, next_file_id FROM
-ducklake_snapshot` with no `TOP` and no `ORDER BY` — DuckDB reads every snapshot row and takes the
-top one locally. On a catalog with a deep history that is a full read of `ducklake_snapshot` on every
-commit retry. It is half of what the original did, which read the table twice, so this is strictly
-cheaper as well as correct; but the cheap form is the one `GetLatestSnapshotQuery` uses — `TOP 1`
-inside an `mssql_scan` — and that is unavailable here, because on mssql v0.2.5 an `mssql_scan` has to
-be the sole source of its query and this one also reads three other tables.
+The replacement is still DuckDB SQL, not T-SQL: DuckLake's own query with one clause changed. DuckDB
+still executes it, still sends a separate SELECT per table, and still reads every snapshot row to
+take the top one locally — the scan that reaches the server is `SELECT snapshot_id, schema_version,
+next_catalog_id, next_file_id FROM ducklake_snapshot`, with no `TOP` and no `ORDER BY`. It is half of
+what the original did, which read that table twice, so this is strictly cheaper as well as correct.
+
+The form that *would* push the limit down is the whole query as T-SQL inside a single `mssql_scan`,
+the way `GetLatestSnapshotQuery` does it. That is available — it was written and verified to work,
+including inside a transaction on the pinned connection, where it satisfies v0.2.5's rule that an
+`mssql_scan` be the sole source of its query. It was not taken, and the measurement is why. Cost of
+the whole conflict query against the depth of `ducklake_snapshot`, rounds alternated:
+
+| snapshots | `= (SELECT MAX(…))` | `ORDER BY … LIMIT 1` |
+| ---: | ---: | ---: |
+| 1,000 | 0.002s | 0.002s |
+| 10,000 | 0.003s | 0.002s |
+| 100,000 | 0.016s | 0.015s |
+
+At a hundred thousand snapshots the query costs fifteen milliseconds and the two forms are level, so
+carrying `TOP 1` to the server would save on the order of fifteen milliseconds — on a commit retry,
+not on a commit. That does not pay for making the whole query ours to translate and keep in step with
+every ducklake bump, nor for moving the result's types from DuckDB's reading of the catalog to the
+server's, on the one path that is only reached when two writers collide.
 
 **Why interception, and how it fails safe.** `GetSnapshotAndStatsAndChangesQuery()` is `static`, so
 there is no virtual to override — but the executor reaches it through `metadata_manager->Query(…)`,
@@ -112,11 +127,13 @@ regression.
   database, which is an `ALTER DATABASE` that cannot run inside a transaction and needs rights this
   extension should not assume. Worth doing in the mssql extension; not a reason to leave the crash.
 - **The whole query as one `mssql_scan`** — verified to work: rewritten into T-SQL (`JOIN … ON`
-  instead of `USING`, and no `NULLS FIRST`, which SQL Server does not have and does not need since it
-  sorts NULLs first ascending) it runs as a single server-side statement, atomically consistent, with
-  the snapshot row first. Rejected as more machinery than the problem needs: it makes the whole query
-  our SQL to maintain, and on v0.2.5 it is only safe while the scan is the sole source of its query.
-  Reading one table once achieves the same guarantee with one changed line.
+  instead of `USING`, no `NULLS FIRST`, which SQL Server neither has nor needs since it sorts NULLs
+  first ascending, and `CAST(NULL AS …)` so the `UNION ALL` resolves its types) it runs as a single
+  server-side statement, atomically consistent, with the snapshot row first. The translation was not
+  the obstacle — it worked first try. It was rejected on what it buys, measured above: fifteen
+  milliseconds per retry at a hundred thousand snapshots, against making the whole query ours to keep
+  in step with ducklake and moving the result's types to the server on a path only concurrent writers
+  reach. Reading one table once achieves the correctness guarantee with one changed line.
 - **Fixing it in the mssql extension** — several materialised catalog scans in one plan on a pinned
   connection should share a consistent read. That is the real cure and it belongs there; this spec is
   what makes the lake correct in the meantime.
