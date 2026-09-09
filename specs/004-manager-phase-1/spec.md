@@ -113,6 +113,27 @@ Two things about *how* they run were found the hard way, and both are load-beari
   concluded it was worthless.** With every row under a single `table_id` the same query matches
   30,000 rows, a scan is competitive, and the index measures as no help at all. A real catalog
   spreads its rows over its tables, and then the predicate is selective.
+- **The two file tables are keyed on the whole visibility condition, not filtered on part of it.**
+  A filtered `WHERE end_snapshot IS NULL` index serves a read of the current state and, by
+  construction, nothing else: a read at an older snapshot wants the rows whose `end_snapshot` is
+  *set*, which the filter excludes, so it falls back to scanning - and that scan grows with the
+  table rather than with the answer. Over 300,000 files across 1000 tables, half superseded, rounds
+  alternated:
+
+  | | current read | read at an old snapshot |
+  | --- | ---: | ---: |
+  | filtered index only | 0.001s | 0.006 - 0.008s |
+  | unfiltered `(table_id, begin_snapshot, end_snapshot)` only | 0.001s | 0.001s |
+  | both | 0.001s | 0.001s |
+
+  One unfiltered index does what two do, so this **replaces** the filtered one rather than joining
+  it, and `EnsureCatalogShape` drops the old one where an earlier build left it. The scan it removes
+  gets worse as history accumulates - 0.003s at 30,000 files, 0.007s at 300,000 - while the seek
+  stays flat. Time travel is the obvious beneficiary, and so is every maintenance function that
+  walks history.
+
+  `ducklake_table`, `ducklake_column` and `ducklake_view` keep the filtered form: their hot read is
+  the catalog load, which asks for the current state and nothing else.
 - **Page compression is not worth it, measured.** The catalog looks like a good candidate - ids
   repeated per file, short encoded min/max - so it was tried on the same 1.23M-row table, rounds
   alternated:

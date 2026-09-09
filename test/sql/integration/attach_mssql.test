@@ -223,16 +223,31 @@ SELECT count(*) FROM mssql_scan('srv', 'SELECT c.name FROM sys.columns c JOIN sy
 statement ok
 DETACH lake;
 
-# the catalog carries the keys and filtered indexes the manager put on it (specs/004 D3)
+# the catalog carries the keys and indexes the manager put on it (specs/004 D3)
 query I
 SELECT count(*) > 20 FROM mssql_scan('srv', 'SELECT name FROM sys.key_constraints WHERE type = ''PK''');
 ----
 true
 
+# three filtered indexes, on tables whose hot read is the catalog load and so only ever asks for the
+# current state
 query I
 SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.indexes WHERE has_filter = 1');
 ----
-5
+3
+
+# and the two file tables keyed on the whole visibility condition instead, so a read at an older
+# snapshot seeks rather than scanning the table - a filtered index cannot serve one at all
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.indexes WHERE name LIKE ''ix_ducklake_%_visible''');
+----
+2
+
+# the per-column statistics a filtered read prunes with, on the predicate that read carries
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.indexes WHERE name = ''ix_ducklake_file_column_stats_lookup''');
+----
+1
 
 statement ok
 DETACH srv;
