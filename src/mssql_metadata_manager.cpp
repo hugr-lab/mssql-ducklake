@@ -3,7 +3,7 @@
 #include "common/ducklake_types.hpp"
 #include "common/ducklake_util.hpp"
 #include "duckdb/common/string_util.hpp"
-#include "duckdb/common/types/decimal.hpp"
+#include "duckdb/common/types.hpp"
 #include "duckdb/main/database.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_metadata_info.hpp"
