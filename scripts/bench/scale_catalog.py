@@ -86,7 +86,7 @@ def warmup_sql(backend: str, mssql_dsn: str, pg_dsn: str) -> str:
 
     A connection pool does not outlive the process that made it, and an mssql attach spends its
     time building one - three TDS logins. Detaching the warm catalog would throw that away, so it
-    stays. Postgres gets the same treatment; a comparison where one side pays connection setup at
+    stays attached for the whole run. Postgres gets the same treatment; a comparison where one side pays connection setup at
     measurement time and the other does not is not a comparison.
     """
     if backend == "postgres":
