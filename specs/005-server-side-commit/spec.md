@@ -334,9 +334,24 @@ What it is loading is the surprise:
 
 **1054 of those 1155 inlined tables are empty**, left behind by `ducklake_flush_inlined_data` after
 it moved their rows into parquet, and all 1154 are still registered in
-`ducklake_inlined_data_tables`. Measured directly, the metadata query over everything takes 640ms
-for 50,217 rows; the same query with the empty inlined tables excluded takes **126ms for 4,118
-rows**. Five times cheaper, on the single most expensive thing a read does.
+`ducklake_inlined_data_tables`. Taking the query text from the plan cache and alternating the two
+variants over four rounds:
+
+| | rows | seconds |
+| --- | ---: | ---: |
+| every table in the schema | 50,217 | 0.226 - 0.237 |
+| only the 28 catalog tables | 182 | 0.017 - 0.020 |
+
+**Thirteen times, and it is entirely volume.** Not the query's shape: removing its `ORDER BY` saves
+0.04s, removing the `sys.partitions` join 0.05s, and swapping that join for the per-row
+`OBJECTPROPERTYEX` the newer upstream source uses changes nothing measurable (0.254 against 0.248).
+`SET mssql_enable_statistics = false` does not move the read either - 1.35s against 1.36s over the
+whole session - so the cardinality the metadata carries is not what it costs.
+
+An earlier version of this section said five times, from 640ms against 126ms. That pair was measured
+in one order without alternating, so the first query paid for a cold cache and the second did not.
+The same mistake the main benchmark alternates its arms to avoid, made again in a throwaway script;
+the numbers above replace it.
 
 DuckLake's own cleanup does not reach them. `DropEmptySupersededInlinedTables` selects tables whose
 `schema_version` is below the newest for that table — *superseded* ones. A table emptied by a flush
@@ -344,7 +359,7 @@ is not superseded: it is the current version, and it is empty. So it survives ev
 metadata is re-read on every session that opens the catalog.
 
 That makes the read-path lever a cleanup rather than an index or a query rewrite, and it is worth
-roughly five times the biggest item on the path. Where it belongs — DuckLake's flush, a maintenance
+roughly thirteen times the biggest item on the path. Where it belongs — DuckLake's flush, a maintenance
 function, or this manager - is the open question; doing it from the manager means dropping a table
 DuckLake still has registered, which is DuckLake's invariant to hold, not ours to break.
 
