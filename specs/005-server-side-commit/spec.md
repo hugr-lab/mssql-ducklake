@@ -41,15 +41,28 @@ runs against **local temporary tables in the client's own DuckDB** — no server
 What lands there is exactly the commit, already normalized by ducklake's own code, which is the
 part we most want not to reimplement (and not to re-audit on every submodule bump).
 
-### D2 — the data crosses by BCP, not by INSERT
+### D2 — the data crosses by BCP, into a temp table inside the transaction
 
 The seventeen local tables are copied to SQL Server with
-`COPY <local> TO 'mssql://<catalog>/<schema>/<staging table>' (FORMAT 'bcp')` — the bulk-load path,
-on a connection of its own in autocommit (research note §7; the same reasoning as the inlined-table
-DDL in specs/004 D2). Empty tables are skipped, which is most of them for a typical commit.
+`COPY <local> TO 'mssql://<catalog>/#<staging table>' (FORMAT 'bcp', CREATE_TABLE true)` — the
+bulk-load path, on the transaction's own connection. Empty tables are skipped, which is most of them
+for a typical commit.
 
-The staging tables themselves are permanent, created once by `InitializeDuckLake` and named per
-session so two concurrent commits cannot collide.
+The staging tables on the server are **`#temp` tables on the transaction's own connection**, not
+permanent ones. That was not the first plan — permanent tables named per session were — and the
+difference matters more than it looks:
+
+- they are **transactional**: verified against the server, rows bulk-loaded into `#stage` inside the
+  metadata transaction are visible to the next statement on that connection, and a `ROLLBACK` leaves
+  nothing behind at all (`tempdb.sys.tables` empty afterwards). A failed commit therefore cleans up
+  after itself, with no truncate-before-use discipline and no orphan to sweep;
+- they are **private to the connection**, so two concurrent commits cannot collide by name and no
+  `##` global temp is needed;
+- and the bulk load still runs on the pinned connection, so nothing extra is opened.
+
+One consequence to carry into D3: a `#temp` table takes **tempdb's** collation, not the database's
+(mssql-extension spec 060 §9). Any comparison the procedure makes between a staged string column and
+a catalog column has to name the collation explicitly, exactly as the catalog's own DDL does.
 
 Checked before committing to this, because it is the assumption the design rests on: every one of
 the seventeen staged tables is flat — `BIGINT`, `VARCHAR` and `BOOLEAN` columns only, no nested
