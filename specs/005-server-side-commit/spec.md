@@ -640,20 +640,26 @@ for (auto &row : result) {
 }
 ```
 
-**It takes the first row to be the snapshot row, and the query has no `ORDER BY`.** A `UNION ALL`
-guarantees no order. If the stats branch is returned first, `GetValue<idx_t>(0)` reads that branch's
-`NULL` snapshot id and the commit dies - and dies for good, because the message contains none of
-`primary key`, `unique`, `conflict` or `concurrent`, which is the whole of `RetryOnError`'s
-vocabulary, so DuckLake does not retry what is in fact a concurrency failure.
+It takes the first row to be the snapshot row. If the stats branch comes first,
+`GetValue<idx_t>(0)` reads that branch's `NULL` snapshot id and the commit dies - and dies for good,
+because the message contains none of `primary key`, `unique`, `conflict` or `concurrent`, which is
+the whole of `RetryOnError`'s vocabulary, so DuckLake does not retry what is in fact a concurrency
+failure. That last part still holds and is still worth fixing upstream.
 
-Asked directly, SQL Server returns the branches in order for this shape, so it could not be forced
-on demand; the reordering that must be happening is plan-dependent, which fits a failure that
-appears in two runs out of six. The unsound assumption is not in doubt either way - it is visible in
-the code, and the crash lands exactly on the read it would produce.
+**The diagnosis in this section was wrong, and specs/007 replaces it.** It said the query "has no
+`ORDER BY`", so a `UNION ALL` was free to return the branches in either order. The query in the
+pinned ducklake ends `ORDER BY table_id NULLS FIRST`, which orders the snapshot row first by
+construction - and measured, standalone, that ordering never breaks: 0 misordered results in 50
+top-level reads under a concurrent writer, and 0 in 44 inside a transaction. The section reached for
+a plausible mechanism instead of measuring one, and then the note "it belongs upstream in DuckLake"
+sent the next reader away from the actual cause.
 
-Backend-independent: nothing here is SQL Server specific beyond it being a server free to choose its
-plan. It belongs upstream in DuckLake, as an `ORDER BY` on the discriminator or a parser that tests
-which kind of row it has rather than counting.
+What actually happens is that the snapshot branch comes back **empty**, so the first row is a stats
+row whatever the order: the branch reads `ducklake_snapshot` twice in one query, once for the outer
+scan and once for `MAX(snapshot_id)`, and through an attached catalog those are two separate SELECTs
+that a concurrent commit can make disagree. It is this manager's defect, not DuckLake's - postgres,
+another remote catalog under the same code, never fails - and specs/007 fixes it by reading the table
+once.
 
 ## Enforcement & security
 

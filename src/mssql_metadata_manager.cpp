@@ -20,6 +20,117 @@ constexpr const char *MSSQLMetadataManager::SHAPE_VERSION_PROPERTY;
 MSSQLMetadataManager::MSSQLMetadataManager(DuckLakeTransaction &transaction) : DuckLakeMetadataManager(transaction) {
 }
 
+namespace {
+
+//! DuckLake's commit loop, on a retry, asks one question that reads ducklake_snapshot TWICE:
+//!
+//!     FROM ducklake_snapshot WHERE snapshot_id = (SELECT MAX(snapshot_id) FROM ducklake_snapshot)
+//!
+//! Through an attached catalog those are two separate SELECTs to the server, materialised
+//! independently on the pinned connection, with no consistent read between them. A commit landing in
+//! the gap makes them disagree - measured with MSSQL_DEBUG=2, the subquery came back with 13
+//! snapshots while the outer scan had seen 12 - so the predicate matches nothing, the snapshot
+//! branch of the UNION ALL is empty, the first row of the result is a statistics row, and DuckLake's
+//! parser reads its NULL snapshot_id as an idx_t: "Calling GetValueInternal on a value that is
+//! NULL". Measured over 14 alternating rounds of four concurrent writers, this lost a writer in 6 of
+//! them; the postgres backend, whose scans share one transaction snapshot, lost none (specs/007 D1).
+//!
+//! Kept verbatim so that a ducklake bump editing this query is caught at attach - see
+//! ProbeServerCapabilities - rather than silently disabling the rewrite below.
+constexpr const char *DUCKLAKE_CONFLICT_CHECK_QUERY = R"(
+SELECT
+    snapshot_id,
+    schema_version,
+    next_catalog_id,
+    next_file_id,
+    COALESCE((
+            SELECT STRING_AGG(changes_made, ',')
+            FROM {METADATA_CATALOG}.ducklake_snapshot_changes c
+            WHERE c.snapshot_id > {SNAPSHOT_ID}
+            ),'') AS changes,
+    NULL AS table_id,
+    NULL AS column_id,
+    NULL AS record_count,
+    NULL AS next_row_id,
+    NULL AS file_size_bytes,
+    NULL AS contains_null,
+    NULL AS contains_nan,
+    NULL AS min_value,
+    NULL AS max_value,
+    NULL AS extra_stats
+    FROM {METADATA_CATALOG}.ducklake_snapshot
+    WHERE snapshot_id = (
+        SELECT MAX(snapshot_id)
+        FROM {METADATA_CATALOG}.ducklake_snapshot)
+UNION ALL
+SELECT
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    table_id,
+    column_id,
+    record_count,
+    next_row_id,
+    file_size_bytes,
+    contains_null,
+    contains_nan,
+    min_value,
+    max_value,
+    extra_stats
+FROM {METADATA_CATALOG}.ducklake_table_stats
+LEFT JOIN {METADATA_CATALOG}.ducklake_table_column_stats
+    USING (table_id)
+WHERE record_count IS NOT NULL
+    AND file_size_bytes IS NOT NULL
+ORDER BY table_id NULLS FIRST;
+	)";
+
+//! The replacement: the same question asked as ONE statement the server answers by itself.
+//!
+//! Two properties follow from that, and only the first is why it was written. A single statement is
+//! evaluated against a single consistent state, so no part of it can disagree with any other part -
+//! which fixes the crash above and, unlike patching the one branch that happened to read a table
+//! twice, keeps fixing it if DuckLake's query ever reads any table twice again. And it is one round
+//! trip: the DuckDB-SQL form sends a separate SELECT per table, measured at 25 batches against 14
+//! for this one on the same conflict check (specs/007 D1).
+//!
+//! T-SQL differences from DuckLake's version, none of them optional: `JOIN ... ON` because `USING`
+//! is not T-SQL; `TOP 1` in a derived table because a branch of a `UNION ALL` may not carry its own
+//! `ORDER BY`; `CAST(NULL AS ...)` so the union resolves the column types rather than guessing from
+//! an untyped NULL; and no `NULLS FIRST`, which SQL Server does not have and does not need, since it
+//! sorts NULLs first ascending - which is what puts the snapshot row where the parser expects it.
+//!
+//! The inner text travels inside a DuckDB string literal, so each of its own quotes is doubled once.
+constexpr const char *MSSQL_CONFLICT_CHECK_QUERY = R"(
+SELECT * FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, '
+SELECT s.snapshot_id, s.schema_version, s.next_catalog_id, s.next_file_id,
+       COALESCE((SELECT STRING_AGG(changes_made, '','')
+                 FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot_changes c
+                 WHERE c.snapshot_id > {SNAPSHOT_ID}), '''') AS changes,
+       CAST(NULL AS BIGINT) AS table_id,
+       CAST(NULL AS BIGINT) AS column_id,
+       CAST(NULL AS BIGINT) AS record_count,
+       CAST(NULL AS BIGINT) AS next_row_id,
+       CAST(NULL AS BIGINT) AS file_size_bytes,
+       CAST(NULL AS BIT) AS contains_null,
+       CAST(NULL AS BIT) AS contains_nan,
+       CAST(NULL AS VARCHAR(MAX)) AS min_value,
+       CAST(NULL AS VARCHAR(MAX)) AS max_value,
+       CAST(NULL AS VARCHAR(MAX)) AS extra_stats
+FROM (SELECT TOP 1 * FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot ORDER BY snapshot_id DESC) s
+UNION ALL
+SELECT NULL, NULL, NULL, NULL, NULL,
+       ts.table_id, cs.column_id, ts.record_count, ts.next_row_id, ts.file_size_bytes,
+       cs.contains_null, cs.contains_nan, cs.min_value, cs.max_value, cs.extra_stats
+FROM {METADATA_SCHEMA_ESCAPED}.ducklake_table_stats ts
+LEFT JOIN {METADATA_SCHEMA_ESCAPED}.ducklake_table_column_stats cs ON cs.table_id = ts.table_id
+WHERE ts.record_count IS NOT NULL AND ts.file_size_bytes IS NOT NULL
+ORDER BY table_id'))";
+
+} // namespace
+
 //===--------------------------------------------------------------------===//
 // The inlining type matrix (specs/004 D4)
 //===--------------------------------------------------------------------===//
@@ -797,6 +908,32 @@ static bool SkipSnapshotFetchEnabled() {
 	return enabled;
 }
 
+//! Off switch for the conflict-check rewrite (specs/007 D1). It exists so the regression test can be
+//! shown to fail without the rewrite - a test that cannot fail proves nothing, and this one did pass
+//! without it until its sensitivity was checked. Read once, like the switches above: this sits on
+//! the path every metadata query takes.
+static bool ConflictRewriteEnabled() {
+	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_CONFLICT_REWRITE") != nullptr;
+	return !disabled;
+}
+
+unique_ptr<QueryResult> MSSQLMetadataManager::Query(DuckLakeSnapshot snapshot, string &query) {
+	// Recognised by comparing with DuckLake's own template, before any placeholder is substituted -
+	// which is why this overload and not Query(string &): here the text is still the raw template,
+	// and {SNAPSHOT_ID} has not yet been replaced with a number that would defeat the comparison.
+	// Nothing is parsed out of the query: the catalog and schema the replacement needs are the
+	// manager's own, and they arrive through the same {METADATA_CATALOG} substitution the base
+	// applies next.
+	//
+	// An exact match, so a ducklake bump that edits the query stops matching rather than applying a
+	// rewrite to something that no longer says what we think. ProbeServerCapabilities turns that
+	// mismatch into an error at attach, because the alternative is a silent return of the crash.
+	if (ConflictRewriteEnabled() && query == DUCKLAKE_CONFLICT_CHECK_QUERY) {
+		query = MSSQL_CONFLICT_CHECK_QUERY;
+	}
+	return DuckLakeMetadataManager::Query(snapshot, query);
+}
+
 string MSSQLMetadataManager::GetLatestSnapshotQuery() const {
 	// Read through `mssql_scan` instead of through the attached catalog, which is what the postgres
 	// manager does with this same query. Measured (specs/005 D13), the same rows cost 10.0ms through
@@ -929,6 +1066,18 @@ void MSSQLMetadataManager::ProbeServerCapabilities() {
 	// than the loop it would replace (D5). MSSQL_DUCKLAKE_SERVER_COMMIT=1 turns it on for that work.
 	if (ServerCommitEnabled()) {
 		transaction.GetCatalog().SetRetrialsServerSide(true);
+	}
+	// The conflict-check rewrite (specs/007 D1) recognises DuckLake's query by an exact match. If a
+	// ducklake bump edits that query the match simply stops happening, the base query runs, and the
+	// concurrent-commit crash comes back - silently, in a path only concurrent writers reach. So the
+	// mismatch is made loud here instead: one string comparison per attach, and a bump that touches
+	// the query fails the integration suite rather than shipping a correctness regression.
+	if (DuckLakeMetadataManager::GetSnapshotAndStatsAndChangesQuery() != DUCKLAKE_CONFLICT_CHECK_QUERY) {
+		throw InvalidInputException(
+		    "mssql_ducklake: DuckLake's conflict-check query has changed in this ducklake pin. This "
+		    "manager rewrites that query so it reads ducklake_snapshot once instead of twice "
+		    "(specs/007); re-audit the rewrite against the new text and update "
+		    "DUCKLAKE_CONFLICT_CHECK_QUERY.");
 	}
 }
 

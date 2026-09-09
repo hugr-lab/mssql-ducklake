@@ -120,6 +120,9 @@ jobs:
           make docker-up
           make test-integration
           make test-integration-fast-path
+          # the concurrency regression (specs/007), which sqllogictest cannot express - two
+          # processes have to commit at once. ~70s at the default six writers and ten rounds
+          make test-concurrent
 
       - name: Upload extension artifact
         if: github.event_name != 'pull_request'
