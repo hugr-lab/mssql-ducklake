@@ -363,8 +363,9 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
     END
 
     -- Hand the staged files their catalog ids, in a stable order.
-    DECLARE @files TABLE (local_id BIGINT PRIMARY KEY, data_file_id BIGINT, table_id BIGINT);
-    INSERT INTO @files (local_id, data_file_id, table_id)
+    DROP TABLE IF EXISTS #ducklake_commit_files;
+    CREATE TABLE #ducklake_commit_files (local_id BIGINT PRIMARY KEY, data_file_id BIGINT, table_id BIGINT);
+    INSERT INTO #ducklake_commit_files (local_id, data_file_id, table_id)
     SELECT data_file_id,
            @next_file_id + ROW_NUMBER() OVER (ORDER BY data_file_id) - 1,
            table_id
@@ -395,8 +396,22 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
            s.file_format, s.record_count, s.file_size_bytes, s.footer_size, r.row_id_start,
            s.partition_id, s.encryption_key, s.mapping_id, s.partial_max
     FROM #ducklake_staged_data_file s
-    JOIN @files f ON f.local_id = s.data_file_id
+    JOIN #ducklake_commit_files f ON f.local_id = s.data_file_id
     JOIN #ducklake_assigned_row_id r ON r.local_id = s.data_file_id;
+
+    -- A partitioned table's files carry their partition values. The staged table is bulk-loaded only
+    -- when it has rows - loading an empty one would cost a round trip on every commit of an
+    -- unpartitioned table, and round trips are the whole point here - so this reads it through
+    -- sp_executesql, which compiles the statement only if the table is actually there. That is also
+    -- why the file ids above live in a #temp table rather than a table variable: a table variable is
+    -- not visible inside the dynamic statement, a session temp table is.
+    IF OBJECT_ID('tempdb..#ducklake_staged_data_file_partition') IS NOT NULL
+        EXEC sp_executesql N'
+            INSERT INTO {SCHEMA}.ducklake_file_partition_value
+                (data_file_id, table_id, partition_key_index, partition_value)
+            SELECT f.data_file_id, f.table_id, s.partition_column_idx, s.partition_value
+            FROM #ducklake_staged_data_file_partition s
+            JOIN #ducklake_commit_files f ON f.local_id = s.local_file_id;';
 
     INSERT INTO {SCHEMA}.ducklake_file_column_stats
         (data_file_id, table_id, column_id, column_size_bytes, value_count, null_count, min_value,
@@ -409,7 +424,7 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
            CASE WHEN s.has_contains_nan = 1 THEN s.contains_nan END,
            s.extra_stats
     FROM #ducklake_staged_data_file_column_stats s
-    JOIN @files f ON f.local_id = s.data_file_id;
+    JOIN #ducklake_commit_files f ON f.local_id = s.data_file_id;
 
     -- Table totals: a table this commit is the first to write gets a row, the rest are added to.
     -- next_row_id is monotonic - carried forward and advanced by what was inserted, never
@@ -475,9 +490,8 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
 	return sql;
 }
 
-MSSQLMetadataManager::StagedCommit MSSQLMetadataManager::StageCommit(DuckLakeTransaction &flush_transaction,
-                                                                     const DuckLakeSnapshot &snapshot,
-                                                                     const DuckLakeRetryConfig &retry_config) {
+void MSSQLMetadataManager::StageCommit(DuckLakeTransaction &flush_transaction, const DuckLakeSnapshot &snapshot,
+                                       const DuckLakeRetryConfig &retry_config) {
 	// DuckLake already knows how to turn a transaction into staged rows - seventeen flat tables of
 	// scalars - and doing that ourselves would be a copy to re-audit on every submodule bump. Its
 	// batch ends with the call to its own ducklake_commit; we keep the staging half and supply the
@@ -498,7 +512,6 @@ MSSQLMetadataManager::StagedCommit MSSQLMetadataManager::StageCommit(DuckLakeTra
 		result->GetErrorObject().Throw("Failed to stage the DuckLake commit: ");
 	}
 
-	StagedCommit report;
 	const auto catalog_name = flush_transaction.GetCatalog().MetadataDatabaseName();
 	for (auto type : DuckLakeStagedTable::AllTypes()) {
 		const string name = DuckLakeStagedTable::BaseName(type);
@@ -512,10 +525,16 @@ MSSQLMetadataManager::StagedCommit MSSQLMetadataManager::StageCommit(DuckLakeTra
 		if (!chunk || chunk->size() == 0 || chunk->GetValue(0, 0).GetValue<int64_t>() == 0) {
 			continue;
 		}
-		// what the server-side apply understands so far, and everything else is a reason to fall back
+		// The caller has already established that this commit is data files alone; anything else here
+		// means that reading of the transaction disagrees with what DuckLake actually staged, and
+		// applying would silently drop it. There is no falling back at this point either - the
+		// snapshot fetch may have been skipped on the strength of the same decision.
 		if (type != DuckLakeStagedTableType::COMMIT_HEADER && type != DuckLakeStagedTableType::DATA_FILE &&
-		    type != DuckLakeStagedTableType::DATA_FILE_COLUMN_STATS) {
-			report.only_data_files = false;
+		    type != DuckLakeStagedTableType::DATA_FILE_COLUMN_STATS &&
+		    type != DuckLakeStagedTableType::DATA_FILE_PARTITION) {
+			throw InternalException(
+			    "MSSQLMetadataManager: the commit was taken for data files alone, but DuckLake staged rows in %s",
+			    name);
 		}
 		// `#name` is a session temp table: private to this connection, and gone if the transaction
 		// rolls back. REPLACE, because the connection may have staged an earlier commit already.
@@ -526,13 +545,12 @@ MSSQLMetadataManager::StagedCommit MSSQLMetadataManager::StageCommit(DuckLakeTra
 			copy->GetErrorObject().Throw("Failed to bulk-load the staged DuckLake commit: ");
 		}
 	}
-	return report;
 }
 
 namespace {
 
-//! quack's definition, and the scope of the fast path: a commit that touches only data, so the
-//! server can apply it without any of the catalog's schema bookkeeping (specs/005 D4).
+//! quack's definition: a commit that touches only data, so the server can apply it without any of
+//! the catalog's schema bookkeeping (specs/005 D4).
 bool IsDataOnlyCommit(const TransactionChangeInformation &c) {
 	return c.created_schemas.empty() && c.dropped_schemas.empty() && c.created_tables.empty() &&
 	       c.created_scalar_macros.empty() && c.created_table_macros.empty() && c.altered_tables.empty() &&
@@ -541,30 +559,61 @@ bool IsDataOnlyCommit(const TransactionChangeInformation &c) {
 	       c.dropped_table_macros.empty();
 }
 
+//! The scope of OUR apply, which is narrower than quack's: data files and nothing else. Decided
+//! from the transaction's own change sets, which name every shape separately - so the decision is
+//! made BEFORE staging rather than after it.
+//!
+//! It used to be made after, by staging everything and inspecting what landed. That made a commit
+//! the apply does not cover pay for both paths: the full staging, its bulk loads to the server, and
+//! then the entire client commit loop from scratch. It was the most expensive shape in the
+//! benchmark - 3.5x phase 1 - precisely because it did the work twice (specs/005 D7).
+bool IsDataFilesOnlyCommit(const TransactionChangeInformation &c) {
+	return IsDataOnlyCommit(c) && !c.tables_inserted_into.empty() && c.tables_deleted_from.empty() &&
+	       c.tables_inserted_inlined.empty() && c.tables_deleted_inlined.empty() && c.tables_flushed_inlined.empty() &&
+	       c.tables_compacted.empty() && c.tables_merge_adjacent.empty() && c.tables_rewrite_delete.empty();
+}
+
 } // namespace
 
+//! The two switches phase 2 is behind while it is measured. Read once - getenv on every commit
+//! would be a syscall in the hot path.
+static bool ServerCommitEnabled() {
+	static const bool enabled = getenv("MSSQL_DUCKLAKE_SERVER_COMMIT") != nullptr;
+	return enabled;
+}
+
+static bool SkipSnapshotFetchEnabled() {
+	static const bool enabled = getenv("MSSQL_DUCKLAKE_SERVER_COMMIT_SKIP_FETCH") != nullptr;
+	return enabled;
+}
+
 bool MSSQLMetadataManager::CanSkipSnapshotFetch(const TransactionChangeInformation &changes) const {
-	// Not yet: the apply covers only data-file commits (specs/005 D4), so the client still has to
-	// fetch its own snapshot for everything else. Skipping the fetch is part of arming phase 2.
-	return false;
+	// This is where phase 2's saving actually is. Measured (specs/005 D7), the apply on its own costs
+	// a round trip per commit rather than saving one, because phase 1's Execute passthrough already
+	// sends the commit as few batches; the fetch this skips is the one round trip left to remove.
+	//
+	// The invariant that makes it safe to answer yes: DuckLake holds `snapshot_lock` across the call
+	// it makes when this returns true, and GetSnapshot() takes that same non-recursive mutex - so a
+	// commit that skipped the fetch can never ask for the snapshot afterwards. This must therefore
+	// answer for EXACTLY the commits FlushChangesServerSide applies without falling back, which is
+	// why both ask IsDataFilesOnlyCommit and neither decides anything after staging.
+	return SkipSnapshotFetchEnabled() && ServerCommitEnabled() && !transaction.GetRequiresNewInlinedTable() &&
+	       IsDataFilesOnlyCommit(changes);
 }
 
 void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_transaction,
                                                   DuckLakeSnapshot transaction_snapshot,
                                                   const TransactionChangeInformation &transaction_changes,
                                                   const DuckLakeRetryConfig &retry_config) {
-	if (!IsDataOnlyCommit(transaction_changes) || flush_transaction.GetRequiresNewInlinedTable()) {
+	// Decided here, BEFORE anything is staged. Staging a commit the apply cannot finish means paying
+	// for both paths - the staging, its bulk loads, and then the whole client loop from scratch -
+	// which was the worst shape in the benchmark (specs/005 D7). This is also exactly what
+	// CanSkipSnapshotFetch answers, which is what makes skipping the fetch safe; see there.
+	if (!IsDataFilesOnlyCommit(transaction_changes) || flush_transaction.GetRequiresNewInlinedTable()) {
 		flush_transaction.RunCommitLoop(transaction_snapshot, transaction_changes, retry_config);
 		return;
 	}
-	auto staged = StageCommit(flush_transaction, transaction_snapshot, retry_config);
-	if (!staged.only_data_files) {
-		// The procedure covers data files and nothing else yet (specs/005 D3). Anything else staged -
-		// a delete file, inlined rows, a compaction - takes the client loop, which reads the same
-		// transaction state and is unaffected by the staging that just happened.
-		flush_transaction.RunCommitLoop(transaction_snapshot, transaction_changes, retry_config);
-		return;
-	}
+	StageCommit(flush_transaction, transaction_snapshot, retry_config);
 
 	auto &commit_info = flush_transaction.GetCommitInfo();
 	auto &connection = flush_transaction.GetConnection();
@@ -610,10 +659,13 @@ void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_tra
 	flush_transaction.ApplyServerSideCommit(static_cast<idx_t>(committed_schema_version));
 	if (had_flushes) {
 		flush_transaction.DropEmptySupersededInlinedTablesClientSide();
+		// quack clears unconditionally, because its apply can create inlined-data tables and the mssql
+		// extension would not see them. Ours creates no table at all - it writes rows into catalog
+		// tables that already exist - and clearing costs the whole schema's metadata: 39 introspection
+		// round trips on the next access, measured, against the ~20 the commit itself needs. So it is
+		// cleared only when the server actually flushed something (specs/005 D7).
+		ClearCache();
 	}
-	// the same two calls quack makes after a server-side commit: the catalog cache cannot have seen
-	// what the server just wrote
-	ClearCache();
 }
 
 void MSSQLMetadataManager::ProbeServerCapabilities() {
@@ -630,7 +682,7 @@ void MSSQLMetadataManager::ProbeServerCapabilities() {
 	// correct for the commits it accepts - it produces a catalog identical to the client loop's -
 	// but it accepts only data files (specs/005 D4), and below a threshold the staging costs more
 	// than the loop it would replace (D5). MSSQL_DUCKLAKE_SERVER_COMMIT=1 turns it on for that work.
-	if (getenv("MSSQL_DUCKLAKE_SERVER_COMMIT")) {
+	if (ServerCommitEnabled()) {
 		transaction.GetCatalog().SetRetrialsServerSide(true);
 	}
 }
