@@ -340,13 +340,15 @@ static constexpr const char *COMMIT_PROCEDURE_VERSION = "1";
 //! RETURNSTATUS. Revisit when that lands.
 static string CommitBatchSql(const string &schema, const string &collation, int64_t schema_version,
                              const string &author, const string &commit_message, const string &commit_extra_info) {
-	return StringUtil::Format(R"(
+	// Named substitution, not positional formatting: this statement names the schema a dozen times,
+	// and a miscounted argument list is a runtime exception whose message is the SQL itself.
+	string sql = R"(
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
-    DECLARE @schema_version BIGINT = %lld;
-    DECLARE @author NVARCHAR(MAX) = %s;
-    DECLARE @commit_message NVARCHAR(MAX) = %s;
-    DECLARE @commit_extra_info NVARCHAR(MAX) = %s;
+    DECLARE @schema_version BIGINT = {SCHEMA_VERSION};
+    DECLARE @author NVARCHAR(MAX) = {AUTHOR};
+    DECLARE @commit_message NVARCHAR(MAX) = {MESSAGE};
+    DECLARE @commit_extra_info NVARCHAR(MAX) = {EXTRA};
     DROP TABLE IF EXISTS #ducklake_commit_result;
     CREATE TABLE #ducklake_commit_result(snapshot_id BIGINT, schema_version BIGINT, had_flushes BIT);
 
@@ -359,7 +361,7 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
         @schema_ver = schema_version,
         @next_catalog_id = next_catalog_id,
         @next_file_id = next_file_id
-    FROM %s.ducklake_snapshot WITH (UPDLOCK, HOLDLOCK)
+    FROM {SCHEMA}.ducklake_snapshot WITH (UPDLOCK, HOLDLOCK)
     ORDER BY snapshot_id DESC;
 
     IF @schema_version >= 0 AND @schema_version <> @schema_ver
@@ -376,7 +378,7 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
            table_id
     FROM #ducklake_staged_data_file;
 
-    INSERT INTO %s.ducklake_data_file
+    INSERT INTO {SCHEMA}.ducklake_data_file
         (data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path, path_is_relative,
          file_format, record_count, file_size_bytes, footer_size, row_id_start, partition_id,
          encryption_key, mapping_id, partial_max)
@@ -386,7 +388,7 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
     FROM #ducklake_staged_data_file s
     JOIN @files f ON f.local_id = s.data_file_id;
 
-    INSERT INTO %s.ducklake_file_column_stats
+    INSERT INTO {SCHEMA}.ducklake_file_column_stats
         (data_file_id, table_id, column_id, column_size_bytes, value_count, null_count, min_value,
          max_value, contains_nan, extra_stats)
     SELECT f.data_file_id, s.table_id, s.column_id, s.column_size_bytes,
@@ -400,7 +402,7 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
     JOIN @files f ON f.local_id = s.data_file_id;
 
     -- Table totals: a table this commit is the first to write gets a row, the rest are added to.
-    MERGE %s.ducklake_table_stats AS t
+    MERGE {SCHEMA}.ducklake_table_stats AS t
     USING (
         SELECT table_id,
                SUM(record_count) AS added_records,
@@ -417,7 +419,7 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
         VALUES (s.table_id, s.added_records, s.next_row_id, s.added_bytes);
 
     -- Per-column totals: widen the range, and remember a null or a NaN once one appears.
-    MERGE %s.ducklake_table_column_stats AS t
+    MERGE {SCHEMA}.ducklake_table_column_stats AS t
     USING (
         SELECT table_id, column_id,
                MAX(CASE WHEN has_null_count = 1 AND null_count > 0 THEN 1 ELSE 0 END) AS any_null,
@@ -430,28 +432,35 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
     WHEN MATCHED THEN UPDATE SET
         contains_null = CASE WHEN t.contains_null = 1 OR s.any_null = 1 THEN 1 ELSE t.contains_null END,
         contains_nan = CASE WHEN t.contains_nan = 1 OR s.any_nan = 1 THEN 1 ELSE t.contains_nan END,
-        min_value = CASE WHEN t.min_value IS NULL OR s.min_value COLLATE %s < t.min_value COLLATE %s
+        min_value = CASE WHEN t.min_value IS NULL OR s.min_value COLLATE {COLLATION} < t.min_value COLLATE {COLLATION}
                          THEN s.min_value ELSE t.min_value END,
-        max_value = CASE WHEN t.max_value IS NULL OR s.max_value COLLATE %s > t.max_value COLLATE %s
+        max_value = CASE WHEN t.max_value IS NULL OR s.max_value COLLATE {COLLATION} > t.max_value COLLATE {COLLATION}
                          THEN s.max_value ELSE t.max_value END
     WHEN NOT MATCHED THEN INSERT (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
         VALUES (s.table_id, s.column_id, s.any_null, s.any_nan, s.min_value, s.max_value, NULL);
 
     DECLARE @added_files BIGINT = (SELECT COUNT(*) FROM #ducklake_staged_data_file);
-    INSERT INTO %s.ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
+    INSERT INTO {SCHEMA}.ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
     VALUES (@snapshot_id, SYSDATETIMEOFFSET(), @schema_ver, @next_catalog_id, @next_file_id + @added_files);
 
     DECLARE @changes NVARCHAR(MAX) = (
         SELECT STRING_AGG(CAST('inserted_into_table:' + CAST(table_id AS NVARCHAR(20)) AS NVARCHAR(MAX)), ',')
         FROM (SELECT DISTINCT table_id FROM #ducklake_staged_data_file) d);
-    INSERT INTO %s.ducklake_snapshot_changes (snapshot_id, changes_made, author, commit_message, commit_extra_info)
+    INSERT INTO {SCHEMA}.ducklake_snapshot_changes (snapshot_id, changes_made, author, commit_message, commit_extra_info)
     VALUES (@snapshot_id, @changes, @author, @commit_message, @commit_extra_info);
 
-    SELECT @snapshot_id AS snapshot_id, @schema_ver AS schema_version, CAST(0 AS BIT) AS had_flushes;
-END
-)",
-	                          schema, schema, schema, schema, schema, schema, collation, collation, collation,
-	                          collation, schema, schema);
+    -- mssql_exec runs a batch and returns a row count, not a result set, so the values go into the
+    -- table this batch created above and are read back from it on the same connection.
+    INSERT INTO #ducklake_commit_result (snapshot_id, schema_version, had_flushes)
+    VALUES (@snapshot_id, @schema_ver, 0);
+)";
+	sql = StringUtil::Replace(sql, "{SCHEMA}", schema);
+	sql = StringUtil::Replace(sql, "{COLLATION}", collation);
+	sql = StringUtil::Replace(sql, "{SCHEMA_VERSION}", to_string(schema_version));
+	sql = StringUtil::Replace(sql, "{AUTHOR}", TSQLLiteral(author));
+	sql = StringUtil::Replace(sql, "{MESSAGE}", TSQLLiteral(commit_message));
+	sql = StringUtil::Replace(sql, "{EXTRA}", TSQLLiteral(commit_extra_info));
+	return sql;
 }
 
 MSSQLMetadataManager::StagedCommit MSSQLMetadataManager::StageCommit(DuckLakeTransaction &flush_transaction,
@@ -473,10 +482,6 @@ MSSQLMetadataManager::StagedCommit MSSQLMetadataManager::StageCommit(DuckLakeTra
 	// them - which has to be the one the bulk load reads from, and the one holding the transaction.
 	auto &connection = flush_transaction.GetConnection();
 	auto result = connection.Query(staging_sql);
-	if (getenv("MSSQL_DUCKLAKE_TRACE")) {
-		fprintf(stderr, "[stage] sql=%zu bytes, error=%s\n", staging_sql.size(),
-		        result->HasError() ? result->GetError().c_str() : "none");
-	}
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to stage the DuckLake commit: ");
 	}
@@ -505,10 +510,6 @@ MSSQLMetadataManager::StagedCommit MSSQLMetadataManager::StageCommit(DuckLakeTra
 		auto copy = connection.Query(
 		    StringUtil::Format("COPY %s TO 'mssql://%s/#%s' (FORMAT 'bcp', CREATE_TABLE true, REPLACE true)",
 		                       SQLIdentifier(name), catalog_name, name));
-		if (getenv("MSSQL_DUCKLAKE_TRACE")) {
-			fprintf(stderr, "[stage] copy %s -> %s\n", name.c_str(),
-			        copy->HasError() ? copy->GetError().c_str() : "ok");
-		}
 		if (copy->HasError()) {
 			copy->GetErrorObject().Throw("Failed to bulk-load the staged DuckLake commit: ");
 		}
@@ -568,9 +569,6 @@ void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_tra
 	                       commit_info.commit_message.IsNull() ? "" : commit_info.commit_message.ToString(),
 	                       commit_info.commit_extra_info.IsNull() ? "" : commit_info.commit_extra_info.ToString())));
 	auto applied = connection.Query(call);
-	if (getenv("MSSQL_DUCKLAKE_TRACE")) {
-		fprintf(stderr, "[commit] %s\n", applied->HasError() ? applied->GetError().c_str() : "ok");
-	}
 	// No fallback from here on: the procedure writes inside this transaction, so the client loop
 	// cannot start over in it. Everything that chooses between the two paths happens before the call.
 	if (applied->HasError()) {
