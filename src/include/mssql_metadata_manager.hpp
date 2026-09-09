@@ -34,8 +34,14 @@ public:
 	void InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) override;
 
 	//! Drop the mssql extension's catalog cache, which DuckLake asks for after creating an inlined
-	//! table (specs/004 D2).
+	//! table (specs/004 D2). Scoped to the tables actually created where we know them - see the
+	//! definition for why that is worth the bookkeeping.
 	void ClearCache() override;
+
+	//! Overridden only to learn the name: this is the other place DuckLake creates a table behind
+	//! the mssql extension's back, and ClearCache needs to know which one.
+	string GetInlinedDeletionTableName(TableIndex table_id, DuckLakeSnapshot snapshot,
+	                                   bool create_if_not_exists = false) override;
 
 	//! The inlined table's DDL is ours: its column types are T-SQL, which the duckdb-parsed commit
 	//! batch could not carry, so it is executed separately (specs/004 D2).
@@ -97,6 +103,11 @@ private:
 	string SchemaIdentifier() const;
 	//! The name of the attached mssql catalog, as a SQL literal - `mssql_exec`'s first argument.
 	string CatalogLiteral() const;
+
+	//! Tables created through our own DDL since the last cache clear, so the clear can name them
+	//! instead of dropping the whole schema's metadata. Empty means "we do not know", and the clear
+	//! falls back to the schema.
+	vector<string> tables_pending_cache_refresh;
 };
 
 } // namespace duckdb

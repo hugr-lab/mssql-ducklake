@@ -88,6 +88,15 @@ Two things about *how* they run were found the hard way, and both are load-beari
   at the right moment, so that is where `mssql_invalidate_cache` goes. Called mid-transaction it
   deadlocks the same way as the DDL did. The extension's own `mssql_exec_invalidate_cache` setting
   does this globally and on every DML; this is the point version.
+- **And it names the table.** `mssql_invalidate_cache` takes a catalog, a schema, and a table, and
+  the three-argument form is the one to use: it re-reads that table's columns *and* the schema's
+  table list — which is what makes a newly created table visible — while keeping every other table's
+  cached columns. Dropping the whole schema's metadata instead cost about 36 round trips per table
+  created, measured, on a catalog of 23 tables plus one inlined table per lake table (specs/005 D7).
+  So the manager records the name of every table it creates — its own inlined data table, and the
+  inlined deletion table it overrides `GetInlinedDeletionTableName` purely to learn about — and
+  `ClearCache()` names them. With nothing recorded, which is the attach-time call, it does not know
+  what changed and the schema is the honest answer.
 
 The inlined data table also gets a primary key, `(row_id, begin_snapshot)`, for the same reason the
 catalog's tables do (D3): its rows are updated and deleted.
