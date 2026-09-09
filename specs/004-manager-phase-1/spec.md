@@ -138,12 +138,16 @@ Two things about *how* they run were found the hard way, and both are load-beari
   lacks an index is what went wrong three times over; SQL Server keeps the answer itself in
   `sys.dm_db_missing_index_details`, which records every plan it could have improved with an index
   that does not exist. Run over a catalog of 300 tables with three of them 200 commits deep and one
-  30 schema changes deep, through the shapes a lake actually runs - a current read, a filtered read,
-  a listing, table info, expiry and cleanup - it recorded **nothing**.
+  30 schema changes deep, through the shapes a lake actually runs, it recorded **nothing**.
 
-  That is only worth stating because the instrument was checked rather than assumed: a deliberately
-  uncovered predicate on the same server does register, so the empty result means the workload's
-  predicates are covered rather than that the DMV is asleep.
+  Two things had to be right for that to mean anything. **The instrument was checked** rather than
+  assumed: a deliberately uncovered predicate on the same server does register a wish, so an empty
+  result means the predicates are covered and not that the DMV is asleep. And **the reads had to
+  prune**: the first attempt filtered on `id BETWEEN 5 AND 400` over a table whose ids run to 19,919,
+  which keeps every file and never exercises the statistics path at all - an empty answer from a
+  workload like that says nothing. Repeated with filters that keep one file out of 201, a few out of
+  201, a single value, two columns at once, and the same at an older version, the answer is still
+  nothing.
 - **Page compression is not worth it, measured.** The catalog looks like a good candidate - ids
   repeated per file, short encoded min/max - so it was tried on the same 1.23M-row table, rounds
   alternated:
