@@ -321,14 +321,23 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	    {"ducklake_data_file", "table_id, begin_snapshot, end_snapshot"},
 	    {"ducklake_delete_file", "table_id, begin_snapshot, end_snapshot"},
 	};
+	// Every check below is scoped to this catalog's schema. `sys.indexes.name` is unique per table,
+	// not per database, so two lakes in two schemas of one database name their indexes identically -
+	// and an unscoped existence check would let the second one skip creating indexes it has not got.
+	// The primary keys above are scoped for the same reason.
+	auto index_exists = [&](const string &index_name) {
+		return StringUtil::Format("SELECT 1 FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id "
+		                          "WHERE i.name = '%s' AND o.schema_id = SCHEMA_ID(%s)",
+		                          index_name, schema_literal);
+	};
 	for (auto &entry : visibility_indexes) {
-		constraints_ddl += StringUtil::Format("IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_%s_visible') "
-		                                      "CREATE INDEX ix_%s_visible ON %s.%s(%s);\n",
-		                                      entry.first, entry.first, schema, entry.first, entry.second);
+		const auto visible = "ix_" + entry.first + "_visible";
+		constraints_ddl += StringUtil::Format("IF NOT EXISTS (%s) CREATE INDEX %s ON %s.%s(%s);\n",
+		                                      index_exists(visible), visible, schema, entry.first, entry.second);
 		// the filtered index this replaces, left behind by an older build of this extension
-		constraints_ddl += StringUtil::Format("IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_%s_live') "
-		                                      "DROP INDEX ix_%s_live ON %s.%s;\n",
-		                                      entry.first, entry.first, schema, entry.first);
+		const auto live = "ix_" + entry.first + "_live";
+		constraints_ddl += StringUtil::Format("IF EXISTS (%s) DROP INDEX %s ON %s.%s;\n", index_exists(live), live,
+		                                      schema, entry.first);
 	}
 
 	// The rest keep the filtered form: their hot reads are the catalog load, which asks for the
@@ -340,9 +349,10 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	    {"ducklake_view", "schema_id"},
 	};
 	for (auto &entry : live_indexes) {
-		constraints_ddl += StringUtil::Format("IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_%s_live') "
-		                                      "CREATE INDEX ix_%s_live ON %s.%s(%s) WHERE end_snapshot IS NULL;\n",
-		                                      entry.first, entry.first, schema, entry.first, entry.second);
+		const auto live = "ix_" + entry.first + "_live";
+		constraints_ddl +=
+		    StringUtil::Format("IF NOT EXISTS (%s) CREATE INDEX %s ON %s.%s(%s) WHERE end_snapshot IS NULL;\n",
+		                       index_exists(live), live, schema, entry.first, entry.second);
 	}
 
 	// The per-column statistics a filtered read prunes with: the largest table in the catalog, a row
@@ -359,10 +369,10 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	// without a length and bounds nothing it writes - and a MAX column is a LOB, so it can be
 	// neither an index key nor something worth duplicating into one. No filtered form either: stats
 	// have no end_snapshot, they belong to a file and the file is what expires.
+	const string stats_lookup = "ix_ducklake_file_column_stats_lookup";
 	constraints_ddl += StringUtil::Format(
-	    "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'ix_ducklake_file_column_stats_lookup') "
-	    "CREATE INDEX ix_ducklake_file_column_stats_lookup ON %s.ducklake_file_column_stats(table_id, column_id);\n",
-	    schema);
+	    "IF NOT EXISTS (%s) CREATE INDEX %s ON %s.ducklake_file_column_stats(table_id, column_id);\n",
+	    index_exists(stats_lookup), stats_lookup, schema);
 
 	// Two batches: inside one, a column's new NOT NULL is not yet visible to the constraint that
 	// needs it, and the server answers "cannot define PRIMARY KEY on a nullable column".
@@ -599,8 +609,7 @@ idx_t MSSQLMetadataManager::StageCommitLocally(DuckLakeTransaction &flush_transa
 	return static_cast<idx_t>(chunk->GetValue(0, 0).GetValue<int64_t>());
 }
 
-void MSSQLMetadataManager::StageCommit(DuckLakeTransaction &flush_transaction, const DuckLakeSnapshot &snapshot,
-                                       const DuckLakeRetryConfig &retry_config) {
+void MSSQLMetadataManager::StageCommit(DuckLakeTransaction &flush_transaction) {
 	// The half that crosses the wire. The rows are already staged locally by StageCommitLocally;
 	// this bulk-loads each non-empty table into a `#temp` on the transaction's own connection, which
 	// is where the apply batch will read them from.
@@ -719,9 +728,11 @@ string MSSQLMetadataManager::GetLatestSnapshotQuery() const {
 }
 
 bool MSSQLMetadataManager::CanSkipSnapshotFetch(const TransactionChangeInformation &changes) const {
-	// This is where phase 2's saving actually is. Measured (specs/005 D7), the apply on its own costs
-	// a round trip per commit rather than saving one, because phase 1's Execute passthrough already
-	// sends the commit as few batches; the fetch this skips is the one round trip left to remove.
+	// Measured (specs/005 D7), the apply saves little on round trips by itself - 15.2 against the
+	// client loop's 16.0 per commit - because phase 1's Execute passthrough already sends the commit
+	// as few batches. Skipping the fetch was meant to be the rest of the saving; measured, it is not
+	// (D7 again), which is why this stays behind its own switch rather than being armed with the
+	// apply.
 	//
 	// The invariant that makes it safe to answer yes: DuckLake holds `snapshot_lock` across the call
 	// it makes when this returns true, and GetSnapshot() takes that same non-recursive mutex - so a
@@ -758,7 +769,7 @@ void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_tra
 		flush_transaction.RunCommitLoop(transaction_snapshot, transaction_changes, retry_config);
 		return;
 	}
-	StageCommit(flush_transaction, transaction_snapshot, retry_config);
+	StageCommit(flush_transaction);
 
 	auto &commit_info = flush_transaction.GetCommitInfo();
 	auto &connection = flush_transaction.GetConnection();
