@@ -141,11 +141,18 @@ commit that is not data-only) falls back to phase 1 rather than failing the comm
 
 Landed and exercised on every data-only commit: the staging (D1, D2), measured in D5.
 
-Written but **off by default** behind `MSSQL_DUCKLAKE_SERVER_COMMIT=1`: the apply. It runs correctly
-when driven by hand — staged rows in, snapshot and statistics out — and inside the real commit path
-it currently ends in a duckdb internal error during query teardown, which is the next thing to
-understand. Until then `ProbeServerCapabilities` does not arm the fast path, so DuckLake never
-takes it and the default build is exactly phase 1.
+Written but **off by default** behind `MSSQL_DUCKLAKE_SERVER_COMMIT=1`: the apply. It gets further
+than that phrasing suggests — against the server the batch applies a data-file commit correctly and
+hands back the right values (`snapshot=2 schema_version=1`), which is the hard half — but the full
+cycle then fails with `INTERNAL Error: Calling GetValueInternal on a value that is NULL`, after our
+own reads have succeeded, and the database is invalidated. So the fault is in what happens on the
+DuckLake side of a server-side commit: `ApplyServerSideCommit`, or the transaction state we leave
+behind. quack does two things there we do not — `ClearCache()` and, on flushes,
+`DropEmptySupersededInlinedTablesClientSide()` — and that is the first place to look. It wants a
+debugger and a fresh head, not another guess.
+
+Until then `ProbeServerCapabilities` does not arm the fast path, so DuckLake never takes it and the
+default build is exactly phase 1, which stays green.
 
 Two lessons already paid for, both about SQL Server rather than about DuckLake:
 
