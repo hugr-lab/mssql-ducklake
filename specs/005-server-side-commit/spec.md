@@ -99,6 +99,26 @@ additionally verifies that the procedure exists at the manager's version, and on
 `SetRetrialsServerSide(true)`. A catalog whose procedure is missing or stale simply stays on phase 1
 until the next initialization refreshes it.
 
+### D5 — what the staging costs, measured before the procedure exists
+
+The staging half landed first and was benchmarked on its own, with the client loop still applying
+the commit — so the numbers are pure overhead, and that is what makes them informative. Against the
+same workload as specs/004: total 7.3s where phase 1 alone was 4.9s, with a small commit going 0.41
+→ 0.88 and update/delete 0.20 → 0.91.
+
+**Staging a small commit costs about what committing it costs.** The reason is round trips again:
+a bulk load is one per non-empty staged table, and a small commit has four to six of them — the same
+order as the statements the client loop sends. The saving only appears where one bulk load replaces
+*many* rows: a commit with hundreds of data files, or inlined data past a few rows.
+
+Two things follow, and neither is a surprise once stated:
+
+- the fast path wants a **threshold**, the way the inlined-write path does (research note §7): below
+  it, the client loop is already the cheaper answer;
+- the procedure has to be worth more than the staging costs, which means it must replace the client
+  loop rather than run beside it. Until it does, phase 2 is a slowdown — which is why it is armed
+  but inert (D4), not because arming it is risky.
+
 ## Enforcement & security
 
 The procedure is created by us and takes no SQL from the client: its parameters are the schema name,
@@ -131,6 +151,13 @@ commit that is not data-only) falls back to phase 1 rather than failing the comm
 
 ## Follow-ups
 
+- **Fill the local staging tables with an Appender rather than INSERT text** (spec 006, the
+  optimization pass). DuckLake emits its staging as `INSERT` statements, which is SQL to parse for
+  every row of a commit; an Appender writes the same rows straight into the local table. The catch is
+  that the emit is ducklake's code, so using an Appender means reimplementing it here - the very
+  thing D1 avoids to keep submodule bumps cheap. It is therefore a measurement question: how much of
+  a commit's time is the local staging at all, once the round trips are gone. Nothing about the
+  server side changes either way.
 - The procedure's own migration story once it changes: recreate on version mismatch is enough while
   this extension is experimental, but a catalog shared by two client versions needs a rule.
 - Compaction and `expire_snapshots` are data-only by the definition above but exercise the least
