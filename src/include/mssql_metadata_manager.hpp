@@ -64,7 +64,8 @@ public:
 	//! opt-in and every refusal is a fallback rather than a failure.
 	void ProbeServerCapabilities() override;
 	//! Read the latest snapshot through `mssql_scan` rather than through the attached catalog - the
-	//! postgres manager's trick, and worth four times the query (specs/005 D13).
+	//! postgres manager's trick. Worth about a tenth of a repeat read, this being one of roughly four
+	//! catalog queries a read makes (specs/005 D13).
 	string GetLatestSnapshotQuery() const override;
 
 	bool CanSkipSnapshotFetch(const TransactionChangeInformation &changes) const override;
@@ -84,8 +85,7 @@ private:
 	//!
 	//! Only called for a commit already known to be data files alone - the caller decides that from
 	//! the transaction's change sets, before any of this runs.
-	void StageCommit(DuckLakeTransaction &transaction, const DuckLakeSnapshot &snapshot,
-	                 const DuckLakeRetryConfig &retry_config);
+	void StageCommit(DuckLakeTransaction &transaction);
 
 	//! The local half of the above: DuckLake's staging into duckdb temporary tables, and the number
 	//! of data files it produced. Nothing crosses the wire, so the count is free and the choice

@@ -249,5 +249,46 @@ SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.indexes WHERE name 
 ----
 1
 
+# A second lake in another schema of the same database gets its own indexes. It did not: index names
+# embed the table but not the schema, and `sys.indexes.name` is unique per table rather than per
+# database, so an existence check that did not scope by schema saw the first lake's index and skipped
+# creating the second lake's. The catalog then worked but read without indexes, which nothing would
+# have noticed.
+statement ok
+SELECT mssql_exec('srv', 'DROP SCHEMA IF EXISTS lake_second;');
+
+statement ok
+SELECT mssql_exec('srv', 'CREATE SCHEMA lake_second;');
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS second (DATA_PATH '__TEST_DIR__/second', METADATA_SCHEMA 'lake_second');
+
+statement ok
+CREATE TABLE second.t(i BIGINT);
+
+statement ok
+INSERT INTO second.t VALUES (1);
+
+query I
+SELECT count(*) FROM second.t;
+----
+1
+
+# both schemas, the same six indexes each
+query II
+SELECT s, n FROM mssql_scan('srv', 'SELECT s.name AS s, COUNT(*) AS n FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE i.name LIKE ''ix_ducklake%'' GROUP BY s.name ORDER BY s.name') ORDER BY s;
+----
+dbo	6
+lake_second	6
+
+statement ok
+DETACH second;
+
+statement ok
+SELECT mssql_exec('srv', 'DECLARE @s NVARCHAR(MAX)=N''''; SELECT @s += N''DROP TABLE ''+QUOTENAME(s.name)+N''.''+QUOTENAME(t.name)+N'';'' FROM sys.tables t JOIN sys.schemas s ON s.schema_id=t.schema_id WHERE s.name = ''lake_second''; EXEC sp_executesql @s;');
+
+statement ok
+SELECT mssql_exec('srv', 'DROP SCHEMA lake_second;');
+
 statement ok
 DETACH srv;
