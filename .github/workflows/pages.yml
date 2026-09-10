@@ -12,13 +12,17 @@ name: Deploy docs
 # (specs/011). A main push only ever changes /next/; a release changes the root.
 
 on:
-  release:
-    types: [published]
   push:
     branches: [main]
     paths:
       - "website/**"
       - ".github/workflows/pages.yml"
+    # a release tag is a new docs version: the push of the tag is a user's event and runs this;
+    # the GitHub release release.yml then publishes is made with GITHUB_TOKEN, and events made
+    # with that token start no workflows - so `release: published` would never fire (found on
+    # v0.1.0, specs/011)
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
