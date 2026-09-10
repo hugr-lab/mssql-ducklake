@@ -614,6 +614,43 @@ unique_ptr<QueryResult> MSSQLMetadataManager::RunCommitBatch(const string &tsql)
 	return connection.Query(StringUtil::Format("SELECT mssql_exec(%s, %s)", CatalogLiteral(), SQLString(tsql)));
 }
 
+unique_ptr<QueryResult> MSSQLMetadataManager::TryRewriteWrite(DuckLakeSnapshot snapshot, const string &query) {
+	// Not every write is in the commit batch: the expiry and the cleanup DELETE from a dozen tables
+	// through Query, one statement at a time, and the flush DELETEs the rows it moved to files. On
+	// the base path each is a scan of the table through the extension's DML operator plus the
+	// DELETE by row identity - and on linux_amd64 the composite-key row identity of ducklake_tag
+	// came back as invalid unicode (CI, specs/014 D3c). The statements are the batch's own
+	// families, so they take the batch's path: one T-SQL statement, one round trip.
+	if (!BatchRewriteEnabled()) {
+		return nullptr;
+	}
+	string statement = query;
+	SubstituteSnapshotPlaceholders(snapshot, statement);
+	StringUtil::Trim(statement);
+	while (!statement.empty() && statement.back() == ';') {
+		statement.pop_back();
+		StringUtil::Trim(statement);
+	}
+	const string update_head = string("UPDATE ") + CATALOG_PREFIX;
+	const string delete_head = string("DELETE FROM ") + CATALOG_PREFIX;
+	if (!StringUtil::StartsWith(statement, update_head) && !StringUtil::StartsWith(statement, delete_head)) {
+		return nullptr;
+	}
+	const auto schema = SchemaIdentifier();
+	string tsql;
+	if (!RewriteUpdate(statement, schema, tsql) && !RewriteDelete(statement, schema, tsql) &&
+	    !RewriteCteUpdate(statement, schema, tsql)) {
+		if (StrictBatchEnabled()) {
+			throw InvalidInputException(
+			    "mssql_ducklake: a write DuckLake sent through Query that the T-SQL rewrite does not "
+			    "recognise (specs/014): %s",
+			    statement);
+		}
+		return nullptr;
+	}
+	return RunCommitBatch(tsql);
+}
+
 unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot, string &query) {
 	// The snapshot's numbers first, so that a literal is a literal; {METADATA_CATALOG} stays until
 	// each family decides what to do with it. The base substitutes again on what it is handed and

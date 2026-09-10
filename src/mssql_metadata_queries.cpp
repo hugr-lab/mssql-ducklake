@@ -161,6 +161,11 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Query(DuckLakeSnapshot snapshot, s
 	if (ConflictRewriteEnabled() && query == DUCKLAKE_CONFLICT_CHECK_QUERY) {
 		query = MSSQL_CONFLICT_CHECK_QUERY;
 	}
+	// a write DuckLake sends through Query - the expiry's, the cleanup's, the flush's DELETEs -
+	// takes the commit batch's T-SQL path when it is one of its families (specs/014 D3c)
+	if (auto written = TryRewriteWrite(snapshot, query)) {
+		return written;
+	}
 	return DuckLakeMetadataManager::Query(snapshot, query);
 }
 

@@ -130,6 +130,10 @@ private:
 	//! error the way the base's Execute does, so the commit loop's retry and rollback see the same
 	//! thing (specs/014 D3).
 	unique_ptr<QueryResult> RunCommitBatch(const string &tsql);
+	//! A write DuckLake sends through Query rather than Execute - the expiry's and cleanup's DELETEs,
+	//! the flush's - recognised by the same families as the batch and run as T-SQL; nullptr when it
+	//! is not one (specs/014 D3c).
+	unique_ptr<QueryResult> TryRewriteWrite(DuckLakeSnapshot snapshot, const string &query);
 	//! The T-SQL column type for an inlined column, from the matrix.
 	string TSQLColumnType(const LogicalType &type) const;
 	//! Keys, indexes and collations, written so that running them twice is a no-op.

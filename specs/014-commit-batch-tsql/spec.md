@@ -124,6 +124,18 @@ The identity check: the all-writes workload run through the rewrite and through 
 (`MSSQL_DUCKLAKE_NO_BATCH_REWRITE=1`) leaves the same catalog — the row count of every
 `ducklake_*` table equal — and `write_shapes.test` passes on both.
 
+**D3c — the writes DuckLake sends through `Query`.** Not every write is in the commit batch: the
+expiry and the cleanup `DELETE` from a dozen tables through `Query`, one statement at a time, and
+the flush `DELETE`s the rows it moved to files. CI found what the base path costs there — on
+linux_amd64 the expiry's `DELETE FROM ducklake_tag … NOT EXISTS (…)` through the extension's DML
+operator failed with `Invalid unicode (byte sequence mismatch) detected in value construction`
+(the composite-key row identity of a table keyed on a `VARCHAR(200)` column), where the same
+statement passed on macOS and, in isolation, on the community 0.2.5 under emulation. The
+statements are the batch's own families, so `Query` hands a recognised `UPDATE` or `DELETE` to the
+same rewrite (`TryRewriteWrite`): one T-SQL statement, one round trip, no scan of the table through
+the DML operator — and the base path is a fallback there too. The observation stays recorded for
+the extension; it is not reproduced.
+
 **D4 — the guard.** `MSSQL_DUCKLAKE_STRICT_BATCH=1` makes an unrecognised statement over a
 `ducklake_` table — anything but the inlined-rows `INSERT` — an error instead of a fallback. The
 integration suite and the write-shapes workload run with it on, so a ducklake bump that adds a

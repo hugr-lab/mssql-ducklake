@@ -22,7 +22,9 @@ to DuckDB's own path through the mssql extension's DML operators. Two statements
 `INSERT` of a user's inlined rows — their values are the user's, in every DuckDB literal form — and
 anything a future DuckLake writes that the list does not have, which then runs correctly, slower.
 The primary keys the [shaping](./catalog/shaping.md) adds are what make that fallback path
-work at all; the T-SQL path is what makes a commit one round trip instead of ~19.
+work at all; the T-SQL path is what makes a commit one round trip instead of ~19. The writes
+DuckLake sends outside the batch — the expiry's and the cleanup's deletes, the flush's — take the
+same path when they are the same statements.
 
 A commit's data-file rows, statistics and partition values go through DuckLake's appender by
 default (`MSSQL_DUCKLAKE_NO_APPENDER=1` puts them in the batch instead;
