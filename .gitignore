@@ -29,3 +29,6 @@ website/.docusaurus/
 website/versioned_docs/
 website/versioned_sidebars/
 website/versions.json
+
+# announcements and articles, drafted here, published elsewhere
+posts/
