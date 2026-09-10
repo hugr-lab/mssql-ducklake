@@ -135,6 +135,11 @@ rewrites anything else and the distribution's format check fails on it.
   `SupportsAppender` on — measured, the appender does work against a remote catalog, contrary to
   what postgres and sqlite answering `false` suggested — and made the catalog's own storage
   `VARCHAR` under a UTF-8 BIN2 collation rather than `NVARCHAR`.
+- **The catalog's database is shaped, once per shape version** (`EnsureCatalogShape`, stamped on
+  `ducklake_metadata`): keys, the UTF-8 BIN2 `VARCHAR`s, indexes — and `PARAMETERIZATION FORCED`
+  on the database itself, best-effort and with `mssql_ducklake_forced_parameterization = false` as
+  the opt-out (specs/012). Without it every distinct literal in a query is a plan compile on the
+  server: ~35 ms per table on its first touch (specs/009), 27% of the 1000-table benchmark.
 - **Both lakes at once**: `ducklake:postgres:` works through the embedded copy too — one extension
   serves postgres-cataloged and mssql-cataloged lakes in the same process.
 - **Attach syntax**: `ducklake:mssql:<ADO connection string>` — duckdb strips `mssql:` as an

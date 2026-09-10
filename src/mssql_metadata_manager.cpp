@@ -4,6 +4,7 @@
 #include "common/ducklake_util.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_metadata_info.hpp"
@@ -581,6 +582,46 @@ IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 3 AND major_id = 
 	// needs it, and the server answers "cannot define PRIMARY KEY on a nullable column".
 	RunServerSide(columns_ddl, "Failed to prepare the DuckLake catalog columns for SQL Server: ");
 	RunServerSide(constraints_ddl, "Failed to key and index the DuckLake catalog for SQL Server: ");
+
+	ApplyForcedParameterization();
+}
+
+void MSSQLMetadataManager::ApplyForcedParameterization() {
+	// Every query the extension and DuckLake send this database carries its literals in the text -
+	// a table name in the metadata query, `WHERE table_id = 1053` in DuckLake's own - and SQL Server
+	// caches ad-hoc plans by text, so each distinct value is a plan of its own and its first
+	// execution compiles it: 28-37 ms for the metadata query, measured on the plan-cache counter
+	// (specs/009). A touch-each-table-once workload compiles once per table. With the option the
+	// server parameterizes the literals itself and one plan serves every value: the 1000-table
+	// benchmark went from 937 s to 686 s, the first write into each table three times faster, the
+	// first read after an attach five times (specs/012).
+	//
+	// A database-wide option, so it has an opt-out, and best-effort, so a login that may shape the
+	// schema but not alter the database - or a platform without the option, Fabric Warehouse and
+	// Synapse among them - still gets a working catalog. Applied here, with the rest of the shape,
+	// and not on every attach: a DBA who sets it back keeps it back.
+	auto client_context = transaction.context.lock();
+	if (!client_context) {
+		throw InternalException("MSSQLMetadataManager: the client context is gone");
+	}
+	Value wanted;
+	if (client_context->TryGetCurrentSetting("mssql_ducklake_forced_parameterization", wanted) &&
+	    !wanted.GetValue<bool>()) {
+		return;
+	}
+	try {
+		// ALTER DATABASE is refused inside a transaction; on its own connection it is also online -
+		// measured against a session holding uncommitted DDL and a row lock in this database, it
+		// completed in a second.
+		RunServerSideOutsideTransaction("ALTER DATABASE CURRENT SET PARAMETERIZATION FORCED;",
+		                                "Failed to set PARAMETERIZATION FORCED on the catalog's database: ");
+	} catch (std::exception &ex) {
+		DUCKDB_LOG_WARNING(*client_context,
+		                   StringUtil::Format("mssql_ducklake: the catalog's database keeps simple parameterization, "
+		                                      "which costs a plan compile per distinct literal (specs/012). To apply "
+		                                      "it by hand: ALTER DATABASE CURRENT SET PARAMETERIZATION FORCED. %s",
+		                                      ex.what()));
+	}
 }
 
 void MSSQLMetadataManager::InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) {

@@ -118,15 +118,20 @@ private:
 	string TSQLColumnType(const LogicalType &type) const;
 	//! Keys, indexes and collations, written so that running them twice is a no-op.
 	void EnsureCatalogShape();
+	//! The last step of that shaping, and the only one outside the transaction and allowed to fail:
+	//! `PARAMETERIZATION FORCED` on the catalog's database (specs/012). Skipped when the
+	//! `mssql_ducklake_forced_parameterization` setting is false.
+	void ApplyForcedParameterization();
 	//! Is that shaping already applied? Asked on every attach, so it is one query rather than the
 	//! whole idempotent batch.
 	bool CatalogShapeIsCurrent();
 	//! The shape this build of the extension wants. Bumped whenever EnsureCatalogShape changes what
-	//! it produces - a column type, a key, an index - so that a catalog shaped by an older build is
-	//! brought up to it on the next attach instead of being left as it was. Starts at 2 because 1 is
-	//! implicitly every catalog shaped before this stamp existed: those carry no property at all,
-	//! read as older, and are converted once.
-	static constexpr int64_t SHAPE_VERSION = 2;
+	//! it produces - a column type, a key, an index, a database option - so that a catalog shaped by
+	//! an older build is brought up to it on the next attach instead of being left as it was. Starts
+	//! at 2 because 1 is implicitly every catalog shaped before this stamp existed: those carry no
+	//! property at all, read as older, and are converted once. 3 added forced parameterization of
+	//! the catalog's database (specs/012).
+	static constexpr int64_t SHAPE_VERSION = 3;
 	//! Where that version is recorded: an extended property on the catalog's own ducklake_metadata
 	//! table - per catalog, invisible to DuckLake's queries, and gone the moment the catalog's
 	//! tables are, which is what makes a recreated catalog shape itself again.
