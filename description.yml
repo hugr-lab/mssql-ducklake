@@ -1,6 +1,9 @@
 # The community-extensions descriptor (specs/011): copied to
-# duckdb/community-extensions/extensions/mssql_ducklake/description.yml by the release's PR there.
-# release.yml checks that `version` and `ref` match the tag before it builds anything.
+# duckdb/community-extensions/extensions/mssql_ducklake/description.yml by the release's PR there,
+# with `ref` replaced by the tag's commit SHA (`git rev-list -n 1 vX.Y.Z` - the convention there;
+# a commit cannot carry its own SHA, so this copy names the tag). release.yml checks that
+# `version` and `ref` match the tag before it builds anything. The extended description is
+# Markdown, one line per paragraph: the site joins wrapped lines.
 extension:
   name: mssql_ducklake
   description: "DuckLake with its catalog in Microsoft SQL Server or Azure SQL - embedded DuckLake, native TDS through the mssql extension."
