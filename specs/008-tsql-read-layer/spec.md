@@ -147,7 +147,7 @@ the client sat in the retry loop's `sleep_for`, and `sys.dm_exec_requests` showe
 
 ## Enforcement & security
 
-The five query texts are constants in our source with the same placeholders the base substitutes;
+The query text is a constant in our source with the same placeholders the base substitutes;
 no part of them is built from user input. Nothing about the trust boundary moves.
 
 ## Testing
