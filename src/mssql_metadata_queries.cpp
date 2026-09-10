@@ -252,6 +252,15 @@ string MSSQLMetadataManager::GetInlinedDeletionTableName(TableIndex table_id, Du
 	return table_name;
 }
 
+unique_ptr<QueryResult> MSSQLMetadataManager::Query(string &query) {
+	// the snapshot-less path: what the expiry, the cleanup and the flush DELETE through (specs/014
+	// D3c) - a recognised write goes as T-SQL, everything else to the base
+	if (auto written = TryRewriteWrite(query)) {
+		return written;
+	}
+	return DuckLakeMetadataManager::Query(query);
+}
+
 string MSSQLMetadataManager::GetLatestSnapshotQuery() const {
 	// Read through `mssql_scan` instead of through the attached catalog, which is what the postgres
 	// manager does with this same query. Measured (specs/005 D13), the same rows cost 10.0ms through

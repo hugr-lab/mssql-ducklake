@@ -92,6 +92,9 @@ public:
 	//! goes to the base untouched. Both query texts are constants in the .cpp; nothing outside needs
 	//! them.
 	unique_ptr<QueryResult> Query(DuckLakeSnapshot snapshot, string &query) override;
+	//! The snapshot-less overload DuckLake's expiry, cleanup and flush use for their DELETEs: the
+	//! same T-SQL path for a recognised write (specs/014 D3c).
+	unique_ptr<QueryResult> Query(string &query) override;
 	//! The commit batch, with the one statement in it that is not DuckDB's to run: the DDL of a new
 	//! inlined deletion table, which the manager creates keyed and outside the transaction instead
 	//! (specs/006 D5b). Everything else in the batch goes to the base as it is.
@@ -134,6 +137,11 @@ private:
 	//! the flush's - recognised by the same families as the batch and run as T-SQL; nullptr when it
 	//! is not one (specs/014 D3c).
 	unique_ptr<QueryResult> TryRewriteWrite(DuckLakeSnapshot snapshot, const string &query);
+	//! The same, for a statement that carries no snapshot placeholders (the Query(string &) path);
+	//! one that does is left to the base.
+	unique_ptr<QueryResult> TryRewriteWrite(const string &query);
+	//! The shared tail of the two: the statement with its placeholders resolved, or not a write.
+	unique_ptr<QueryResult> RewriteWriteStatement(string statement);
 	//! The T-SQL column type for an inlined column, from the matrix.
 	string TSQLColumnType(const LogicalType &type) const;
 	//! Keys, indexes and collations, written so that running them twice is a no-op.
