@@ -11,6 +11,12 @@ namespace duckdb {
 // nothing here links it. Unlike the postgres manager it does not intercept the commit batch: with
 // the catalog keyed (see InitializeDuckLake) duckdb executes DuckLake's own SQL against SQL Server,
 // so this class rewrites no SQL at all.
+//
+// One class, four source files, cut along what each does (specs/010): mssql_metadata_manager.cpp -
+// the type matrix, talking to the server, the inlined table, the attach-time probe;
+// mssql_catalog_shape.cpp - the keys, indexes, collations and the database option that shape a
+// catalog; mssql_server_commit.cpp - phase 2, the commit staged and applied on the server;
+// mssql_metadata_queries.cpp - the queries written in T-SQL, the conflict check and the read layer.
 class MSSQLMetadataManager : public DuckLakeMetadataManager {
 public:
 	explicit MSSQLMetadataManager(DuckLakeTransaction &transaction);
