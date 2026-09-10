@@ -19,7 +19,7 @@ Nothing in this repository moves that cost; the fix is the extension's (paramete
 templates, #334 — which needs the RETURNSTATUS fix of #332 first, so it lands on the 2.0 line).
 The database setting `PARAMETERIZATION FORCED` gives the same effect without any code and is
 measured here; whether to apply or recommend it is its own spec. What this spec changes is the
-record — the anatomy in specs/005 – 006 and design 002 §1.1 — and the instrument: `metadata_log.py`
+record — design 002's anatomy and the draft of this spec — and the instrument: `metadata_log.py`
 parsed exactly one entry per run before this.
 
 ## The measurement
@@ -30,7 +30,7 @@ second session without the debug flag.
 
 | statement | what the stream shows | commit (log) |
 | --- | --- | ---: |
-| `CREATE TABLE` | the inlined table is created here, through `mssql_exec`, before the commit (DuckLake creates it with the table, specs/006 D5); six `INSERT`s through DuckDB's DML path, three single-table loads at 1 ms — texts the server had compiled minutes earlier; then DuckLake's own catalog reload, 44K rows of `ducklake_column` | 220 ms |
+| `CREATE TABLE` | the inlined table is created here, through `mssql_exec`, in the commit of the `CREATE` ahead of its batch (specs/006 D5); six `INSERT`s through DuckDB's DML path, three single-table loads that hit cached plans, 1 ms each; then DuckLake's own catalog reload, 44K rows of `ducklake_column` | 220 ms |
 | first inlined `INSERT` | `GetEntry('dbo.ducklake_inlined_data_1053_1206')` — a miss, **one** single-table load, **40 ms**, the only new thing; the `INSERT` into it; the commit | 48 ms |
 | second inlined `INSERT` | cache hit; the commit | 25 ms |
 
