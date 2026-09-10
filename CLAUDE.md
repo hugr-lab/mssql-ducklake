@@ -193,7 +193,9 @@ platform through the same reusable workflow as `distribution.yml`, and publishes
 with the binaries and `SHA256SUMS.txt`; the tag's push also runs `pages.yml`, which
 snapshots every release tag's docs as that version at deploy time — never commit
 `versioned_docs/` or `versions.json`. After the tag: the PR to duckdb/community-extensions with
-`description.yml`, and the constant to the next version with `-dev`.
+`description.yml`, its `ref` replaced by the tag's commit SHA (`git rev-list -n 1 vX.Y.Z` — the
+convention there; the repo's copy names the tag, since a commit cannot carry its own SHA), and the
+constant to the next version with `-dev`.
 
 ## Distribution
 

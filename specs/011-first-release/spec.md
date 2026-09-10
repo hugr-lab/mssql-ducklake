@@ -59,8 +59,12 @@ the next version with `-dev`, and the descriptor stays at the released tag until
 build's git hash.
 
 **D4 — the community descriptor.** `description.yml` at the root, copied to
-`duckdb/community-extensions/extensions/mssql_ducklake/description.yml` by the release's PR there:
-name, an honest description (embeds DuckLake at a pin, mutually exclusive with stock ducklake,
+`duckdb/community-extensions/extensions/mssql_ducklake/description.yml` by the release's PR there
+with `ref` replaced by the tag's commit SHA (`git rev-list -n 1 vX.Y.Z`): every descriptor there
+names a commit, and the repo's own copy cannot — a commit does not know its own SHA — so it names
+the tag and the guard checks the tag. The text is Markdown, one paragraph per line (the site joins
+wrapped lines, and a line starting `- ` becomes a list item). The descriptor carries: name, an
+honest description (embeds DuckLake at a pin, mutually exclusive with stock ducklake,
 needs the mssql extension), `excluded_platforms` = the mssql extension's set plus wasm (the
 manager is nothing where mssql is not), `test_config` skipping the server-backed suite, a
 hello-world attach. Their build runs our `extension_config.cmake`, which builds the mssql
