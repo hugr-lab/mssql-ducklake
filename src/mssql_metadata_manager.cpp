@@ -104,7 +104,7 @@ ORDER BY table_id NULLS FIRST;
 //!
 //! The inner text travels inside a DuckDB string literal, so each of its own quotes is doubled once.
 constexpr const char *MSSQL_CONFLICT_CHECK_QUERY = R"(
-SELECT * FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, '
+FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, '
 SELECT s.snapshot_id, s.schema_version, s.next_catalog_id, s.next_file_id,
        COALESCE((SELECT STRING_AGG(changes_made, '','')
                  FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot_changes c
@@ -310,17 +310,6 @@ void MSSQLMetadataManager::InvalidateTableCache(const string &table_name) {
 	}
 }
 
-string MSSQLMetadataManager::GetInlinedDeletionTableName(TableIndex table_id, DuckLakeSnapshot snapshot,
-                                                         bool create_if_not_exists) {
-	auto table_name = DuckLakeMetadataManager::GetInlinedDeletionTableName(table_id, snapshot, create_if_not_exists);
-	if (create_if_not_exists && !table_name.empty()) {
-		// The base may have created it or found it cached; we cannot tell, and recording a name that
-		// did not need refreshing costs one precise invalidation, while missing one costs correctness.
-		tables_pending_cache_refresh.push_back(table_name);
-	}
-	return table_name;
-}
-
 //===--------------------------------------------------------------------===//
 // Initialization (specs/004 D3)
 //===--------------------------------------------------------------------===//
@@ -338,9 +327,17 @@ bool MSSQLMetadataManager::CatalogShapeIsCurrent() {
 	// the inner statement travels inside a duckdb string literal, so each of its own quotes is
 	// doubled once - the same shape the collation probe above uses
 	auto schema_name = StringUtil::Replace(transaction.GetCatalog().MetadataSchemaName(), "'", "''''");
+	// The stamp sits on ducklake_metadata - the catalog's own anchor table, the one DuckLake probes to
+	// decide whether a catalog exists - and not on the schema. It was on the schema for one day, and
+	// that was a regression: a catalog whose tables were dropped and recreated (with our shaping
+	// failing partway, as it did behind a dying session's locks) kept the schema's stamp, every later
+	// attach trusted it, and the catalog stayed without keys until the first UPDATE failed. A stamp on
+	// the table dies with the table, so a recreated catalog is shaped again - the self-healing the
+	// old constraint marker had by construction.
 	auto result = connection.Query(StringUtil::Format(
 	    "SELECT shape FROM mssql_scan(%s, 'SELECT TRY_CAST(CAST(value AS VARCHAR(32)) AS BIGINT) AS shape "
-	    "FROM sys.extended_properties WHERE class = 3 AND major_id = SCHEMA_ID(''%s'') AND name = ''%s''')",
+	    "FROM sys.extended_properties WHERE class = 1 "
+	    "AND major_id = OBJECT_ID(QUOTENAME(''%s'') + ''.ducklake_metadata'') AND minor_id = 0 AND name = ''%s''')",
 	    CatalogLiteral(), schema_name, SHAPE_VERSION_PROPERTY));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to inspect the DuckLake catalog on SQL Server: ");
@@ -565,14 +562,20 @@ EXEC sp_executesql @widen;
 	// It is what lets a catalog shaped by an older build of this extension be brought up to the
 	// current shape - the DDL is all idempotent, so the stamp is the only thing that decides whether
 	// it is worth running at all.
-	constraints_ddl += StringUtil::Format(R"(
-IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 3 AND major_id = SCHEMA_ID(%s) AND name = '%s')
-    EXEC sp_updateextendedproperty @name = N'%s', @value = N'%d', @level0type = N'SCHEMA', @level0name = %s;
+	constraints_ddl +=
+	    StringUtil::Format(R"(
+IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 1 AND major_id = OBJECT_ID(QUOTENAME(%s) + '.ducklake_metadata') AND minor_id = 0 AND name = '%s')
+    EXEC sp_updateextendedproperty @name = N'%s', @value = N'%d', @level0type = N'SCHEMA', @level0name = %s, @level1type = N'TABLE', @level1name = N'ducklake_metadata';
 ELSE
-    EXEC sp_addextendedproperty @name = N'%s', @value = N'%d', @level0type = N'SCHEMA', @level0name = %s;
+    EXEC sp_addextendedproperty @name = N'%s', @value = N'%d', @level0type = N'SCHEMA', @level0name = %s, @level1type = N'TABLE', @level1name = N'ducklake_metadata';
+-- the schema-level stamp one build wrote (specs/006 D4, before specs/008 moved it): a leftover that
+-- would otherwise outlive any catalog dropped from under it
+IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 3 AND major_id = SCHEMA_ID(%s) AND name = '%s')
+    EXEC sp_dropextendedproperty @name = N'%s', @level0type = N'SCHEMA', @level0name = %s;
 )",
-	                                      schema_literal, SHAPE_VERSION_PROPERTY, SHAPE_VERSION_PROPERTY, SHAPE_VERSION,
-	                                      schema_literal, SHAPE_VERSION_PROPERTY, SHAPE_VERSION, schema_literal);
+	                       schema_literal, SHAPE_VERSION_PROPERTY, SHAPE_VERSION_PROPERTY, SHAPE_VERSION,
+	                       schema_literal, SHAPE_VERSION_PROPERTY, SHAPE_VERSION, schema_literal, schema_literal,
+	                       SHAPE_VERSION_PROPERTY, SHAPE_VERSION_PROPERTY, schema_literal);
 
 	// Two batches: inside one, a column's new NOT NULL is not yet visible to the constraint that
 	// needs it, and the server answers "cannot define PRIMARY KEY on a nullable column".
@@ -934,6 +937,90 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Query(DuckLakeSnapshot snapshot, s
 	return DuckLakeMetadataManager::Query(snapshot, query);
 }
 
+//===--------------------------------------------------------------------===//
+// The read layer in T-SQL (specs/008)
+//===--------------------------------------------------------------------===//
+
+//! One T-SQL statement as the sole source of a DuckDB query - the only shape mssql v0.2.5 runs on
+//! the pinned connection inside a transaction (design 002 section 3.1). The text keeps the base's
+//! placeholders: {METADATA_SCHEMA_ESCAPED} and {SNAPSHOT_ID} are substituted by the base's Query
+//! after this, on the finished statement, which is why the schema is the identifier form and not
+//! the literal one - a literal would arrive with quotes the doubling below has already passed.
+static string ServerScan(const string &tsql) {
+	return "FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, '" + StringUtil::Replace(tsql, "'", "''") + "')";
+}
+
+//! The first row's first column as an idx_t, or `absent` when the scan returned no row.
+static idx_t ScalarOf(QueryResult &result, const string &context, idx_t absent) {
+	if (result.HasError()) {
+		result.GetErrorObject().Throw(context);
+	}
+	auto chunk = result.Fetch();
+	if (!chunk || chunk->size() == 0 || chunk->GetValue(0, 0).IsNull()) {
+		return absent;
+	}
+	return chunk->GetValue(0, 0).GetValue<idx_t>();
+}
+
+// Why only this one lookup goes to the server, and not the other four a read makes (the inlined and
+// data-file row counts, the global stats, the schema version's snapshot). All five are single-table
+// scalars and all five were moved, and measured three ways against each other (specs/008): the
+// probe alone gives the whole read-side win - a first read of a table on a thousand-table catalog
+// goes from 0.29-0.46 s to 0.06-0.08 s, because a miss on this probe through the catalog path makes
+// the mssql extension reload the schema's metadata, 964 ms on that catalog - while moving the other
+// four cost 30-45% on every commit whose stats refresh runs them. Their catalog scans are what warm
+// the extension's metadata for exactly the tables the commit batch then UPDATEs; through mssql_scan
+// nothing is warmed and the batch pays the load itself. So they stay on the catalog path.
+
+string MSSQLMetadataManager::GetInlinedDeletionTableName(TableIndex table_id, DuckLakeSnapshot snapshot,
+                                                         bool create_if_not_exists) {
+	if (create_if_not_exists) {
+		// The base creates the table inside the transaction and keeps the fact in a per-transaction
+		// cache that is private to it and cleared on retry - which is right, since the CREATE rolls
+		// back with the attempt. We keep the create path exactly the base's, and only learn from it.
+		auto table_name = DuckLakeMetadataManager::GetInlinedDeletionTableName(table_id, snapshot, true);
+		if (!table_name.empty()) {
+			created_deletion_tables.insert(table_id.index);
+			// The base may have created it or found it cached; we cannot tell, and recording a name
+			// that did not need refreshing costs one precise invalidation, while missing one costs
+			// correctness.
+			tables_pending_cache_refresh.push_back(table_name);
+		}
+		return table_name;
+	}
+
+	// The read path. The catalog-level cache is the base's and is consulted the same way; what
+	// differs is the probe behind a miss. The base runs `SELECT NULL FROM <table> LIMIT 1` through
+	// the catalog and reads its error state as "absent" - and on a miss the mssql extension reloads
+	// the whole schema's metadata to find out. OBJECT_ID is one round trip and one row either way.
+	auto table_name = InlinedFileDeletionTableName(table_id);
+	auto &catalog = transaction.GetCatalog();
+	auto cached = catalog.CheckInlinedDeletionTableCache(table_id, snapshot);
+	if (cached == InlinedDeletionCacheResult::EXISTS) {
+		return table_name;
+	}
+	if (cached == InlinedDeletionCacheResult::DOES_NOT_EXIST) {
+		return string();
+	}
+	auto query = ServerScan(StringUtil::Format(
+	    "SELECT CASE WHEN OBJECT_ID('{METADATA_SCHEMA_ESCAPED}.%s') IS NULL THEN 0 ELSE 1 END AS present", table_name));
+	auto result = transaction.Query(snapshot, query);
+	auto present = ScalarOf(*result, "Failed to look up the inlined deletion table in DuckLake: ", 0) != 0;
+	if (!present) {
+		catalog.CacheInlinedDeletionTableResult(table_id, snapshot, false);
+		return string();
+	}
+	// Seen through this transaction's own connection, so a table this transaction created but has
+	// not committed is visible too. The catalog-level "exists" is permanent, and that create can
+	// still roll back - so it is recorded only for tables some earlier transaction committed. The
+	// base gets the same protection from its private per-transaction cache, checked before the
+	// probe; we cannot see that cache, so the test is our own record of what we created.
+	if (created_deletion_tables.find(table_id.index) == created_deletion_tables.end()) {
+		catalog.CacheInlinedDeletionTableResult(table_id, snapshot, true);
+	}
+	return table_name;
+}
+
 string MSSQLMetadataManager::GetLatestSnapshotQuery() const {
 	// Read through `mssql_scan` instead of through the attached catalog, which is what the postgres
 	// manager does with this same query. Measured (specs/005 D13), the same rows cost 10.0ms through
@@ -948,7 +1035,7 @@ string MSSQLMetadataManager::GetLatestSnapshotQuery() const {
 	//
 	// TOP 1 descending rather than the base's MAX subquery: same row, one seek down the primary key
 	// this manager puts on ducklake_snapshot, and no self-join for the server to unpick.
-	return R"(SELECT * FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, 'SELECT TOP 1 snapshot_id, )"
+	return R"(FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, 'SELECT TOP 1 snapshot_id, )"
 	       R"(schema_version, next_catalog_id, next_file_id FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot )"
 	       R"(ORDER BY snapshot_id DESC'))";
 }

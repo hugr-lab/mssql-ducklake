@@ -1,5 +1,6 @@
 #pragma once
 
+#include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/connection.hpp"
 #include "storage/ducklake_metadata_manager.hpp"
 
@@ -49,8 +50,11 @@ public:
 	//! than at the end of the commit - see the call site for why the timing matters.
 	void InvalidateTableCache(const string &table_name);
 
-	//! Overridden only to learn the name: this is the other place DuckLake creates a table behind
-	//! the mssql extension's back, and ClearCache needs to know which one.
+	//! Two jobs. On the create path it is the other place DuckLake creates a table behind the mssql
+	//! extension's back, and ClearCache needs to know which one. On the read path it replaces the
+	//! base's existence probe - a catalog query whose error state means "absent", and which on a
+	//! miss makes the extension reload the whole schema's metadata - with one mssql_scan of
+	//! OBJECT_ID (specs/008 D1).
 	string GetInlinedDeletionTableName(TableIndex table_id, DuckLakeSnapshot snapshot,
 	                                   bool create_if_not_exists = false) override;
 
@@ -123,8 +127,9 @@ private:
 	//! implicitly every catalog shaped before this stamp existed: those carry no property at all,
 	//! read as older, and are converted once.
 	static constexpr int64_t SHAPE_VERSION = 2;
-	//! Where that version is recorded: an extended property on the catalog's schema, which is
-	//! per-schema (two lakes in one database keep their own) and invisible to DuckLake's own tables.
+	//! Where that version is recorded: an extended property on the catalog's own ducklake_metadata
+	//! table - per catalog, invisible to DuckLake's queries, and gone the moment the catalog's
+	//! tables are, which is what makes a recreated catalog shape itself again.
 	static constexpr const char *SHAPE_VERSION_PROPERTY = "mssql_ducklake_shape";
 	//! Run T-SQL through `mssql_exec` on a connection of the caller's choosing.
 	void RunOn(Connection &connection, const string &tsql, const string &context);
@@ -142,6 +147,10 @@ private:
 	//! instead of dropping the whole schema's metadata. Empty means "we do not know", and the clear
 	//! falls back to the schema.
 	vector<string> tables_pending_cache_refresh;
+	//! Tables whose inlined-deletion table THIS transaction created. The catalog-level "exists"
+	//! cache is permanent, and a create can still roll back - so the read-path probe never records
+	//! "exists" for one of these. See GetInlinedDeletionTableName.
+	unordered_set<idx_t> created_deletion_tables;
 };
 
 } // namespace duckdb

@@ -1,4 +1,4 @@
-# Spec 008: the T-SQL read layer — five scalar lookups through `mssql_scan`
+# Spec 008: the T-SQL read layer — one probe through `mssql_scan`, and why not five
 
 - **Status**: draft
 - **Date**: 2026-09-10
@@ -9,10 +9,16 @@
 Every read of a lake table asks the catalog a handful of small questions — is there an inlined
 deletion table, how many rows does this inlined table hold, what is the net data-file row count,
 what are the global stats, where does this schema version begin. Each is a single-table scalar
-query, and each goes through DuckDB's catalog path, which costs the mssql extension a metadata load
-of the table on first touch. On a thousand-table catalog one of those questions costs **964 ms**.
-This spec moves the five of them to `mssql_scan`, where a query is text and there is nothing to
-load. Same pattern as specs/007, without the text match: these are ordinary virtuals.
+query on DuckDB's catalog path. On a thousand-table catalog one of them costs **964 ms**: the
+existence probe, whose miss makes the mssql extension reload the whole schema's metadata. This spec
+moves that one to `mssql_scan`, where a query is text and there is nothing to load — the pattern of
+specs/007 without the text match, since it is an ordinary virtual.
+
+All five were moved first, and measured three ways against each other. The probe alone gives the
+whole read-side win; moving the other four cost 30 – 45% on every commit whose stats refresh runs
+them, because their catalog scans are what warm the extension's metadata for exactly the tables the
+commit then writes. They stay where they were, and the reason is recorded here so nobody moves them
+again on the same intuition.
 
 ## Problem
 
@@ -48,43 +54,96 @@ In the mixed-workload inventory (design 002 §1.2) reads through the catalog pat
 
 ## Design
 
-Five overrides in `MSSQLMetadataManager`, each replacing the base's query with
+One override, `GetInlinedDeletionTableName`'s read path. Where the base runs
+`SELECT NULL FROM <table> LIMIT 1` through the catalog and reads its error state as "absent", the
+manager runs
 
 ```
-SELECT * FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, '<T-SQL>')
+FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, 'SELECT CASE WHEN OBJECT_ID(''{METADATA_SCHEMA_ESCAPED}.<table>'') IS NULL THEN 0 ELSE 1 END AS present')
 ```
 
-and handing it to `transaction.Query(snapshot, …)` so the base substitutes `{METADATA_SCHEMA_ESCAPED}`
-and `{SNAPSHOT_ID}` exactly as it does today. Each query is the sole source of its statement, which
-is the rule mssql v0.2.5 imposes on the pinned connection (design 002 §3.1) and what
-`GetLatestSnapshotQuery` already relies on.
+through `transaction.Query(snapshot, …)`, so the base substitutes the placeholders exactly as it
+does today. One row either way, no error semantics, and — the point — no metadata load: through the
+catalog path a miss on a table that does not exist sends the extension to reload the schema, which is
+what 964 ms was. The schema placeholder has to be the identifier form: the T-SQL travels inside a
+DuckDB string literal whose quotes are doubled *before* substitution, so a placeholder expanding to a
+quoted literal would arrive with quotes the doubling never saw. This is the sole source of its
+statement, which is the rule mssql v0.2.5 imposes on the pinned connection (design 002 §3.1).
 
-| virtual | the T-SQL |
-| --- | --- |
-| `GetInlinedDeletionTableName` (read path) | `SELECT CASE WHEN OBJECT_ID('<schema>.<table>') IS NULL THEN 0 ELSE 1 END AS present` — always one row, no error semantics |
-| `GetNetInlinedRowCount` | the base text as is: `COUNT(*) … WHERE {SNAPSHOT_ID} >= begin_snapshot AND ({SNAPSHOT_ID} < end_snapshot OR end_snapshot IS NULL)` |
-| `GetNetDataFileRowCount` | the base text as is — `COALESCE`, correlated subqueries and the join are T-SQL |
-| `GetGlobalTableStats` | `JOIN … ON cs.table_id = ts.table_id` instead of `USING`; column list and order unchanged, because `TransformGlobalStats` reads by position |
-| `GetBeginSnapshotForSchemaVersion` | the base text as is |
+The override needed care because of what the caches around it mean. The base holds a
+per-transaction set of tables it created — **private**, and cleared by a non-virtual
+`ClearInlinedTableCaches` on every commit retry, which is right: the `CREATE` rolls back with the
+attempt. And the catalog-level cache records "exists" **permanently**. The base is safe because it
+consults its private set *before* the probe, so a table this transaction created never reaches the
+permanent cache. An override cannot see that set. So it keeps the base's create path exactly —
+calls the base, which creates the table and records it in its own set — and only records, in a set
+of its own, that this transaction created it. On the read path it consults the catalog-level cache
+as the base does, then **always probes** on a miss (seeing this transaction's own uncommitted table
+through the pinned connection), and writes "exists" to the permanent cache only for a table this
+transaction did *not* create. A stale entry in the override's own set after a retry can only
+suppress a cache write, never produce a wrong answer, because the probe is fresh. The base's own
+TODO ("using the error state to check for existence here is fragile") is closed on the way.
 
-`GetInlinedDeletionTableName` is one function holding two caches — the per-transaction set and
-`catalog.CacheInlinedDeletionTableResult` — and the `create_if_not_exists` branch, which runs
-`CREATE TABLE IF NOT EXISTS` through `transaction.Query` and calls `ClearCache()`. The manager
-already overrides it, only to record the table name for `ClearCache`. The new override reproduces
-the caches and the create branch and replaces the probe; the base's own TODO ("using the error
-state to check for existence here is fragile") is closed on the way.
+### The four that went and came back
 
-`GetNetDataFileRowCount` calls `GetInlinedDeletionTableName`, so the first row of the table above
-fixes it twice.
+`GetNetInlinedRowCount`, `GetNetDataFileRowCount`, `GetGlobalTableStats` and
+`GetBeginSnapshotForSchemaVersion` were moved to `mssql_scan` in the first version of this change
+and verified correct — values equal to the postgres backend's on the same sequence, all suites
+green. Then three builds were run against each other, alternated, first round discarded: the build
+before this spec, all five overrides, and the probe alone.
 
-Types coming back through `mssql_scan` were verified for this exact pair of tables in specs/007:
-`contains_null` arrives as a boolean, `record_count` as a bigint.
+Write, 150 tables, seconds (rounds 2 – 4):
 
-**The measuring tool ships with the change.** `scripts/bench/metadata_log.py` captures DuckLake's
-own `DuckLakeMetadata` log over a workload — `SET logging_storage = 'memory'`, `enabled_log_types =
+| phase | before | all five | probe only |
+| --- | --- | --- | --- |
+| first inlined insert | 7.96 / 8.51 / 9.00 | 8.80 / 8.54 / 9.16 | 8.38 / 9.08 / 8.36 |
+| second inlined insert | 2.51 / 2.86 / 2.57 | **3.78 / 3.33 / 3.62** | 2.73 / 2.87 / 2.71 |
+| file-backed insert | 2.43 / 2.64 / 2.81 | 2.71 / 3.04 / 3.08 | 2.75 / 2.67 / 2.65 |
+
+Read, one 1000-table catalog, a fresh process per arm, seconds:
+
+| phase | before | all five | probe only |
+| --- | --- | --- | --- |
+| attach | 0.72 – 0.75 | 0.74 – 0.75 | 0.72 – 0.74 |
+| first read of a table | **0.29 – 0.46** | **0.06** | **0.06 – 0.08** |
+| next table, warm repeat | 0.01 | 0.00 | 0.01 |
+
+All five cost 30 – 45% on the commits whose stats refresh runs the counts, and bought nothing on
+reads beyond the probe. The mechanism is the extension's metadata cache: the four counters' catalog
+scans touch `ducklake_table_stats`, `ducklake_table_column_stats`, `ducklake_data_file` and the
+inlined table — the tables the commit batch then UPDATEs through DuckDB's DML path, which needs
+their metadata loaded. Through `mssql_scan` nothing is loaded, and the batch pays for it. The first
+version of this spec called the cold load "the cost" and the scan "free"; on the write path it was
+the other way round. `MSSQL_DEBUG=1` showed it as batches: 24 for the first commit in a process
+against 17, the difference being those loads.
+
+The measuring tool ships with the change. `scripts/bench/metadata_log.py` captures DuckLake's own
+`DuckLakeMetadata` log over a workload — `SET logging_storage = 'memory'`, `enabled_log_types =
 'DuckLakeMetadata'`, then `duckdb_logs()` — and aggregates it by query shape with count, total time
-and path (`catalog` / `mssql_scan` / `execute`). It is how this spec's numbers were taken and how
-the next one's will be.
+and path (`catalog` / `mssql_scan` / `execute`). It is how this spec's numbers were taken.
+
+### The incident on the way, and the fix that rode along
+
+Measuring this spec's write-path cost required alternating two builds over a fresh catalog, and the
+first attempt hung: a commit retried for ten minutes on
+
+```
+MSSQL: UPDATE/DELETE requires a table with a primary key. Table 'dbo.ducklake_table_stats' has no primary key.
+```
+
+— retried, because DuckLake's `RetryOnError` matches the words `primary key`. The catalog had 178
+tables, **no keys, no indexes, and a shape stamp saying "current"**. The chain: the previous run was
+killed while its pinned connection held locks; the next reset recreated the tables, our shaping ran
+into those locks and failed partway (its error swallowed by the script), the stamp — written last —
+was never written, but the *previous* catalog's stamp survived on the **schema**, and every attach
+after that trusted it.
+
+Before specs/006 the marker was a constraint on the tables and died with them; putting the stamp on
+the schema (006 D4) lost that. It now lives on `ducklake_metadata`, the anchor table DuckLake itself
+probes for the catalog's existence, so a recreated catalog is shaped again, and the shaping drops a
+schema-level leftover when it finds one. The integration test plants the stale schema stamp before
+its own reset and asserts the attach neither trusts nor leaves it. No server deadlock was involved —
+the client sat in the retry loop's `sleep_for`, and `sys.dm_exec_requests` showed nothing waiting.
 
 ## Enforcement & security
 
@@ -94,19 +153,33 @@ no part of them is built from user input. Nothing about the trust boundary moves
 ## Testing
 
 - **Which path ran is asserted, not assumed.** The integration test enables the `DuckLakeMetadata`
-  log and asserts that none of the five base shapes appear after a read —
-  `count(*) FROM duckdb_logs() WHERE message LIKE '%FROM … ducklake_inlined_delete_% LIMIT 1%'`
-  is 0, and likewise for the others. specs/006's appender test could not tell its paths apart; this
-  one can.
-- **The answers are the same.** Row counts, `ducklake_table_info` output and inlined-deletion
-  visibility are asserted against known values on a table with data files, an inlined table, a
-  delete file and an inlined delete — the four sources `GetNetDataFileRowCount` subtracts.
+  log and asserts that the base's probe shape does not appear after a read, that the `OBJECT_ID`
+  scan does, and — deliberately — that the counters' catalog shapes still do. specs/006's appender
+  test could not tell its paths apart; this one can.
+- **The answers are the same.** Row counts and inlined-deletion visibility are asserted against
+  known values on tables carrying data files, an inlined table, delete files and an inlined delete
+  — the four sources `GetNetDataFileRowCount` subtracts. The number that count feeds is the scan's
+  cardinality estimate (`ducklake_scan.cpp`), not anything `ducklake_table_info` shows; and
+  `ducklake_table_stats.record_count` counts written rows without subtracting deletes — 102 for 100
+  file rows plus 2 inlined, after one delete of each kind. That expectation was checked against the
+  postgres backend on the same sequence before it was written down here, because the first draft of
+  this test expected 100 and would have blamed the override.
 - The existing suites, unchanged: 163 integration assertions on both commit paths, `make
   test-concurrent` (the conflict path runs `GetGlobalTableStats` through 007's query, not this one,
   but the retry path is where a type mismatch would surface), MERGE on inlined tables (specs/006 D3).
-- **Measured**: `make bench-scale` at 1000 tables, `filtered_read`, `reattach`, `deep_read_*`
-  before and after, rounds alternated; and `metadata_log.py` over the mixed workload, where the
-  catalog-path read time is expected to drop from 3216 ms by the sum of the cold costs above.
+- **Measured**, `make bench-scale` at 1000 tables, this branch against the morning's `main` on the
+  same server (not alternated — the builds are a rebuild apart — so the small deltas are noise):
+
+  | phase | before | after | |
+  | --- | ---: | ---: | ---: |
+  | `filtered_read` | 2.93 | 1.61 | **−45%** |
+  | `partitioned_read_latest` | 1.23 | 0.47 | **−62%** |
+  | `partitioned_reattach` / `deep_reattach` | 3.18 / 3.44 | 2.09 / 2.29 | −34% / −33% |
+  | `reattach`, `table_info`, `deep_read_*`, `partitioned_read_pruned` | | | level |
+  | `evolution_read_latest` | 23.4 | 24.0 | level — the per-schema-version reload, specs/005 D12 |
+
+  The write phases came out 10 – 12% slower in that pair. That was real, and it is the four
+  counters — see "The four that went and came back"; with the probe alone the writes are level.
 
 ## Alternatives considered
 

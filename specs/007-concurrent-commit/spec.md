@@ -71,7 +71,7 @@ Postgres does not have this because its scanner reads inside one transaction sna
 single `mssql_scan` — the pattern `GetLatestSnapshotQuery` already uses here:
 
 ```sql
-SELECT * FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, '… TOP 1 … UNION ALL … ORDER BY table_id')
+FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, '… TOP 1 … UNION ALL … ORDER BY table_id')
 ```
 
 One statement is evaluated against one consistent state, so no part of it can disagree with any other

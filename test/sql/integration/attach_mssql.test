@@ -29,6 +29,14 @@ SELECT count(*) FROM mssql_scan('srv', 'SELECT 1 AS marker FROM sys.tables WHERE
 ----
 1
 
+# The precondition of an incident (specs/008): a shape stamp left on the SCHEMA by the build that
+# put it there, outliving the tables it described. With the stamp on the schema, a catalog recreated
+# from scratch - here, by this very reset - read as already shaped and was left without keys; the
+# stamp now lives on ducklake_metadata and dies with it. The stale schema-level one is planted here
+# so the attach below proves it is neither trusted nor left behind.
+statement ok
+SELECT mssql_exec('srv', 'IF NOT EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 3 AND major_id = SCHEMA_ID(''dbo'') AND name = ''mssql_ducklake_shape'') EXEC sp_addextendedproperty @name = N''mssql_ducklake_shape'', @value = N''2'', @level0type = N''SCHEMA'', @level0name = N''dbo'';');
+
 statement ok
 SELECT mssql_exec('srv', '
 DECLARE @sql NVARCHAR(MAX) = N'''';
@@ -399,6 +407,59 @@ SELECT count(*), sum(v) FROM lake.merged_small;
 ----
 4	103
 
+# The read layer in T-SQL (specs/008). One lookup a read makes - does this table have an inlined
+# deletion table - goes through mssql_scan now: the base asked it as a catalog query whose error
+# state meant "absent", and a miss made the mssql extension reload the whole schema's metadata. The
+# other four scalar lookups stay on the catalog path on purpose (measured: their scans warm exactly
+# the tables the commit then writes). Which path ran is ASSERTED here, through DuckLake's own
+# metadata log: specs/006's appender test could not tell its paths apart, this one can.
+statement ok
+SET logging_storage = 'memory';
+
+statement ok
+SET enable_logging = true;
+
+statement ok
+SET logging_level = 'debug';
+
+statement ok
+SET enabled_log_types = 'DuckLakeMetadata';
+
+query II
+SELECT count(*), sum(v) FROM lake.merged;
+----
+500	6247500
+
+query II
+SELECT count(*), sum(v) FROM lake.merged_small;
+----
+4	103
+
+query I
+SELECT count(*) FROM lake.parts;
+----
+1000
+
+# the base's probe must not appear at all, and the replacement must
+query I
+SELECT count(*) FROM duckdb_logs() WHERE type = 'DuckLakeMetadata' AND message LIKE '%ducklake_inlined_delete_% LIMIT 1%';
+----
+0
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs() WHERE type = 'DuckLakeMetadata' AND message LIKE '%mssql_scan(%OBJECT_ID(%';
+----
+true
+
+# and the four counters are still catalog scans - the warm path, kept on purpose
+query I
+SELECT count(*) > 0 FROM duckdb_logs() WHERE type = 'DuckLakeMetadata' AND message LIKE '%SUM(record_count) FROM "__ducklake_metadata_lake"%';
+----
+true
+
+statement ok
+SET enable_logging = false;
+
 statement ok
 DETACH lake;
 
@@ -459,18 +520,25 @@ SELECT t, l FROM mssql_scan('srv', 'SELECT ty.name AS t, CAST(c.max_length AS BI
 ----
 varchar	200
 
-# the shape version this build wrote, which is what CatalogShapeIsCurrent reads on the next attach
+# the shape version this build wrote - on the catalog's anchor table, which is what
+# CatalogShapeIsCurrent reads on the next attach - and the stale schema-level one planted at the top
+# of this file is gone
 query I
-SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM sys.extended_properties WHERE class = 3 AND major_id = SCHEMA_ID(''dbo'') AND name = ''mssql_ducklake_shape''');
+SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM sys.extended_properties WHERE class = 1 AND major_id = OBJECT_ID(''dbo.ducklake_metadata'') AND minor_id = 0 AND name = ''mssql_ducklake_shape''');
 ----
 2
+
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.extended_properties WHERE class = 3 AND major_id = SCHEMA_ID(''dbo'') AND name = ''mssql_ducklake_shape''');
+----
+0
 
 # A catalog shaped by an OLDER build is brought up to the current shape on attach. It was not: the
 # marker used to be the presence of one constraint, which answers "some build shaped this" - so a
 # catalog with the wrong column types and missing indexes read as current and was left alone. Here
 # the stamp is removed and a column put back the way DuckLake declares it, as an older build left it.
 statement ok
-SELECT mssql_exec('srv', 'EXEC sp_dropextendedproperty @name = N''mssql_ducklake_shape'', @level0type = N''SCHEMA'', @level0name = N''dbo'';
+SELECT mssql_exec('srv', 'EXEC sp_dropextendedproperty @name = N''mssql_ducklake_shape'', @level0type = N''SCHEMA'', @level0name = N''dbo'', @level1type = N''TABLE'', @level1name = N''ducklake_metadata'';
 DROP INDEX ix_ducklake_file_partition_value_lookup ON dbo.ducklake_file_partition_value;
 ALTER TABLE dbo.ducklake_file_partition_value ALTER COLUMN partition_value NVARCHAR(MAX) NULL;');
 
