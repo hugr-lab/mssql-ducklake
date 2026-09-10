@@ -144,8 +144,10 @@ that stays at 5x (`partitioned_commits`, 25 files a commit). A staging branch of
 large inserts would live exactly until that bump; not built.
 
 **D6 — what this does to specs/005.** The `#temp` staging path stays as it is — off by default,
-for commits of many data files where bulk loads beat literals. With the batch in one call, its
-threshold moves; re-measured in the same bench run.
+for commits of many data files where bulk loads beat literals, and still passing its suite
+(`make test-integration-fast-path`, strict). Its threshold of sixteen files (005 D7) was measured
+against the DML path this spec replaces, so it is optimistic now; not re-measured here — with the
+appender becoming bulk loads on the 2.0 line (D5) the path's future is a bump away.
 
 ## Enforcement & security
 
@@ -209,4 +211,4 @@ threshold moves; re-measured in the same bench run.
 ## Follow-ups
 
 - After the 2.0 bump the extension can call `sp_executesql`; nothing here depends on it.
-- If the appender goes off (D5), specs/006 D1's decision is superseded and says so.
+- specs/005's threshold, re-measured against this batch if the staging path is kept past the 2.0 bump.
