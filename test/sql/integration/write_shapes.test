@@ -1,0 +1,272 @@
+# name: test/sql/integration/write_shapes.test
+# description: Every write DuckLake can make, through the commit batch's T-SQL run (specs/014)
+# group: [integration]
+
+# The workload of design 003 as a test: every literal kind DuckLake writes into a catalog
+# statement, every family of statement the batch carries - inlined and file-backed inserts, UPDATE,
+# DELETE, MERGE, every ALTER, renames, views, macros, tags, partitioning, sort keys, CREATE TABLE
+# AS, a multi-statement transaction, flush, expire, merge-adjacent, cleanup, drops. `make
+# test-integration` runs it with MSSQL_DUCKLAKE_STRICT_BATCH=1, so a statement the rewrite does not
+# recognise fails here naming itself, and the lake's answers say the rewrite did what DuckLake's own
+# SQL does. Its catalog lives in a schema of its own, made and dropped here, so attach_mssql.test's
+# per-schema counts are not disturbed.
+require-env MSSQL_DUCKLAKE_TEST_DSN
+
+require parquet
+
+statement ok
+SET autoload_known_extensions = false;
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
+
+statement ok
+ATTACH '${MSSQL_DUCKLAKE_TEST_DSN}' AS srv (TYPE mssql);
+
+# a schema of its own, fresh: a run that died leaves it populated, and DROP SCHEMA refuses that
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''write_shapes'';
+EXEC sp_executesql @sql;
+IF SCHEMA_ID(''write_shapes'') IS NULL EXEC(''CREATE SCHEMA write_shapes'');');
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/write_shapes', METADATA_SCHEMA 'write_shapes');
+
+statement ok
+CREATE SCHEMA lake.s1;
+
+# every inlined type: the ones SQL Server holds natively and the ones stored as text
+statement ok
+CREATE TABLE lake.s1.t(id BIGINT, b BOOLEAN, ti TINYINT, si SMALLINT, i INTEGER, ui UINTEGER, ub UBIGINT, h HUGEINT, f FLOAT, d DOUBLE, dec DECIMAL(18, 3), v VARCHAR, bl BLOB, dt DATE, tm TIME, ts TIMESTAMP, tsn TIMESTAMP_NS, tz TIMESTAMPTZ, u UUID, iv INTERVAL, st STRUCT(a INTEGER, b VARCHAR), li INTEGER[], mp MAP(VARCHAR, INTEGER));
+
+statement ok
+INSERT INTO lake.s1.t VALUES (1, true, -1, 2, 3, 4, 5, 6, 'nan'::FLOAT, 1.5, 12.345, 'it''s ünïcode — 日本', '\xDE\xAD'::BLOB, DATE '2026-01-02', TIME '12:34:56.123456', TIMESTAMP '2026-01-02 03:04:05.123456', TIMESTAMP_NS '2026-01-02 03:04:05.123456789', TIMESTAMPTZ '2026-01-02 03:04:05+02', '01234567-89ab-cdef-0123-456789abcdef'::UUID, INTERVAL 1 DAY, {'a': 1, 'b': 'x'}, [1, 2], MAP {'k': 1});
+
+statement ok
+INSERT INTO lake.s1.t (id, v) VALUES (2, NULL), (3, 'three');
+
+# the strings, the unicode and the quote survive the round trip through the catalog's stats and
+# the inlined table
+query IIII
+SELECT id, v, b, isnan(f) FROM lake.s1.t ORDER BY id;
+----
+1	it's ünïcode — 日本	true	true
+2	NULL	NULL	NULL
+3	three	NULL	NULL
+
+query I
+SELECT max_value FROM mssql_scan('srv', 'SELECT max_value FROM write_shapes.ducklake_table_column_stats WHERE table_id = 2 AND column_id = 12');
+----
+three
+
+# past the inlining limit: a data file
+statement ok
+INSERT INTO lake.s1.t (id, v, dt) SELECT i, 'row' || i, DATE '2026-01-01' + i::INTEGER FROM range(100, 200) r(i);
+
+statement ok
+UPDATE lake.s1.t SET v = 'two' WHERE id = 2;
+
+statement ok
+UPDATE lake.s1.t SET v = 'updated' WHERE id BETWEEN 150 AND 160;
+
+statement ok
+DELETE FROM lake.s1.t WHERE id = 3;
+
+statement ok
+DELETE FROM lake.s1.t WHERE id > 190;
+
+query III
+SELECT count(*), count(*) FILTER (WHERE v = 'updated'), max(id) FROM lake.s1.t;
+----
+93	11	190
+
+statement ok
+CREATE TABLE lake.s1.src(id BIGINT, v VARCHAR);
+
+statement ok
+INSERT INTO lake.s1.src VALUES (2, 'merged'), (999, 'new');
+
+statement ok
+MERGE INTO lake.s1.t USING lake.s1.src ON t.id = src.id WHEN MATCHED THEN UPDATE SET v = src.v WHEN NOT MATCHED THEN INSERT (id, v) VALUES (src.id, src.v);
+
+query II
+SELECT id, v FROM lake.s1.t WHERE id IN (2, 999) ORDER BY id;
+----
+2	merged
+999	new
+
+# every ALTER
+statement ok
+ALTER TABLE lake.s1.t ADD COLUMN extra VARCHAR DEFAULT 'dflt';
+
+statement ok
+ALTER TABLE lake.s1.t RENAME COLUMN extra TO extra2;
+
+statement ok
+ALTER TABLE lake.s1.t DROP COLUMN extra2;
+
+statement ok
+ALTER TABLE lake.s1.t ALTER COLUMN i SET DEFAULT 7;
+
+statement ok
+ALTER TABLE lake.s1.src RENAME TO src2;
+
+query I
+SELECT count(*) FROM lake.s1.src2;
+----
+2
+
+# tags, a view, a macro
+statement ok
+COMMENT ON TABLE lake.s1.t IS 'a table comment';
+
+statement ok
+COMMENT ON COLUMN lake.s1.t.v IS 'a column comment';
+
+statement ok
+COMMENT ON TABLE lake.s1.t IS 'a table comment, again';
+
+query I
+SELECT comment FROM duckdb_tables() WHERE database_name = 'lake' AND table_name = 't';
+----
+a table comment, again
+
+statement ok
+CREATE VIEW lake.s1.vw AS SELECT id, v FROM lake.s1.t;
+
+query I
+SELECT count(*) FROM lake.s1.vw;
+----
+94
+
+statement ok
+DROP VIEW lake.s1.vw;
+
+statement ok
+CREATE MACRO lake.s1.plus1(x) AS x + 1;
+
+query I
+SELECT lake.s1.plus1(41);
+----
+42
+
+statement ok
+DROP MACRO lake.s1.plus1;
+
+# partitioning and sort keys, then commits under them
+statement ok
+CREATE TABLE lake.s1.p(id BIGINT, day DATE, v VARCHAR);
+
+statement ok
+ALTER TABLE lake.s1.p SET PARTITIONED BY (day);
+
+statement ok
+ALTER TABLE lake.s1.p SET SORTED BY (id);
+
+statement ok
+INSERT INTO lake.s1.p SELECT i, DATE '2026-01-01' + (i % 3)::INTEGER, 'v' || i FROM range(50) r(i);
+
+statement ok
+INSERT INTO lake.s1.p SELECT i, DATE '2026-02-01', 'w' || i FROM range(50) r(i);
+
+query II
+SELECT count(*), count(DISTINCT day) FROM lake.s1.p;
+----
+100	4
+
+query I
+SELECT count(*) FROM lake.s1.p WHERE day = DATE '2026-01-02';
+----
+17
+
+# CREATE TABLE AS under the inlining limit: the table and its rows in one commit
+statement ok
+CREATE TABLE lake.s1.ctas AS SELECT 1 AS a, 'x' AS b;
+
+# several statements in one commit
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+INSERT INTO lake.s1.t (id, v) VALUES (4, 'four');
+
+statement ok
+UPDATE lake.s1.t SET v = 'four!' WHERE id = 4;
+
+statement ok
+CREATE TABLE lake.s1.intx(a INTEGER);
+
+statement ok
+INSERT INTO lake.s1.intx VALUES (1);
+
+statement ok
+COMMIT;
+
+query II
+SELECT (SELECT v FROM lake.s1.t WHERE id = 4), (SELECT count(*) FROM lake.s1.intx);
+----
+four!	1
+
+# time travel still answers from the catalog the rewrite wrote
+query I
+SELECT count(*) FROM lake.s1.t AT (VERSION => 4);
+----
+3
+
+# the maintenance functions: flush, merge, expire, cleanup
+statement ok
+SELECT count(*) FROM ducklake_flush_inlined_data('lake');
+
+query I
+SELECT count(*) FROM lake.s1.t;
+----
+95
+
+statement ok
+SELECT count(*) FROM ducklake_merge_adjacent_files('lake');
+
+statement ok
+SELECT count(*) FROM ducklake_expire_snapshots('lake', older_than => now());
+
+statement ok
+SELECT count(*) FROM ducklake_cleanup_old_files('lake', cleanup_all => true);
+
+query I
+SELECT count(*) FROM lake.s1.t;
+----
+95
+
+# drops, and the schema with everything left in it
+statement ok
+DROP TABLE lake.s1.ctas;
+
+statement ok
+DROP TABLE lake.s1.intx;
+
+statement ok
+DROP SCHEMA lake.s1 CASCADE;
+
+# the tables are gone from the schema; ducklake_table_info keeps listing what the snapshots knew
+query II
+SELECT (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lake' AND schema_name = 's1'), (SELECT count(*) FROM ducklake_table_info('lake'));
+----
+0	6
+
+statement ok
+DETACH lake;
+
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''write_shapes'';
+EXEC sp_executesql @sql; DROP SCHEMA write_shapes;');
+
+statement ok
+DETACH srv;

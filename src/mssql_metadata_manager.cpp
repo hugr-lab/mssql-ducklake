@@ -22,6 +22,10 @@ constexpr const char *MSSQLMetadataManager::SHAPE_VERSION_PROPERTY;
 MSSQLMetadataManager::MSSQLMetadataManager(DuckLakeTransaction &transaction) : DuckLakeMetadataManager(transaction) {
 }
 
+bool MSSQLMetadataManager::SupportsAppender() const {
+	return !AppenderDisabled();
+}
+
 //===--------------------------------------------------------------------===//
 // The inlining type matrix (specs/004 D4)
 //===--------------------------------------------------------------------===//

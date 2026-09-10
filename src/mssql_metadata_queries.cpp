@@ -130,62 +130,8 @@ ORDER BY table_id'))";
 
 } // namespace
 
-//! The DDL DuckLake's commit loop writes into the batch for a new inlined deletion table, verbatim
-//! from WriteNewInlinedFileDeletesSqlBatch - matched exactly, the way the conflict check is
-//! (specs/007), and guarded at attach the same way. Between the two halves sits the table id.
-constexpr const char *INLINED_DELETE_DDL_HEAD =
-    "CREATE TABLE IF NOT EXISTS {METADATA_CATALOG}.ducklake_inlined_delete_";
-constexpr const char *INLINED_DELETE_DDL_TAIL = "(file_id BIGINT, row_id BIGINT, begin_snapshot BIGINT);\n";
-
-bool InlinedDeletionDdlIsDuckLakes() {
-	DuckLakeInlinedFileDeletionInfo probe;
-	probe.table_id = TableIndex(7);
-	vector<DuckLakeInlinedFileDeletionInfo> one;
-	one.push_back(std::move(probe));
-	auto generated = DuckLakeMetadataManager::WriteNewInlinedFileDeletesSqlBatch(one);
-	return StringUtil::StartsWith(generated, string(INLINED_DELETE_DDL_HEAD) + "7" + INLINED_DELETE_DDL_TAIL);
-}
-
 bool ConflictCheckQueryIsDuckLakes() {
 	return DuckLakeMetadataManager::GetSnapshotAndStatsAndChangesQuery() == DUCKLAKE_CONFLICT_CHECK_QUERY;
-}
-
-unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot, string &query) {
-	// The commit loop puts `CREATE TABLE IF NOT EXISTS ducklake_inlined_delete_<t>(...)` into the
-	// batch the first time a table's file-backed rows are deleted inline (the base's
-	// WriteNewInlinedFileDeletesSqlBatch; on this pin the loop calls that static directly, so the
-	// virtual around it is never asked). Run as DuckDB DDL inside the transaction that makes a
-	// keyless table, and the flush that later DELETEs from it is refused: "UPDATE/DELETE requires a
-	// table with a primary key". So the statement is taken out of the batch here and the table is
-	// created the manager's way - keyed, in autocommit, and made known to the extension before the
-	// INSERT that follows it in the same batch (specs/006 D5b). A DDL that is not exactly this text
-	// is left to the base; the attach-time guard says when that starts happening.
-	const string head = INLINED_DELETE_DDL_HEAD;
-	const string tail = INLINED_DELETE_DDL_TAIL;
-	idx_t pos = 0;
-	while ((pos = query.find(head, pos)) != string::npos) {
-		auto digits = pos + head.size();
-		auto digits_end = digits;
-		while (digits_end < query.size() && StringUtil::CharacterIsDigit(query[digits_end])) {
-			digits_end++;
-		}
-		if (digits_end == digits || query.compare(digits_end, tail.size(), tail) != 0) {
-			pos = digits;
-			continue;
-		}
-		// The loop writes this DDL into EVERY batch that deletes inline from the table - the static
-		// that builds it cannot know the table exists - so the catalog-level cache decides whether
-		// there is anything to do. The manager's table is committed the moment it is created, which
-		// is why it can be recorded as existing at once, unlike the base's transactional one.
-		auto table_id = TableIndex(std::stoull(query.substr(digits, digits_end - digits)));
-		auto &catalog = transaction.GetCatalog();
-		if (catalog.CheckInlinedDeletionTableCache(table_id, snapshot) != InlinedDeletionCacheResult::EXISTS) {
-			CreateInlinedDeletionTable(InlinedFileDeletionTableName(table_id));
-			catalog.CacheInlinedDeletionTableResult(table_id, snapshot, true);
-		}
-		query.erase(pos, digits_end + tail.size() - pos);
-	}
-	return DuckLakeMetadataManager::Execute(snapshot, query);
 }
 
 void MSSQLMetadataManager::CreateInlinedDeletionTable(const string &table_name) {

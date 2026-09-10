@@ -12,14 +12,21 @@ work against a SQL Server catalog. This page is what is specific to it.
 
 ### How a commit reaches the server
 
-DuckLake generates its commit as DuckDB SQL against the attached catalog, and that is how it runs:
-statement by statement through the mssql extension's `INSERT`, `UPDATE` and `DELETE` operators, on
-the transaction's pinned connection, with the primary keys the [shaping](./catalog/shaping.md)
-added making the updates possible. A commit's data-file rows, statistics and partition values go
-through DuckLake's appender the same way. Nothing is transpiled; the only T-SQL the manager writes
-itself is DDL and a few reads. The cost is round trips — about 19 per commit, and a scan of the
-per-column statistics table for the commit's stats update — which is where the remaining gap to
-the PostgreSQL backend sits ([Performance](./performance.md)).
+DuckLake assembles a commit as one batch of DuckDB SQL — inserts into its catalog tables, the
+stats update, the deletes of a drop or an expiry — and hands it to the manager. The manager knows
+every statement that batch can carry: a closed list captured off every write DuckLake can make
+(the repository's design notes), each recognised **exactly** and sent as the manager's own T-SQL,
+contiguous runs in one call on the transaction's connection. Nothing is translated: a statement
+matches to the character, with its literals where the template says literals go, or it is left
+to DuckDB's own path through the mssql extension's DML operators. Two statements are: the
+`INSERT` of a user's inlined rows — their values are the user's, in every DuckDB literal form — and
+anything a future DuckLake writes that the list does not have, which then runs correctly, slower.
+The primary keys the [shaping](./catalog/shaping.md) adds are what make that fallback path
+work at all; the T-SQL path is what makes a commit one round trip instead of ~19.
+
+A commit's data-file rows, statistics and partition values go through DuckLake's appender by
+default (`MSSQL_DUCKLAKE_NO_APPENDER=1` puts them in the batch instead;
+[Performance](./performance.md) has both measured).
 
 ### Inlining and types
 

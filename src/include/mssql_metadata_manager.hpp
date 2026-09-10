@@ -34,9 +34,7 @@ public:
 	//! helper, one `ducklake_table` and one `ducklake_schema` query PER FILE, where the appender
 	//! goes through the manager's cached one. Round trips per commit stop growing with its size -
 	//! 65 flat against 2065 for a thousand data files, and 1.7x faster at that size.
-	bool SupportsAppender() const override {
-		return true;
-	}
+	bool SupportsAppender() const override;
 	//! SQL Server sysname is 128 characters
 	idx_t MaxIdentifierLength() const override {
 		return 128;
@@ -128,6 +126,10 @@ private:
 	//! the mssql extension at once - shared by the Execute seam and the create path of
 	//! GetInlinedDeletionTableName (specs/006 D5b).
 	void CreateInlinedDeletionTable(const string &table_name);
+	//! One run of the commit batch's T-SQL, on the transaction's connection; the result carries an
+	//! error the way the base's Execute does, so the commit loop's retry and rollback see the same
+	//! thing (specs/014 D3).
+	unique_ptr<QueryResult> RunCommitBatch(const string &tsql);
 	//! The T-SQL column type for an inlined column, from the matrix.
 	string TSQLColumnType(const LogicalType &type) const;
 	//! Keys, indexes and collations, written so that running them twice is a no-op.

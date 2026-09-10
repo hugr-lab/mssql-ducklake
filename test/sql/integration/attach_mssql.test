@@ -711,7 +711,7 @@ SELECT count(*) FROM second.t;
 
 # both schemas, the same seven indexes each
 query II
-SELECT s, n FROM mssql_scan('srv', 'SELECT s.name AS s, COUNT(*) AS n FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE i.name LIKE ''ix_ducklake%'' GROUP BY s.name ORDER BY s.name') ORDER BY s;
+SELECT s, n FROM mssql_scan('srv', 'SELECT s.name AS s, COUNT(*) AS n FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE i.name LIKE ''ix_ducklake%'' AND s.name IN (''dbo'', ''lake_second'') GROUP BY s.name ORDER BY s.name') ORDER BY s;
 ----
 dbo	7
 lake_second	7
