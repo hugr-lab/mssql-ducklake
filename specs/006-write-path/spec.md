@@ -261,6 +261,36 @@ schema-wide clear at that point is not — the table is created *outside* the tr
 metadata read, on its own connection, to wait on. The name is still recorded, so DuckLake's own clear
 stays the cheap targeted one; the repeat costs a single round trip.
 
+### D5b — the inlined deletion table had the same defect, on a path no test reached
+
+Found on 2026-09-10 by the write-shapes capture that opened specs/014: a flush after an inlined
+deletion of file-backed rows fails with `Failed to delete inlined file deletions after flush:
+MSSQL: UPDATE/DELETE requires a table with a primary key. Table 'dbo.ducklake_inlined_delete_2'
+has no primary key.` The table that holds inlined deletions of file rows,
+`ducklake_inlined_delete_<table>`, is created by DuckLake's commit loop with a `CREATE TABLE IF NOT
+EXISTS` **written into the commit batch** — `WriteNewInlinedFileDeletesSqlBatch`, a static the loop
+calls directly on this pin, so the virtual `WriteNewInlinedFileDeletes` around it (and the manager's
+override of `GetInlinedDeletionTableName(…, create)`, specs/008) is never asked. Run as DuckDB DDL
+inside the transaction that makes a keyless table, and the flush's `DELETE FROM … WHERE
+begin_snapshot <= n` is refused. The suite's only deletion up to then was of inlined rows, which
+takes another path.
+
+The fix is D5's, at the one seam that sees the statement: the manager now overrides `Execute`, and
+before handing the batch to the base takes out every statement that is exactly the base's text —
+`CREATE TABLE IF NOT EXISTS {METADATA_CATALOG}.ducklake_inlined_delete_<n>(file_id BIGINT, row_id
+BIGINT, begin_snapshot BIGINT);` — and creates that table itself: keyed on
+`(file_id, row_id, begin_snapshot)`, in autocommit on its own connection, with the one-table cache
+refresh, so the `INSERT` that follows in the same batch finds it. Matched verbatim and guarded at
+attach like the conflict check (specs/007): a ducklake bump that changes the text fails the attach
+rather than quietly creating keyless tables again. Catalogs an earlier build left with keyless
+deletion tables are keyed by the shaping on their next attach (`SHAPE_VERSION` 4, specs/012's
+mechanism). Tests: a file-backed table, two rows deleted inline, the key visible, the flush
+succeeding; then the key dropped with the stamp to stand in for an older build, the next attach
+keying it again, and a second deletion and flush through it.
+
+This is also the first statement the manager replaces inside the commit batch, and the seam
+specs/014 builds on.
+
 ## Enforcement & security
 
 Unchanged from specs/005: rows travel as **data**, never as statement text the server has to parse as

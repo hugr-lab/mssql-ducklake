@@ -49,7 +49,8 @@ manager creates with T-SQL types: `BIT`, `SMALLINT`, `INT`, `BIGINT`, `DECIMAL(p
 `TIME(6)`, `DATETIME2(…)`, `DATETIMEOFFSET(6)`, `UNIQUEIDENTIFIER`, `VARBINARY(MAX)` — and
 `VARCHAR(MAX)` for what SQL Server cannot hold exactly ([Writing](../writing.md#inlining-and-types)).
 Each has a primary key on `(row_id, begin_snapshot)`, so DuckLake's inlined `UPDATE` and `DELETE`
-work. The table is created in the commit that creates the lake table, outside the transaction, so
+work; the `ducklake_inlined_delete_<table>` tables that hold inlined deletions of file-backed rows
+are keyed on `(file_id, row_id, begin_snapshot)` the same way, so a flush can clear them. The table is created in the commit that creates the lake table, outside the transaction, so
 that the mssql extension's metadata cache can see it before the first `INSERT` needs it.
 
 ### Forced parameterization
