@@ -47,6 +47,10 @@ catalog's database (`SELECT is_parameterization_forced FROM sys.databases WHERE 
 through `mssql_scan`); if it is 0 the shaping could not set it. [Performance](../performance.md)
 has the numbers.
 
+**Which versions are loaded** — `SELECT mssql_ducklake_version(), mssql_version();` gives both
+extensions' release versions; `SELECT extension_name, extension_version FROM duckdb_extensions()`
+the builds' git hashes.
+
 **Seeing what the manager does** — `MSSQL_DEBUG=1` on the process prints every batch the mssql
 extension sends, and the DuckLake metadata log (`enabled_log_types = 'DuckLakeMetadata'`) records
 every catalog query with its time; `make metadata-log WORKLOAD=…` aggregates them.

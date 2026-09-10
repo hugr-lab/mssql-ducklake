@@ -59,6 +59,12 @@ site for the rest; the stale status paragraph is gone. CLAUDE.md lists `website/
 and the build in the commands, and states the two rules: relative links only, and the release-time
 snapshot.
 
+**D6 — a version a user can ask for.** `mssql_ducklake_version()` existed but answered the
+build's git hash; it now answers the release version — a constant in `CMakeLists.txt`
+(`0.1.0-dev` until the release commit drops the suffix), the way `mssql_version()` does for the
+mssql extension — while `duckdb_extensions().extension_version` keeps the hash. The unit test pins
+the shape rather than the value, so a release does not have to touch it.
+
 ## Enforcement & security
 
 Nothing runs against a server. The Pages deploy has `pages: write` and `id-token: write` and runs

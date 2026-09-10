@@ -27,8 +27,15 @@ extern "C" void ducklake_duckdb_cpp_init(duckdb::ExtensionLoader &loader);
 namespace duckdb {
 namespace {
 
+//! The release version, the way mssql_version() answers for the mssql extension: the constant
+//! CMakeLists.txt carries and the release commit bumps. DuckDB's own extension_version (the git hash
+//! of the build) stays what Version() returns, for duckdb_extensions().
 void MssqlDucklakeVersionFun(DataChunk &args, ExpressionState &state, Vector &result) {
+#ifdef MSSQL_DUCKLAKE_VERSION
+	result.Reference(Value(MSSQL_DUCKLAKE_VERSION));
+#else
 	result.Reference(Value(MssqlDucklakeExtension().Version()));
+#endif
 }
 
 void LoadInternal(ExtensionLoader &loader) {

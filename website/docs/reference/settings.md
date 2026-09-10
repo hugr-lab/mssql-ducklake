@@ -24,7 +24,7 @@ connections; see the [mssql extension's reference](https://hugr-lab.github.io/ms
 
 | function | returns |
 | --- | --- |
-| `mssql_ducklake_version()` | the extension's version string |
+| `mssql_ducklake_version()` | the extension's release version — `0.1.0-dev` until the first release; the same idea as the mssql extension's `mssql_version()`. `duckdb_extensions()` shows the build's git hash instead. |
 
 Everything else is DuckLake's: `ducklake_snapshots()`, `ducklake_table_info()`,
 `ducklake_table_changes()`, `ducklake_flush_inlined_data()`, `ducklake_expire_snapshots()`,
