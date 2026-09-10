@@ -1,6 +1,6 @@
 # Spec 011: the first release — v0.1.0 on the v1.5.5 line
 
-- **Status**: implemented (the tag and the community-extensions PR follow the merge)
+- **Status**: implemented (v0.1.0 tagged 2026-09-10; duckdb/community-extensions#2683)
 - **Date**: 2026-09-10
 - **Author**: VGSML
 
@@ -45,6 +45,12 @@ gitignored — nothing is committed for a release's docs, the tag *is* the snaps
 release serves at the root, the live docs as *Next* with the unreleased banner, and a published
 release triggers the deploy (`release: published`), so the site changes the moment the release
 exists. Verified locally with a temporary tag: the snapshot, the dropdown, the build.
+
+**D2b — what v0.1.0 taught.** The release's own event did not deploy the site: a GitHub
+release created with the workflow's `GITHUB_TOKEN` is an event made by that token, and events
+made by it start no workflows — `release: published` never fired. The push of the tag is the
+user's event and does; `pages.yml` now runs on `v*` tags (and on demand), and the release trigger
+is gone. The v0.1.0 deploy was dispatched by hand.
 
 **D3 — the version.** `MSSQL_DUCKLAKE_VERSION` is `0.1.0` in this commit; `description.yml` says
 `0.1.0` and `ref: v0.1.0`; the guard holds them together. After the release the constant goes to

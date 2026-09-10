@@ -6,7 +6,7 @@ set(TARGET_NAME mssql_ducklake)
 # a constant, not the git hash DuckDB puts in duckdb_extensions().extension_version. The release
 # commit sets it to the tag's version and release.yml refuses a tag that disagrees; the commit
 # after a release bumps it to the next version with "-dev" (specs/011).
-set(MSSQL_DUCKLAKE_VERSION "0.1.0")
+set(MSSQL_DUCKLAKE_VERSION "0.2.0-dev")
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)

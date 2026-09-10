@@ -615,31 +615,62 @@ unique_ptr<QueryResult> MSSQLMetadataManager::RunCommitBatch(const string &tsql)
 }
 
 unique_ptr<QueryResult> MSSQLMetadataManager::TryRewriteWrite(DuckLakeSnapshot snapshot, const string &query) {
-	// Not every write is in the commit batch: the expiry and the cleanup DELETE from a dozen tables
-	// through Query, one statement at a time, and the flush DELETEs the rows it moved to files. On
-	// the base path each is a scan of the table through the extension's DML operator plus the
-	// DELETE by row identity - and on linux_amd64 the composite-key row identity of ducklake_tag
-	// came back as invalid unicode (CI, specs/014 D3c). The statements are the batch's own
-	// families, so they take the batch's path: one T-SQL statement, one round trip.
 	if (!BatchRewriteEnabled()) {
 		return nullptr;
 	}
 	string statement = query;
 	SubstituteSnapshotPlaceholders(snapshot, statement);
-	StringUtil::Trim(statement);
-	while (!statement.empty() && statement.back() == ';') {
-		statement.pop_back();
-		StringUtil::Trim(statement);
+	return RewriteWriteStatement(std::move(statement));
+}
+
+unique_ptr<QueryResult> MSSQLMetadataManager::TryRewriteWrite(const string &query) {
+	// Query(string &) substitutes no snapshot, so a statement on this path carries no snapshot
+	// placeholder by contract; one that does is not ours to guess at
+	if (!BatchRewriteEnabled() || query.find("{SNAPSHOT_ID}") != string::npos ||
+	    query.find("{SCHEMA_VERSION}") != string::npos || query.find("{NEXT_") != string::npos) {
+		return nullptr;
 	}
-	const string update_head = string("UPDATE ") + CATALOG_PREFIX;
-	const string delete_head = string("DELETE FROM ") + CATALOG_PREFIX;
-	if (!StringUtil::StartsWith(statement, update_head) && !StringUtil::StartsWith(statement, delete_head)) {
+	return RewriteWriteStatement(query);
+}
+
+unique_ptr<QueryResult> MSSQLMetadataManager::RewriteWriteStatement(string query) {
+	// Not every write is in the commit batch: the expiry and the cleanup DELETE from a dozen tables
+	// through Query, one statement at a time, the flush DELETEs the rows it moved to files, and the
+	// drop of superseded inlined tables sends several DELETEs and DROPs in one string. On the base
+	// path each DELETE is a scan of the table through the extension's DML operator plus the DELETE
+	// by row identity - and on linux_amd64 the composite-key row identity of ducklake_tag came back
+	// as invalid unicode, not every time (CI, specs/014 D3c). The statements are the batch's own
+	// families, so they take the batch's path: one T-SQL run, one round trip. A query with a
+	// statement that is not a write at all is a read and goes to the base whole.
+	const auto statements = SplitStatements(query);
+	if (statements.empty()) {
 		return nullptr;
 	}
 	const auto schema = SchemaIdentifier();
-	string tsql;
-	if (!RewriteUpdate(statement, schema, tsql) && !RewriteDelete(statement, schema, tsql) &&
-	    !RewriteCteUpdate(statement, schema, tsql)) {
+	const string update_head = string("UPDATE ") + CATALOG_PREFIX;
+	const string delete_head = string("DELETE FROM ") + CATALOG_PREFIX;
+	const string drop_head = string("DROP TABLE IF EXISTS ") + CATALOG_PREFIX;
+	string run;
+	vector<string> dropped_in_run;
+	for (auto &statement : statements) {
+		// a CTE is a write only when an UPDATE follows it; DuckLake's stats reads are CTEs too
+		const bool cte_update =
+		    StringUtil::StartsWith(statement, "WITH ") && statement.find(update_head) != string::npos;
+		if (!StringUtil::StartsWith(statement, update_head) && !StringUtil::StartsWith(statement, delete_head) &&
+		    !StringUtil::StartsWith(statement, drop_head) && !cte_update) {
+			return nullptr;
+		}
+		string tsql, dropped;
+		if (RewriteUpdate(statement, schema, tsql) || RewriteDelete(statement, schema, tsql) ||
+		    RewriteCteUpdate(statement, schema, tsql)) {
+			run += tsql + "\n";
+			continue;
+		}
+		if (RewriteDropIfExists(statement, schema, tsql, dropped)) {
+			run += tsql + "\n";
+			dropped_in_run.push_back(dropped);
+			continue;
+		}
 		if (StrictBatchEnabled()) {
 			throw InvalidInputException(
 			    "mssql_ducklake: a write DuckLake sent through Query that the T-SQL rewrite does not "
@@ -648,7 +679,13 @@ unique_ptr<QueryResult> MSSQLMetadataManager::TryRewriteWrite(DuckLakeSnapshot s
 		}
 		return nullptr;
 	}
-	return RunCommitBatch(tsql);
+	auto result = RunCommitBatch(run);
+	if (!result->HasError()) {
+		for (auto &table : dropped_in_run) {
+			InvalidateTableCache(table);
+		}
+	}
+	return result;
 }
 
 unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot, string &query) {
