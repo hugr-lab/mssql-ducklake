@@ -14,8 +14,8 @@ first execution compiles it: 28 – 37 ms for the metadata query, measured on th
 and waits for the 2.0 line; DuckLake's own literals have no such fix at all. The database has one
 for both: `ALTER DATABASE … SET PARAMETERIZATION FORCED`, after which the server parameterizes
 the literals itself and one plan serves every value. Measured on the 1000-table benchmark before any
-code was written: **937 s → 686 s**, the first write into each table three times faster, the first
-read after an attach five times.
+code was written: **937 s → 686 s**; on this build, both arms in one run, **698 vs 388 s** — the
+first write into each table two to three times faster, the first read after an attach four times.
 
 This spec makes shaping a catalog apply that option to the catalog's database — best-effort, once
 per shape version, with an opt-out — and bumps the shape version so that catalogs shaped by earlier
