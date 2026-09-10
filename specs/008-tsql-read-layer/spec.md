@@ -1,6 +1,6 @@
 # Spec 008: the T-SQL read layer — one probe through `mssql_scan`, and why not five
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-09-10
 - **Author**: VGSML
 
