@@ -25,8 +25,9 @@ Stated as limitations, with where each stands. The specs linked are in the
   unsigned 64-bit integers, intervals, enums, geometry and nested types are stored as text in the
   inlined-data tables — lossless, not filterable server-side ([Writing](../writing.md#inlining-and-types)).
   `VARIANT` columns are never inlined.
-- **A retried commit can leave an empty, unregistered `ducklake_inlined_data_*` table behind**;
-  harmless, and `ducklake_cleanup_old_files` does not remove it. A flush leaves the emptied inlined tables in place — DuckLake's behaviour on every
+- **A rolled-back commit can leave an empty `ducklake_inlined_data_*` or `ducklake_inlined_delete_*`
+  table behind** — they are created outside the transaction so that the commit can see them;
+  harmless, and `ducklake_cleanup_old_files` does not remove them. A flush leaves the emptied inlined tables in place — DuckLake's behaviour on every
   backend.
 - **`mssql_scan()` inside a transaction** must be the sole source of its query with mssql v0.2.5:
   a plan mixing it with a catalog scan fails depending on execution order. The manager follows the

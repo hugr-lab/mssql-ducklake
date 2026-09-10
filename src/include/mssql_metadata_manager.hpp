@@ -94,6 +94,10 @@ public:
 	//! goes to the base untouched. Both query texts are constants in the .cpp; nothing outside needs
 	//! them.
 	unique_ptr<QueryResult> Query(DuckLakeSnapshot snapshot, string &query) override;
+	//! The commit batch, with the one statement in it that is not DuckDB's to run: the DDL of a new
+	//! inlined deletion table, which the manager creates keyed and outside the transaction instead
+	//! (specs/006 D5b). Everything else in the batch goes to the base as it is.
+	unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string &query) override;
 
 	bool CanSkipSnapshotFetch(const TransactionChangeInformation &changes) const override;
 	void FlushChangesServerSide(DuckLakeTransaction &transaction, DuckLakeSnapshot transaction_snapshot,
@@ -120,6 +124,10 @@ private:
 	idx_t StageCommitLocally(DuckLakeTransaction &transaction, const DuckLakeSnapshot &snapshot,
 	                         const DuckLakeRetryConfig &retry_config);
 
+	//! The inlined deletion table for a lake table, keyed, created in autocommit and made known to
+	//! the mssql extension at once - shared by the Execute seam and the create path of
+	//! GetInlinedDeletionTableName (specs/006 D5b).
+	void CreateInlinedDeletionTable(const string &table_name);
 	//! The T-SQL column type for an inlined column, from the matrix.
 	string TSQLColumnType(const LogicalType &type) const;
 	//! Keys, indexes and collations, written so that running them twice is a no-op.
@@ -136,8 +144,9 @@ private:
 	//! an older build is brought up to it on the next attach instead of being left as it was. Starts
 	//! at 2 because 1 is implicitly every catalog shaped before this stamp existed: those carry no
 	//! property at all, read as older, and are converted once. 3 added forced parameterization of
-	//! the catalog's database (specs/012).
-	static constexpr int64_t SHAPE_VERSION = 3;
+	//! the catalog's database (specs/012); 4 keys the inlined deletion tables an older build left
+	//! keyless (specs/014).
+	static constexpr int64_t SHAPE_VERSION = 4;
 	//! Where that version is recorded: an extended property on the catalog's own ducklake_metadata
 	//! table - per catalog, invisible to DuckLake's queries, and gone the moment the catalog's
 	//! tables are, which is what makes a recreated catalog shape itself again.
