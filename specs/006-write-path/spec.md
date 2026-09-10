@@ -219,9 +219,15 @@ a LOB — the same query was 0.008s → 0.003s, so most of the win comes from bo
 exists, which answers *"some build of this extension shaped this catalog"*. A catalog shaped by an
 older build therefore read as current and never received new column types or indexes — every shape
 change to date would have reached new catalogs only. It now compares a version stamped in an extended
-property on the schema, written last, after the DDL that earns it. The upgrade path is a test: the
-stamp is removed and a column put back the way DuckLake declares it, and the next attach restores
-both.
+property, written last, after the DDL that earns it. The upgrade path is a test: the stamp is
+removed and a column put back the way DuckLake declares it, and the next attach restores both.
+
+*Corrected in specs/008:* this spec first put the stamp on the **schema**, and that lost a property
+the constraint marker had by construction — it died with the tables. A catalog dropped and recreated
+in the same schema, with the shaping failing partway (measured: behind the locks of a session being
+killed), kept the schema's stamp, and every later attach trusted it; the catalog stayed without keys
+until its first UPDATE failed. The stamp lives on `ducklake_metadata`, the catalog's own anchor table,
+since specs/008, and the shaping removes a schema-level leftover when it finds one.
 
 ### D5 — a table created and written in one commit was invisible to its own INSERT
 
