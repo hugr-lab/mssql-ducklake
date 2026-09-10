@@ -1,6 +1,6 @@
 # Spec 005: phase 2 — the commit as one call to the server
 
-- **Status**: draft
+- **Status**: implemented (phase 2 behind `MSSQL_DUCKLAKE_SERVER_COMMIT`; the commit batch itself is specs/014's)
 - **Date**: 2026-09-09
 - **Author**: VGSML
 - **Depends on**: [004](../004-manager-phase-1/spec.md) (the manager, and the measurement that motivates this)

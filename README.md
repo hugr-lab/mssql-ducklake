@@ -1,5 +1,11 @@
 # mssql_ducklake
 
+[![CI](https://github.com/hugr-lab/mssql-ducklake/actions/workflows/ci.yml/badge.svg)](https://github.com/hugr-lab/mssql-ducklake/actions/workflows/ci.yml)
+[![DuckDB](https://img.shields.io/static/v1?label=duckdb&message=v1.5.5&color=blue)](https://github.com/duckdb/duckdb/releases/tag/v1.5.5)
+[![Latest release](https://img.shields.io/github/v/release/hugr-lab/mssql-ducklake?label=release&color=blue)](https://github.com/hugr-lab/mssql-ducklake/releases/latest)
+[![Docs](https://img.shields.io/badge/docs-hugr--lab.github.io%2Fmssql--ducklake-1c7d78)](https://hugr-lab.github.io/mssql-ducklake/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **[DuckLake](https://ducklake.select) on Microsoft SQL Server** — a [DuckDB](https://duckdb.org)
 extension that embeds DuckLake and keeps its catalog in SQL Server or Azure SQL, speaking to the
 server through the [mssql extension](https://github.com/hugr-lab/mssql-extension). Everything
@@ -12,7 +18,7 @@ performance against the PostgreSQL backend, settings, limitations, troubleshooti
 
 ```sql
 INSTALL mssql FROM community;
-INSTALL mssql_ducklake FROM community;   -- from the first release on; until then, build from source
+INSTALL mssql_ducklake FROM community;
 LOAD mssql_ducklake;
 ATTACH 'ducklake:mssql:Server=host,1433;Database=lake_meta;User Id=…;Password=…' AS lake (DATA_PATH 's3://…');
 ```
@@ -23,7 +29,7 @@ ATTACH 'ducklake:mssql:Server=host,1433;Database=lake_meta;User Id=…;Password=
 > `mssql_ducklake` **before** the first `ATTACH 'ducklake:…'`, otherwise DuckDB autoloads the stock
 > extension for that prefix.
 
-**Status: experimental.** The first release, v0.1.0 on the DuckDB v1.5.5 line, is in preparation.
+**Status: experimental.** Released as v0.1.0 on the DuckDB v1.5.5 line.
 In place: the full DuckLake surface on a SQL Server catalog; DDL, inlined and file-backed writes,
 `UPDATE`, `DELETE`, `MERGE`; concurrent writers; a server-backed integration suite and a
 concurrency test in CI; a 1000-table benchmark against the PostgreSQL backend, at 1.5x of its total

@@ -39,14 +39,14 @@ specs are the shareable distillation of that work.
 | [001](001-bridge-extension/spec.md) | the bridge extension — DuckLake metadata on SQL Server | superseded by 002 |
 | [002](002-embedded-ducklake/spec.md) | the standalone extension — embedded ducklake + mssql manager | accepted |
 | [003](003-mssql-extension-v0.2.5/spec.md) | mssql-extension v0.2.5 — what the manager needs from the runtime pair | implemented (mssql v0.2.5) |
-| [004](004-manager-phase-1/spec.md) | the SQL Server metadata manager, phase 1 — parity with postgres | implemented (target missed, see Measured) |
-| [005](005-server-side-commit/spec.md) | phase 2 — the commit as one call to the server | draft |
+| [004](004-manager-phase-1/spec.md) | the SQL Server metadata manager, phase 1 — parity with postgres | implemented (the target reached by 012 and 014: 1.54x, commits at parity) |
+| [005](005-server-side-commit/spec.md) | phase 2 — the commit as one call to the server | implemented (behind `MSSQL_DUCKLAKE_SERVER_COMMIT`; superseded in practice by 014) |
 | [006](006-write-path/spec.md) | the write path — the appender, MERGE, and the catalog's own storage | implemented |
 | [007](007-concurrent-commit/spec.md) | concurrent commits — the conflict check that read one table twice | implemented |
 | [008](008-tsql-read-layer/spec.md) | the T-SQL read layer — one probe through `mssql_scan`, and why not five | implemented |
 | [009](009-inlined-first-write/spec.md) | the first inlined write is a plan compile per table | implemented (reconnaissance; mssql-extension#334) |
 | [010](010-manager-split/spec.md) | splitting the manager, and two documents that say the wrong thing | implemented |
-| [011](011-first-release/spec.md) | the first release — v0.1.0 on the v1.5.5 line, through community-extensions | draft |
+| [011](011-first-release/spec.md) | the first release — v0.1.0 on the v1.5.5 line, through community-extensions | implemented |
 | [012](012-forced-parameterization/spec.md) | forced parameterization on the catalog's database | implemented |
 | [013](013-docs-site/spec.md) | the documentation site | implemented |
 | [014](014-commit-batch-tsql/spec.md) | the commit batch as our T-SQL, statement by known statement | implemented |

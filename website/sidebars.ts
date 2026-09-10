@@ -18,6 +18,7 @@ const sidebars: SidebarsConfig = {
       items: ['reference/settings', 'reference/limitations', 'reference/troubleshooting'],
     },
     'versions',
+    'releases',
     'development',
   ],
 };

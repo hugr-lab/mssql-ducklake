@@ -28,6 +28,7 @@ extension moves to that line with a bump of all three pins.
 
 ### Documentation versions
 
-This site is versioned with the extension: the version dropdown serves the docs of the latest
-release, and the docs being written for the next one live under *Next*. Until the first release is
-snapshotted, the current docs are the only version.
+This site is versioned with the extension, from its tags: at every deploy the docs of each
+release tag are snapshotted as that version — the dropdown serves the latest release, and the docs
+being written for the next one live under *Next*. Nothing is committed for it; the tag is the
+snapshot ([Releases](./releases.md)).

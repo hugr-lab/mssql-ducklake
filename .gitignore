@@ -25,3 +25,7 @@ vcpkg_installed/
 website/node_modules/
 website/build/
 website/.docusaurus/
+# the released docs are snapshotted from the tags at deploy time (pages.yml), never committed
+website/versioned_docs/
+website/versioned_sidebars/
+website/versions.json
