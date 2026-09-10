@@ -134,7 +134,8 @@ rewrites anything else and the distribution's format check fails on it.
 - **Inlining is in scope**: DuckLake inlines small inserts into catalog tables (default limit 10);
   the manager owns the inlined-table DDL/types via the type hooks. The matrix and edge cases
   (FLOAT NaN, TIMESTAMP_NS, HUGEINT, STRUCT) are in the research note §5.
-- **Performance target: ≥ postgres backend.** Phase 1 parity (Execute passthrough,
+- **Performance target: ≥ postgres backend.** At 1.54x on the 1000-table bench with commits at
+  parity (spec 014); the plan was: phase 1 parity (Execute passthrough,
   `GetLatestSnapshotQuery` via `mssql_scan`, own `InitializeDuckLake` with PKs + indexes,
   `MaxIdentifierLength=128`); phase 2 beats it with a server-side `ducklake_commit` T-SQL
   procedure — data-only commits in one round trip with server-side retry. Research note §7 is the

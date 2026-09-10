@@ -1,6 +1,6 @@
 # Spec 014: the commit batch as our T-SQL, statement by known statement
 
-- **Status**: draft
+- **Status**: implemented
 - **Date**: 2026-09-10
 - **Author**: VGSML
 
@@ -130,11 +130,18 @@ integration suite and the write-shapes workload run with it on, so a ducklake bu
 shape fails the suite naming the statement, and the closed list is re-audited the way 007's and
 D5b's templates are. Off by default: a user's catalog keeps working through the base path, slower.
 
-**D5 — the appender.** With `SupportsAppender` true (specs/006) a commit's data-file rows,
-statistics and partition values bypass the batch and go through DuckDB's appender — one DML round
-trip per table. Off, they are `INSERT … VALUES` statements in the batch and this spec's rewrite
-sends them with everything else in one call. Measured both ways on the bench; the setting follows
-the numbers.
+**D5 — the appender stays on.** With `SupportsAppender` true (specs/006) a commit's data-file
+rows, statistics and partition values bypass the batch and go through DuckDB's appender — one DML
+round trip per table, its rows in `VALUES` chunks of a thousand. Off
+(`MSSQL_DUCKLAKE_NO_APPENDER=1`), they are `INSERT … VALUES` statements in the batch and this
+spec's rewrite sends them with everything else in one call. Measured both ways, the mssql arm of
+the 1000-table bench: off is slower on every phase it touches — `partitioned_commits` 33.0 against
+30.6, `flush_inlined` 262 against 239, `partitioned_merge_adjacent` 27.4 against 18.2, total 612
+against 578 — the round trips it saves cost less than the literal statements it compiles. And the
+mssql extension's *INSERT via BCP* (its spec 062) ships with its first release on the DuckDB 2.0
+line: the appender path becomes bulk loads with no code here, which is the cure for the phase
+that stays at 5x (`partitioned_commits`, 25 files a commit). A staging branch of the rewrite for
+large inserts would live exactly until that bump; not built.
 
 **D6 — what this does to specs/005.** The `#temp` staging path stays as it is — off by default,
 for commits of many data files where bulk loads beat literals. With the batch in one call, its
@@ -160,8 +167,29 @@ threshold moves; re-measured in the same bench run.
   at the end do.
 - The existing integration suite on both paths (strict on; `MSSQL_DUCKLAKE_SERVER_COMMIT=1`), `make
   test-concurrent` — the retry path through a T-SQL primary-key error.
-- `make bench-scale --tables 1000` before and after, both appender settings: the phases named in
-  the summary against postgres.
+- `make bench-scale --tables 1000` before and after, both arms in one run, the appender on:
+
+  | phase | before (012) | **after** | postgres | ratio |
+  | --- | ---: | ---: | ---: | ---: |
+  | `first_commits` | 29.1 | **16.7** | 5.8 | 2.9x |
+  | `second_commits` | 25.5 | **11.4** | 9.0 | **1.27x** |
+  | `deep_history` (1000 commits, one table) | 77.7 | **35.3** | 30.5 | **1.16x** |
+  | `merge_adjacent` | 34.2 | **3.4** | 22.4 | **0.15x** |
+  | `flush_inlined` | 248 | 240 | 150 | 1.6x |
+  | `partitioned_commits` | 31.9 | 30.7 | 6.1 | 5.0x |
+  | `partitioned_merge_adjacent` | 20.8 | 18.9 | 12.5 | 1.5x |
+  | `evolution` (100 schema changes) | 41.0 | 39.1 | 25.9 | 1.5x |
+  | `filtered_read` | 0.45 | 0.37 | 0.18 | 2.1x |
+  | **total** | **698** | **577** | **375** | **1.54x** |
+
+  The commit-bound phases are at or near parity: a file-backed commit costs 11.4 ms against
+  postgres's 9.0, a thousand commits into one table 35 s against 30, and the compaction that
+  rewrites file metadata for many files is six times faster than postgres, whose manager runs that
+  batch through a scanner. What stays: the first inlined write (2.9x — the inlined rows' `INSERT`
+  through the base path, one boundary in the batch, plus the table's first touch), the partitioned
+  commits (the appender's per-file rows, BCP on the 2.0 line), the flush (DuckLake's per-table
+  reads and file writes, 1.6x) and the reattach (three logins, specs/005 D8). Against postgres the
+  whole benchmark went 2.44x → 1.80x (specs/012) → **1.54x**.
 
 ## Alternatives considered
 
