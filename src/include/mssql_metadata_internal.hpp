@@ -17,7 +17,7 @@ inline string TSQLLiteral(const string &value) {
 	return "N'" + StringUtil::Replace(value, "'", "''") + "'";
 }
 
-//! The two switches phase 2 is behind while it is measured. Read once - getenv on every commit
+//! The switches phase 2 is behind while it is measured. Read once - getenv on every commit
 //! would be a syscall in the hot path.
 inline bool ServerCommitEnabled() {
 	static const bool enabled = getenv("MSSQL_DUCKLAKE_SERVER_COMMIT") != nullptr;

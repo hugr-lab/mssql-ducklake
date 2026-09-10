@@ -1,4 +1,5 @@
 #include "mssql_metadata_manager.hpp"
+#include "mssql_metadata_internal.hpp"
 
 #include "common/ducklake_types.hpp"
 #include "common/ducklake_util.hpp"
@@ -11,7 +12,6 @@
 #include "storage/ducklake_staged_commit.hpp"
 #include "storage/ducklake_transaction_changes.hpp"
 #include "storage/ducklake_transaction.hpp"
-#include "mssql_metadata_internal.hpp"
 
 namespace duckdb {
 
