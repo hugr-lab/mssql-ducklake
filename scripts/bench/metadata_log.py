@@ -41,7 +41,7 @@ LOAD = (
     "SET logging_level = 'debug';\n"
     "SET enabled_log_types = 'DuckLakeMetadata';\n"
 )
-DUMP = "\nSELECT '\\x1e' || message FROM duckdb_logs() WHERE type = 'DuckLakeMetadata';\n"
+DUMP = "\nSELECT chr(30) || message FROM duckdb_logs() WHERE type = 'DuckLakeMetadata';\n"
 MESSAGE = re.compile(r"'query': (?P<q>.*), 'elapsed_ms': (?P<ms>\d+)\}$", re.S)
 
 
@@ -78,7 +78,7 @@ def main() -> None:
     # the dump's rows carry a record separator so the log's own commas and newlines cannot split them
     parsed = []
     for chunk in proc.stdout.split("\x1e")[1:]:
-        text = chunk.strip().strip('"').replace('""', '"')
+        text = chunk.strip(' \n"').replace('""', '"')
         m = MESSAGE.search(text)
         if not m:
             continue
