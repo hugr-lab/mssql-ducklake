@@ -48,3 +48,4 @@ specs are the shareable distillation of that work.
 | [010](010-manager-split/spec.md) | splitting the manager, and two documents that say the wrong thing | implemented |
 | [011](011-first-release/spec.md) | the first release — v0.1.0 on the v1.5.5 line, through community-extensions | draft |
 | [012](012-forced-parameterization/spec.md) | forced parameterization on the catalog's database | implemented |
+| [013](013-docs-site/spec.md) | the documentation site | implemented |

@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.5)
 
 # Set extension name here
 set(TARGET_NAME mssql_ducklake)
+# The release version mssql_ducklake_version() answers, like the mssql extension's mssql_version():
+# a constant bumped in the release commit (specs/011), not the git hash DuckDB puts in
+# duckdb_extensions().extension_version. "-dev" until the tag that drops it.
+set(MSSQL_DUCKLAKE_VERSION "0.1.0-dev")
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
@@ -39,6 +43,9 @@ set(EXTENSION_SOURCES
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+
+target_compile_definitions(${EXTENSION_NAME} PRIVATE MSSQL_DUCKLAKE_VERSION="${MSSQL_DUCKLAKE_VERSION}")
+target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE MSSQL_DUCKLAKE_VERSION="${MSSQL_DUCKLAKE_VERSION}")
 
 if(TARGET roaring::roaring-headers)
   target_link_libraries(${EXTENSION_NAME} roaring::roaring roaring::roaring-headers

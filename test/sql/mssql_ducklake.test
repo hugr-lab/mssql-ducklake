@@ -14,8 +14,10 @@ LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';
 statement ok
 LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
 
+# the release version, a constant (CMakeLists.txt) rather than the build's git hash - "-dev" until
+# the release commit drops it (specs/011)
 query I
-SELECT mssql_ducklake_version() IS NOT NULL;
+SELECT regexp_matches(mssql_ducklake_version(), '^[0-9]+\.[0-9]+\.[0-9]+(-dev)?$');
 ----
 true
 
