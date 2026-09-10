@@ -223,6 +223,12 @@ void MSSQLMetadataManager::ProbeServerCapabilities() {
 	// concurrent-commit crash comes back - silently, in a path only concurrent writers reach. So the
 	// mismatch is made loud here instead: one string comparison per attach, and a bump that touches
 	// the query fails the integration suite rather than shipping a correctness regression.
+	if (!InlinedDeletionDdlIsDuckLakes()) {
+		throw InvalidInputException(
+		    "mssql_ducklake: DuckLake's DDL for a new inlined deletion table has changed in this ducklake "
+		    "pin. The commit batch seam creates that table keyed in its place (specs/006 D5b); re-audit "
+		    "the text and update INLINED_DELETE_DDL_HEAD/TAIL.");
+	}
 	if (!ConflictCheckQueryIsDuckLakes()) {
 		throw InvalidInputException(
 		    "mssql_ducklake: DuckLake's conflict-check query has changed in this ducklake pin. This "

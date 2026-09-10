@@ -544,7 +544,7 @@ varchar	200
 query I
 SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM sys.extended_properties WHERE class = 1 AND major_id = OBJECT_ID(''dbo.ducklake_metadata'') AND minor_id = 0 AND name = ''mssql_ducklake_shape''');
 ----
-3
+4
 
 query I
 SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.extended_properties WHERE class = 3 AND major_id = SCHEMA_ID(''dbo'') AND name = ''mssql_ducklake_shape''');
@@ -610,8 +610,69 @@ SELECT f FROM mssql_scan('srv', 'SELECT CAST(is_parameterization_forced AS BIGIN
 ----
 1
 
+# A flush after an inlined deletion of file-backed rows. The deletions live in
+# ducklake_inlined_delete_<table>, which the base created keyless inside the transaction, and the
+# flush DELETEs from it - refused by the mssql extension without a key ("UPDATE/DELETE requires a
+# table with a primary key"). The manager creates it keyed now, the way it creates the inlined data
+# table (specs/006 D5), and the key is visible on the server.
+statement ok
+CREATE TABLE reshaped.fd AS SELECT i, 'r' || i AS s FROM range(20) r(i);
+
+statement ok
+DELETE FROM reshaped.fd WHERE i IN (3, 7);
+
+query I
+SELECT count(*) > 0 FROM mssql_scan('srv', 'SELECT kc.name FROM sys.key_constraints kc JOIN sys.tables t ON t.object_id = kc.parent_object_id WHERE t.name LIKE ''ducklake_inlined_delete%'' AND t.schema_id = SCHEMA_ID(''dbo'') AND kc.type = ''PK''');
+----
+true
+
+statement ok
+SELECT count(*) FROM ducklake_flush_inlined_data('reshaped');
+
+query I
+SELECT count(*) FROM reshaped.fd;
+----
+18
+
+# An older build created that table keyless, through the base's DDL. Its key is dropped here to
+# stand in for that, with the shape stamp, and the next attach keys it again
 statement ok
 DETACH reshaped;
+
+statement ok
+SELECT mssql_exec('srv', 'EXEC sp_dropextendedproperty @name = N''mssql_ducklake_shape'', @level0type = N''SCHEMA'', @level0name = N''dbo'', @level1type = N''TABLE'', @level1name = N''ducklake_metadata'';
+DECLARE @drop NVARCHAR(MAX) = N''''; SELECT @drop += N''ALTER TABLE dbo.'' + QUOTENAME(t.name) + N'' DROP CONSTRAINT '' + QUOTENAME(kc.name) + N'';'' FROM sys.key_constraints kc JOIN sys.tables t ON t.object_id = kc.parent_object_id WHERE t.name LIKE ''ducklake_inlined_delete%'' AND t.schema_id = SCHEMA_ID(''dbo''); EXEC sp_executesql @drop;');
+
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT kc.name FROM sys.key_constraints kc JOIN sys.tables t ON t.object_id = kc.parent_object_id WHERE t.name LIKE ''ducklake_inlined_delete%'' AND t.schema_id = SCHEMA_ID(''dbo'')');
+----
+0
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS rekeyed (DATA_PATH '__TEST_DIR__/lake');
+
+query I
+SELECT count(*) > 0 FROM mssql_scan('srv', 'SELECT kc.name FROM sys.key_constraints kc JOIN sys.tables t ON t.object_id = kc.parent_object_id WHERE t.name LIKE ''ducklake_inlined_delete%'' AND t.schema_id = SCHEMA_ID(''dbo'')');
+----
+true
+
+# and DuckLake can still delete from it: a second flush after another inlined deletion
+statement ok
+DELETE FROM rekeyed.fd WHERE i = 11;
+
+statement ok
+SELECT count(*) FROM ducklake_flush_inlined_data('rekeyed');
+
+query I
+SELECT count(*) FROM rekeyed.fd;
+----
+17
+
+statement ok
+DROP TABLE rekeyed.fd;
+
+statement ok
+DETACH rekeyed;
 
 # A second lake in another schema of the same database gets its own indexes. It did not: index names
 # embed the table but not the schema, and `sys.indexes.name` is unique per table rather than per

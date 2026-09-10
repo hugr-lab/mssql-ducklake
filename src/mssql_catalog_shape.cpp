@@ -171,6 +171,25 @@ EXEC sp_executesql @widen;
 )",
 	                                  VARCHAR_COLLATION, schema_literal);
 
+	// The inlined deletion tables an older build created keyless, through the base's DDL (the
+	// manager writes them keyed now - mssql_metadata_queries.cpp). DuckLake DELETEs from them on a
+	// flush, which the mssql extension refuses without a key. Same dynamic form as the widening
+	// above: the tables are per lake table and the shaping cannot name them.
+	constraints_ddl += StringUtil::Format(R"(
+DECLARE @key NVARCHAR(MAX) = N'';
+SELECT @key += N'ALTER TABLE ' + QUOTENAME(sch.name) + N'.' + QUOTENAME(t.name)
+             + N' ALTER COLUMN file_id BIGINT NOT NULL; ALTER TABLE ' + QUOTENAME(sch.name) + N'.' + QUOTENAME(t.name)
+             + N' ALTER COLUMN row_id BIGINT NOT NULL; ALTER TABLE ' + QUOTENAME(sch.name) + N'.' + QUOTENAME(t.name)
+             + N' ALTER COLUMN begin_snapshot BIGINT NOT NULL; ALTER TABLE ' + QUOTENAME(sch.name) + N'.' + QUOTENAME(t.name)
+             + N' ADD CONSTRAINT ' + QUOTENAME('pk_' + t.name) + N' PRIMARY KEY (file_id, row_id, begin_snapshot);'
+FROM sys.tables t
+JOIN sys.schemas sch ON sch.schema_id = t.schema_id
+WHERE sch.name = %s AND t.name LIKE 'ducklake_inlined_delete%%'
+  AND NOT EXISTS (SELECT 1 FROM sys.key_constraints kc WHERE kc.parent_object_id = t.object_id AND kc.type = 'PK');
+EXEC sp_executesql @key;
+)",
+	                                      schema_literal);
+
 	// Indexes on the condition almost every DuckLake read carries. Neither the postgres nor the
 	// sqlite manager has indexes here at all.
 	//

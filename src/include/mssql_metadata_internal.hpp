@@ -62,4 +62,8 @@ inline bool ConflictRewriteEnabled() {
 //! at attach so that a ducklake bump editing the query fails loudly (specs/007).
 bool ConflictCheckQueryIsDuckLakes();
 
+//! Whether DuckLake's commit loop still writes the inlined deletion table's DDL into the batch in the
+//! text the Execute seam recognises (specs/006 D5b). Asked at attach for the same reason.
+bool InlinedDeletionDdlIsDuckLakes();
+
 } // namespace duckdb
