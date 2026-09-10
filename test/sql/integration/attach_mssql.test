@@ -52,6 +52,16 @@ SELECT count(*) FROM mssql_scan('srv', 'SELECT t.name FROM sys.tables t JOIN sys
 ----
 0
 
+# The database option the shaping applies (specs/012), put back first so that this run proves the
+# attach set it rather than an earlier run
+statement ok
+SELECT mssql_exec('srv', 'ALTER DATABASE CURRENT SET PARAMETERIZATION SIMPLE;');
+
+query I
+SELECT f FROM mssql_scan('srv', 'SELECT CAST(is_parameterization_forced AS BIGINT) AS f FROM sys.databases WHERE database_id = DB_ID()');
+----
+0
+
 # `ducklake:mssql:<ADO connection string>`: duckdb strips the `mssql:` prefix and picks the mssql
 # storage for the catalog ATTACH (the `mssql://` URI form is deliberately not a prefix to duckdb -
 # it needs META_TYPE 'mssql' instead). No METADATA_SCHEMA: since mssql v0.2.5 the catalog answers
@@ -76,6 +86,14 @@ query I
 SELECT snapshot_id FROM ducklake_snapshots('lake');
 ----
 0
+
+# and the catalog's database now parameterizes every literal itself: one plan per query shape
+# rather than one per table name or id, which is what made the first touch of each table a plan
+# compile (specs/009, 012)
+query I
+SELECT f FROM mssql_scan('srv', 'SELECT CAST(is_parameterization_forced AS BIGINT) AS f FROM sys.databases WHERE database_id = DB_ID()');
+----
+1
 
 # DDL and an inlined insert through the generic manager: the catalog load behind them reads the
 # metadata with decorrelated subqueries, which mssql v0.2.5 materializes on the transaction's
@@ -526,7 +544,7 @@ varchar	200
 query I
 SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM sys.extended_properties WHERE class = 1 AND major_id = OBJECT_ID(''dbo.ducklake_metadata'') AND minor_id = 0 AND name = ''mssql_ducklake_shape''');
 ----
-2
+3
 
 query I
 SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.extended_properties WHERE class = 3 AND major_id = SCHEMA_ID(''dbo'') AND name = ''mssql_ducklake_shape''');
@@ -547,8 +565,21 @@ SELECT count(*) FROM mssql_scan('srv', 'SELECT c.name FROM sys.columns c JOIN sy
 ----
 1
 
+# The database option is the one thing the shaping does outside the catalog's own schema, so it has
+# an opt-out. Put the database back to SIMPLE and opt out: this re-shaping must leave it alone
+statement ok
+SELECT mssql_exec('srv', 'ALTER DATABASE CURRENT SET PARAMETERIZATION SIMPLE;');
+
+statement ok
+SET mssql_ducklake_forced_parameterization = false;
+
 statement ok
 ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS upgraded (DATA_PATH '__TEST_DIR__/lake');
+
+query I
+SELECT f FROM mssql_scan('srv', 'SELECT CAST(is_parameterization_forced AS BIGINT) AS f FROM sys.databases WHERE database_id = DB_ID()');
+----
+0
 
 # the attach noticed and re-applied: the column is back to VARCHAR(200) and the index is back
 query II
@@ -563,6 +594,24 @@ SELECT count(*) FROM mssql_scan('srv', 'SELECT i.name FROM sys.indexes i JOIN sy
 
 statement ok
 DETACH upgraded;
+
+# opted back in, the next shaping applies it - the stamp is removed again so there is one
+statement ok
+RESET mssql_ducklake_forced_parameterization;
+
+statement ok
+SELECT mssql_exec('srv', 'EXEC sp_dropextendedproperty @name = N''mssql_ducklake_shape'', @level0type = N''SCHEMA'', @level0name = N''dbo'', @level1type = N''TABLE'', @level1name = N''ducklake_metadata'';');
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS reshaped (DATA_PATH '__TEST_DIR__/lake');
+
+query I
+SELECT f FROM mssql_scan('srv', 'SELECT CAST(is_parameterization_forced AS BIGINT) AS f FROM sys.databases WHERE database_id = DB_ID()');
+----
+1
+
+statement ok
+DETACH reshaped;
 
 # A second lake in another schema of the same database gets its own indexes. It did not: index names
 # embed the table but not the schema, and `sys.indexes.name` is unique per table rather than per
