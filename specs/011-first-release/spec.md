@@ -1,126 +1,110 @@
-# Spec 011: the first release — v0.1.0 on the v1.5.5 line, through community-extensions
+# Spec 011: the first release — v0.1.0 on the v1.5.5 line
 
-- **Status**: draft
+- **Status**: implemented (the tag and the community-extensions PR follow the merge)
 - **Date**: 2026-09-10
 - **Author**: VGSML
 
 ## Summary
 
-The extension builds green on every platform, has 163 server-backed assertions on both commit paths
-and a concurrency regression test, and has never been tagged. This spec is the list of what stands
-between that and a build a user can `INSTALL mssql_ducklake FROM community`: a version and a tag,
-the community descriptor, honest documentation of what is and is not done, and the spec statuses
-brought in line with the code. The release line is **v1.5.5** — the 2.0 line has no released tag
-in any of the three pinned components (design 002 §5).
+The extension builds green on every platform, has 289 server-backed assertions on both commit
+paths, a concurrency regression test, a documentation site, and a benchmark it can publish — and
+has never been tagged. This spec is the machinery that turns a tag into a release and keeps the
+site's version in step with it, and the record a release cannot ship without: the version, the
+community descriptor, the release notes, the spec statuses. The release line is **v1.5.5** — no
+released tag of duckdb 2.0, mssql on 2.0 or ducklake for 2.0 exists (design 002 §5).
 
 ## Problem
 
-Nothing here is a feature; each is something a release cannot ship without:
-
-- **No tag, ever.** `distribution.yml` triggers on `v*` and has only ever run on pushes to `main`.
-- **No community descriptor.** The distribution channel (CLAUDE.md) is a PR to
-  `duckdb/community-extensions` carrying `extensions/mssql_ducklake/description.yml`; nothing in
-  this repository prepares it.
-- **Spec statuses lag the code.** specs/004 is "accepted (in progress)" with a performance target
-  the benchmark still misses (design 002 §1: 2.32x total against postgres); specs/005 is `draft`
-  with phase 2 shipped behind `MSSQL_DUCKLAKE_SERVER_COMMIT`. A user reading the specs cannot tell
-  what the release contains.
-- **Known defects are scattered across follow-up sections**, not stated in one place a user reads.
-- **The test server is not what the README recommends.** `docker/init/sqlserver.sql` creates
-  `lake_meta` with the image's default `SQL_Latin1_General_CP1_CI_AS`; the manager converts every
-  catalog column to the UTF-8 BIN2 collation (specs/006 D4), so this works — but the suite has never
-  run against a database *created* UTF-8, which is what the README tells users to do.
+- **No tag, ever.** `distribution.yml` triggered on `v*` and built the binaries; nothing published
+  them, and nothing checked that the tag said what the code says.
+- **The version was a build hash.** `mssql_ducklake_version()` answers a constant since specs/013
+  (`0.1.0-dev`), but no step ties the constant to a tag.
+- **The docs site had a versioning contract and no automation**: "at each release run
+  `docs:version <X.Y.Z>` and commit the snapshot" — a step to remember, a snapshot to keep in git.
+- **No community descriptor**, no release notes, and spec statuses that lag the code (specs/004
+  "accepted (in progress)", specs/005 `draft`).
 
 ## Design
 
-**Version.** `v0.1.0`. The extension is experimental; the version says so, and the pins say the
-rest. Where it lives: the `extension_config.cmake` / `CMakeLists.txt` version string and the tag.
-Bumping it is part of the release commit, not a separate one.
+**D1 — the tag is the release.** `.github/workflows/release.yml` runs on a `v*` tag, in three
+jobs. `guard` reads `MSSQL_DUCKLAKE_VERSION` from `CMakeLists.txt` and `version`/`ref` from
+`description.yml` and fails if any disagrees with the tag — a release whose binary would report
+another version than its tag cannot be built. `build` is the same reusable workflow
+`distribution.yml` runs on `main` (`_extension_distribution.yml@v1.5.5`, wasm excluded), so the
+release binaries are the ones the community-extensions build would produce. `release` renames each
+platform's artifact to `mssql_ducklake-<version>-<platform>.duckdb_extension`, writes
+`SHA256SUMS.txt`, and publishes the GitHub release with them and a body that names the pins, the
+docs, the release notes and the install lines; a tag with a `-` in it publishes as a pre-release.
+`distribution.yml` no longer runs on tags: one build per tag.
 
-**Tag → distribution build.** Tagging `v0.1.0` on `main` runs `distribution.yml` — Linux amd64 and
-arm64, macOS amd64 and arm64, Windows MSVC and MinGW, wasm deliberately excluded — and its artifacts
-are the release. The GitHub release is created from the tag with the notes below.
+**D2 — the site's version follows the tags, automatically.** `pages.yml` checks out with the tags
+and, before building, snapshots every release tag's `website/docs` and `sidebars.ts` as that
+version: the tag's tree is swapped in, `docusaurus docs:version <X.Y.Z>` runs on it, the live tree
+is swapped back. `versions.json`, `versioned_docs/` and `versioned_sidebars/` are generated and
+gitignored — nothing is committed for a release's docs, the tag *is* the snapshot. The latest
+release serves at the root, the live docs as *Next* with the unreleased banner, and a published
+release triggers the deploy (`release: published`), so the site changes the moment the release
+exists. Verified locally with a temporary tag: the snapshot, the dropdown, the build.
 
-**Community descriptor.** `extensions/mssql_ducklake/description.yml` in a fork of
-`duckdb/community-extensions`, with:
+**D3 — the version.** `MSSQL_DUCKLAKE_VERSION` is `0.1.0` in this commit; `description.yml` says
+`0.1.0` and `ref: v0.1.0`; the guard holds them together. After the release the constant goes to
+the next version with `-dev`, and the descriptor stays at the released tag until the next release
+(that is what community-extensions builds). `duckdb_extensions().extension_version` keeps the
+build's git hash.
 
-- `name: mssql_ducklake`, the repo and the `v0.1.0` ref, `duckdb_version: v1.5.5`;
-- `excluded_platforms: wasm_mvp;wasm_eh;wasm_threads` — mssql is raw TDS sockets (CLAUDE.md);
-- `requires_toolchains` as the mssql extension declares (openssl through vcpkg);
-- a description that says what the thing is: *embeds ducklake at `<pin>`; mutually exclusive with
-  the stock ducklake extension; requires the mssql extension* — design 001 §8 called the honest
-  wording a requirement, not a nicety, because a reviewer will ask.
+**D4 — the community descriptor.** `description.yml` at the root, copied to
+`duckdb/community-extensions/extensions/mssql_ducklake/description.yml` by the release's PR there:
+name, an honest description (embeds DuckLake at a pin, mutually exclusive with stock ducklake,
+needs the mssql extension), `excluded_platforms` = the mssql extension's set plus wasm (the
+manager is nothing where mssql is not), `test_config` skipping the server-backed suite, a
+hello-world attach. Their build runs our `extension_config.cmake`, which builds the mssql
+extension beside ours for the tests, as the distribution build does. The PR goes up after the tag
+exists, and its green build is the proof the descriptor is right.
 
-The PR to community-extensions goes up after the tag, and this spec's status flips to
-`implemented` when it merges, not before.
+**D5 — release notes and statuses.** `website/docs/releases.md` — a page per release, versioned
+with the site — carries what v0.1.0 does, what the manager adds, the numbers, what is not there,
+the platforms; the GitHub release body links to it. specs/004 is `implemented` with its target
+reached later (specs/012, 014: 1.54x with commits at parity); specs/005 is `implemented (phase 2
+behind a switch)`. The README carries the badges the mssql extension's does.
 
-**Documentation a user reads.** `README.md` gains a section that states, in this order:
-
-1. *How to install and attach* — `INSTALL mssql FROM community; LOAD mssql; INSTALL mssql_ducklake
-   FROM community; LOAD mssql_ducklake;` then `ATTACH 'ducklake:mssql:…'`; the load order and the
-   autoload trap (CLAUDE.md).
-2. *What it needs from the server* — SQL Server 2019+ or Azure SQL (the UTF-8 collation gate,
-   specs/004 D3); the login's permissions (creates tables and indexes in the metadata schema);
-   `sys.databases` visibility is not required.
-3. *Known limitations*, stated as limitations:
-   - phase 2's server-side commit is off by default and experimental
-     (`MSSQL_DUCKLAKE_SERVER_COMMIT`);
-   - a retried commit can leave an unregistered, empty `ducklake_inlined_data_*` table behind
-     (specs/004 follow-ups); a flush leaves empty inlined tables (specs/005 D10, upstream);
-   - the type matrix: FLOAT NaN, TIMESTAMP_NS, HUGEINT and nested types are stored as text in
-     inlined tables (specs/004 D4);
-   - performance against the postgres backend by workload, with the numbers from design 002 §1 —
-     not "fast", the ratios;
-   - concurrent writers: fixed in specs/007; the systemic fix (SNAPSHOT isolation) is
-     hugr-lab/mssql-extension#331.
-4. *Versions* — the pin table, and that a ducklake fix reaches users only with this extension's
-   next release (the vendoring rule).
-
-**Spec statuses.** specs/004 → `implemented (target missed, see Measured)`, already what its
-Measured section says. specs/005 → `implemented (phase 2 behind a switch)`, with one paragraph
-naming the switch and why it is off. The README index follows.
-
-**The test server, created UTF-8.** `docker/init/sqlserver.sql` creates `lake_meta` `COLLATE
-Latin1_General_100_BIN2_UTF8`; the suite then exercises the configuration the README recommends.
-The manager's conversion sweep (specs/006 D4) still runs — a user with a CI_AS database is the
-common case and stays tested by the collation assertions in the integration suite, which create
-their own state.
-
-**Release notes** are the specs: one line per spec 002 – 010 with its one-sentence summary, the
-pin table, and the limitations list above verbatim.
+**D6 — the test server stays on the legacy collation.** The draft wanted `lake_meta` created
+UTF-8, "what the README recommends". The docs recommend no such thing: the manager collates every
+catalog column explicitly (specs/006 D4), and a `CI_AS` database — the common case — is the harder
+one to get right. The suite keeps it.
 
 ## Enforcement & security
 
-The two load-time gates are what a user meets first and both are documented in the README section
-above: the extension refuses to load beside the stock ducklake extension, and refuses to load
-without the mssql extension (`test/sql/deps_gate.test`). Neither is new; both are now written where
-a user will read them.
+- `release.yml` has `contents: write` in its last job only; the build is the reusable workflow
+  with its own permissions; the guard runs first and fails closed.
+- The site's snapshot step reads tags only; a tag without `website/docs` is skipped, not failed.
+- The two load-time gates a user meets first — stock ducklake loaded, mssql missing — are on the
+  site's troubleshooting page.
 
 ## Testing
 
-- The distribution build on the tag, all platforms green — the same run that has passed on every
-  push to `main` since specs/006.
-- The community-extensions build: their CI builds the descriptor's ref on their runners; green there
-  is the proof that the descriptor is right (`excluded_platforms`, toolchains, the vcpkg manifest).
-- `scripts/ci/smoke_load.sh` against the *installed* artifact — `INSTALL mssql_ducklake FROM
-  community` on a stock DuckDB v1.5.5 CLI — once the community build is published: the out-of-tree
-  load, both gates, one local-file lake cycle.
-- The integration suite against a UTF-8-created `lake_meta`, before the docker init change merges.
+- The guard, negated: a tag that disagrees with the constant fails in `guard` before any build.
+- The snapshot step on a temporary local tag: `docs:version` on the tag's tree, the version in
+  `versions.json`, the site building with the dropdown.
+- `mssql_ducklake_version()` answers `0.1.0` (the unit test pins the shape).
+- After the tag: the distribution build inside `release.yml` green on every platform, the release
+  page with six binaries and their checksums, the site serving `/0.1.0/`… at the root with the live
+  tree at `/next/`; the community-extensions build of the descriptor's ref green.
 
 ## Alternatives considered
 
-- **Release on the 2.0 line.** There is no released tag of duckdb 2.0, mssql on 2.0 or ducklake
-  for 2.0; community-extensions builds against released DuckDB. Not a choice yet.
-- **Wait for the performance target.** specs/004's "≥ postgres" is missed by 2.32x at a thousand
-  tables (design 002 §1), and the two phases before this one (specs/008, 009) address the hot
-  path. But the extension is correct, tested and experimental; a release with the ratios published
-  is more useful to the people who will report the next defect than a release withheld until a
-  number moves.
-- **Ship phase 2 on by default.** It is correct for the commits it accepts (specs/005 D4) and
-  incomplete for the rest; off by default with a documented switch is the honest shape.
+- **Committed docs snapshots** (the mssql extension's way): a step to remember at each release and
+  a copy of the docs in git per version. The tags already hold every version of the docs; deriving
+  the snapshots from them at deploy time removes both.
+- **The version from the tag at build time** (`git describe` in CMake): depends on the tags being
+  fetched wherever the extension is built — the community build checks out a ref, not necessarily
+  with tags. A constant the guard checks is one line and always right.
+- **Release on the 2.0 line**: nothing released to build against; not a choice yet.
+- **Wait for the performance target**: it is reached where it matters (commits at parity); the
+  rest is documented with its numbers.
 
 ## Follow-ups
 
-- The upstream track from CLAUDE.md — contributing the manager in-tree to ducklake — is taken up
-  if the release finds users.
-- After the 2.0 line is released across all three pins: design 002 §5 and §9 phase E.
+- After the tag: the PR to duckdb/community-extensions; `INSTALL mssql_ducklake FROM community`
+  smoke-tested on a stock v1.5.5 CLI once their build publishes; the constant to `0.2.0-dev`.
+- The upstream track — contributing the manager in-tree to ducklake — if the release finds users.
+- The 2.0 line, when all three pins have a release (design 002 §9 phase E).

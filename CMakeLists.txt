@@ -3,9 +3,10 @@ cmake_minimum_required(VERSION 3.5)
 # Set extension name here
 set(TARGET_NAME mssql_ducklake)
 # The release version mssql_ducklake_version() answers, like the mssql extension's mssql_version():
-# a constant bumped in the release commit (specs/011), not the git hash DuckDB puts in
-# duckdb_extensions().extension_version. "-dev" until the tag that drops it.
-set(MSSQL_DUCKLAKE_VERSION "0.1.0-dev")
+# a constant, not the git hash DuckDB puts in duckdb_extensions().extension_version. The release
+# commit sets it to the tag's version and release.yml refuses a tag that disagrees; the commit
+# after a release bumps it to the next version with "-dev" (specs/011).
+set(MSSQL_DUCKLAKE_VERSION "0.1.0")
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)

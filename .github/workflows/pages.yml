@@ -3,11 +3,13 @@ name: Deploy docs
 # Publishes website/ to GitHub Pages at https://hugr-lab.github.io/mssql-ducklake/ (specs/013).
 #
 # The docs build from MAIN, and Docusaurus VERSIONING keeps released content
-# authoritative: at each release `docs:version <X.Y.Z>` snapshots the docs into
-# versioned_docs/, which serves at the ROOT as the default; the live docs/ tree
-# publishes as "Next" under /next/ with an unreleased banner. So a main push only
-# ever changes /next/ until the next release snapshot. Same scheme as
-# hugr-lab/mssql-extension, whose site this one mirrors.
+# authoritative - done here, at build time, from the TAGS: for every release tag
+# v<X.Y.Z> the tag's website/docs is snapshotted as version X.Y.Z (the same
+# `docs:version` the maintainer would run, on the tag's tree), so the latest
+# release serves at the ROOT and the live docs/ tree publishes as "Next" under
+# /next/ with an unreleased banner. Nothing is committed for it: the tag is the
+# snapshot, and versions.json / versioned_docs/ are generated and gitignored
+# (specs/011). A main push only ever changes /next/; a release changes the root.
 
 on:
   release:
@@ -36,6 +38,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # the tags are the released versions of the docs
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -43,11 +48,33 @@ jobs:
           cache: npm
           cache-dependency-path: website/package-lock.json
 
+      - name: Snapshot the released docs from the tags
+        # from the repository root: git's pathspecs are relative to the working directory
+        shell: bash
+        run: |
+          (cd website && npm ci)
+          git fetch --tags --force
+          for tag in $(git tag --list 'v*' | sort -V); do
+            case "$tag" in *-*) echo "$tag is a pre-release - not a docs version"; continue;; esac
+            ver="${tag#v}"
+            if [ -z "$(git ls-tree -d --full-tree "$tag" -- website/docs)" ]; then
+              echo "$tag carries no website/docs - skipped"
+              continue
+            fi
+            rm -rf snapshot && mkdir snapshot
+            git archive --format=tar "$tag" website/docs website/sidebars.ts | tar -x -C snapshot
+            mv website/docs website/docs.next && mv snapshot/website/docs website/docs
+            cp website/sidebars.ts website/sidebars.next.ts && cp snapshot/website/sidebars.ts website/sidebars.ts
+            (cd website && npx docusaurus docs:version "$ver")
+            rm -rf website/docs && mv website/docs.next website/docs
+            mv website/sidebars.next.ts website/sidebars.ts && rm -rf snapshot
+            echo "snapshotted $tag as $ver"
+          done
+          cat website/versions.json 2>/dev/null || echo "no released docs yet - the current docs are the only version"
+
       - name: Build the docs site
         working-directory: website
-        run: |
-          npm ci
-          npx docusaurus build
+        run: npx docusaurus build
 
       - uses: actions/configure-pages@v5
 

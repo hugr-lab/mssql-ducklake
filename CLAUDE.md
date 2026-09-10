@@ -183,9 +183,22 @@ in); **at each release run `npm run docusaurus docs:version <X.Y.Z>` in `website
 snapshot**, so the released docs serve at the root and the live tree as *Next*. A feature that
 changes what a user sees lands with its page in `website/docs/`, the way it lands with its spec.
 
+## Releasing
+
+A tag is the release (specs/011). The release commit sets `MSSQL_DUCKLAKE_VERSION` in
+`CMakeLists.txt` and `version`/`ref` in `description.yml` to the version, adds the release to
+`website/docs/releases.md`, and merges; then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+`release.yml` refuses a tag that disagrees with the constant or the descriptor, builds every
+platform through the same reusable workflow as `distribution.yml`, and publishes the GitHub release
+with the binaries and `SHA256SUMS.txt`; the published release triggers `pages.yml`, which
+snapshots every release tag's docs as that version at deploy time — never commit
+`versioned_docs/` or `versions.json`. After the tag: the PR to duckdb/community-extensions with
+`description.yml`, and the constant to the next version with `-dev`.
+
 ## Distribution
 
-Experimental, through the **community extensions repository** on released DuckDB (v1.5.5). The
+Experimental, through the **community extensions repository** on released DuckDB (v1.5.5);
+the GitHub release of each tag carries the same binaries. The
 description is honest: embeds ducklake at a named pin, mutually exclusive with the stock ducklake
 extension. The upstream track — a PR contributing the manager in-tree to ducklake (postgres-manager
 precedent) — is taken up if the extension finds users; after such a merge this extension becomes a

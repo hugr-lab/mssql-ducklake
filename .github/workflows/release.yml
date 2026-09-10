@@ -1,0 +1,122 @@
+name: Release
+
+# A tag v<X.Y.Z> is the release (specs/011). This workflow guards the version, builds the extension
+# for every platform through the same reusable workflow the community-extensions build runs
+# (distribution.yml on main), and publishes the GitHub release with the binaries and their
+# checksums. Publishing the release triggers pages.yml, which snapshots the tag's docs as the site's
+# released version - the version dropdown follows the tags, nothing is committed for it.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: The tag matches the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          VERSION="${TAG#v}"
+          CMAKE_VERSION=$(sed -n 's/^set(MSSQL_DUCKLAKE_VERSION "\(.*\)")$/\1/p' CMakeLists.txt)
+          DESC_VERSION=$(sed -n 's/^  version: "\(.*\)"$/\1/p' description.yml)
+          DESC_REF=$(sed -n 's/^  ref: "\(.*\)"$/\1/p' description.yml)
+          echo "tag $TAG; CMakeLists.txt $CMAKE_VERSION; description.yml version $DESC_VERSION ref $DESC_REF"
+          if [ "$CMAKE_VERSION" != "$VERSION" ]; then
+            echo "::error::MSSQL_DUCKLAKE_VERSION in CMakeLists.txt is '$CMAKE_VERSION', the tag says '$VERSION' - the release commit sets the constant (specs/011)"
+            exit 1
+          fi
+          if [ "$DESC_VERSION" != "$VERSION" ] || [ "$DESC_REF" != "$TAG" ]; then
+            echo "::error::description.yml says version '$DESC_VERSION' ref '$DESC_REF', the tag is '$TAG'"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build extension binaries
+    needs: guard
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.5
+    with:
+      extension_name: mssql_ducklake
+      duckdb_version: v1.5.5
+      ci_tools_version: v1.5.5
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
+
+  release:
+    name: Publish the release
+    needs: [guard, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Name them by version and platform, and checksum them
+        shell: bash
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          mkdir -p release
+          # one artifact per platform: mssql_ducklake-v1.5.5-extension-<platform>/mssql_ducklake.duckdb_extension
+          for dir in artifacts/mssql_ducklake-*-extension-*; do
+            platform="${dir##*-extension-}"
+            file=$(find "$dir" -name 'mssql_ducklake.duckdb_extension' | head -1)
+            [ -n "$file" ] || { echo "no binary in $dir"; continue; }
+            cp "$file" "release/mssql_ducklake-${VERSION}-${platform}.duckdb_extension"
+          done
+          cd release
+          ls -l
+          sha256sum *.duckdb_extension > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            release/*.duckdb_extension
+            release/SHA256SUMS.txt
+          body: |
+            ## mssql_ducklake ${{ github.ref_name }} — DuckLake on SQL Server
+
+            Built for DuckDB **v1.5.5**; embeds DuckLake at the pin named in
+            [Versions](https://hugr-lab.github.io/mssql-ducklake/versions/); needs the mssql
+            extension v0.2.5 or newer at runtime. What is in this release, and what is not:
+            [release notes](https://hugr-lab.github.io/mssql-ducklake/releases/) ·
+            [limitations](https://hugr-lab.github.io/mssql-ducklake/reference/limitations/).
+
+            ### Install
+
+            ```sql
+            INSTALL mssql FROM community;
+            INSTALL mssql_ducklake FROM community;   -- once the community build of this tag is published
+            LOAD mssql_ducklake;
+            ```
+
+            or, from a downloaded binary: `INSTALL 'mssql_ducklake-${{ needs.guard.outputs.version }}-<platform>.duckdb_extension';`
+            (`duckdb -unsigned` for a binary the community repository has not signed).
+
+            ### Verify
+
+            ```bash
+            sha256sum -c SHA256SUMS.txt
+            ```

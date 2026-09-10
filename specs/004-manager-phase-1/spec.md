@@ -1,6 +1,6 @@
 # Spec 004: the SQL Server metadata manager, phase 1 — parity with postgres
 
-- **Status**: accepted (in progress)
+- **Status**: implemented (the parity target reached later — specs/012 and 014: 1.54x overall, commits at parity)
 - **Date**: 2026-09-09
 - **Author**: VGSML
 - **Depends on**: [002](../002-embedded-ducklake/spec.md) (the embedded extension), [003](../003-mssql-extension-v0.2.5/spec.md) (mssql v0.2.5)
