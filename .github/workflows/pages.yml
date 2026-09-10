@@ -1,0 +1,59 @@
+name: Deploy docs
+
+# Publishes website/ to GitHub Pages at https://hugr-lab.github.io/mssql-ducklake/ (specs/013).
+#
+# The docs build from MAIN, and Docusaurus VERSIONING keeps released content
+# authoritative: at each release `docs:version <X.Y.Z>` snapshots the docs into
+# versioned_docs/, which serves at the ROOT as the default; the live docs/ tree
+# publishes as "Next" under /next/ with an unreleased banner. So a main push only
+# ever changes /next/ until the next release snapshot. Same scheme as
+# hugr-lab/mssql-extension, whose site this one mirrors.
+
+on:
+  release:
+    types: [published]
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Build the docs site
+        working-directory: website
+        run: |
+          npm ci
+          npx docusaurus build
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/build
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

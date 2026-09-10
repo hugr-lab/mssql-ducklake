@@ -20,3 +20,8 @@ design/
 # local vcpkg checkout + artifacts (make vcpkg-setup)
 vcpkg/
 vcpkg_installed/
+
+# the docs site (website/): installed and built locally, deployed by pages.yml
+website/node_modules/
+website/build/
+website/.docusaurus/

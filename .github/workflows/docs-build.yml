@@ -1,0 +1,47 @@
+name: Docs site build
+
+# Builds website/ on pull requests, and nothing else. pages.yml is the only other
+# place that builds the site, and it never runs on pull_request - it holds the
+# Pages concurrency group and the github-pages environment, so a PR run there
+# would cancel an in-flight deploy. Build only; no pages: or id-token: permission.
+
+on:
+  pull_request:
+    paths:
+      - "website/**"
+      - "scripts/ci/check_docs_links.py"
+      - ".github/workflows/docs-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build docs site
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cheap, and before the npm install so a link error reports in seconds.
+      # Docusaurus cannot catch this class itself: an absolute link resolves to a
+      # page that exists in the released version, so onBrokenLinks sees nothing.
+      - name: No absolute internal doc links
+        run: python3 scripts/ci/check_docs_links.py
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: npm ci && docusaurus build
+        working-directory: website
+        run: |
+          npm ci
+          npx docusaurus build

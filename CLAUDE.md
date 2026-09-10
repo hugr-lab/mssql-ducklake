@@ -57,6 +57,8 @@ docker/                          # the integration SQL Server: compose (everythi
                                  #   7433, pinned image) + init/sqlserver.sql (catalog db + test marker); .env.example
 scripts/ci/                      # smoke_load.sh (incl. the stock-ducklake exclusion), assert_ran.sh, ...
 specs/                           # one lightweight spec per feature, NNN-slug/spec.md (see specs/README.md)
+website/                         # the docs site: Docusaurus, versioned per release, deployed to
+                                 #   hugr-lab.github.io/mssql-ducklake by pages.yml (specs/013)
 design/                          # LOCAL, gitignored: numbered research topics NNN-topic/
 ```
 
@@ -77,6 +79,7 @@ make metadata-log WORKLOAD=w.sql            # every metadata query DuckLake issu
 find src \( -name '*.cpp' -o -name '*.hpp' \) | xargs clang-format -i   # pin: clang_format==11.0.1 (pip)
 make format-check                           # duckdb's format.py over src + test (needs black, cmake-format, clang_format 11.0.1 in PATH)
 make tidy-check                             # clang-tidy over src (TIDY_BINARY=... to pick one); what the distribution's code-quality job runs
+cd website && npm ci && npx docusaurus build   # the docs site; broken links fail it (docs-build.yml is the PR gate)
 ```
 
 Build outputs: CLI `build/release/duckdb`, loadables
@@ -167,6 +170,18 @@ rewrites anything else and the distribution's format check fails on it.
   pair fails as a CTE, so one lucky plan proves nothing. The fix (mssql-extension #314) arrives
   with the duckdb 2.0 line; not a blocker — on v1.5.5 the manager uses `mssql_scan()` only as the
   sole source of a query.
+
+## Documentation
+
+`website/` is the user documentation — a Docusaurus site mirroring hugr-lab/mssql-extension's
+(same look, same versioning contract), published at https://hugr-lab.github.io/mssql-ducklake/ by
+`.github/workflows/pages.yml` on every push to `main` that touches it; `docs-build.yml` builds it
+on pull requests. The org site (hugr-lab.github.io) links here. Rules that came from the mssql
+extension's site: links between pages are relative markdown links, never absolute site paths
+(`scripts/ci/check_docs_links.py` enforces it — an absolute link leaves the version the reader is
+in); **at each release run `npm run docusaurus docs:version <X.Y.Z>` in `website/` and commit the
+snapshot**, so the released docs serve at the root and the live tree as *Next*. A feature that
+changes what a user sees lands with its page in `website/docs/`, the way it lands with its spec.
 
 ## Distribution
 
