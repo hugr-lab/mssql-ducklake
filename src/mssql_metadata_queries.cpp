@@ -173,7 +173,16 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 			pos = digits;
 			continue;
 		}
-		CreateInlinedDeletionTable("ducklake_inlined_delete_" + query.substr(digits, digits_end - digits));
+		// The loop writes this DDL into EVERY batch that deletes inline from the table - the static
+		// that builds it cannot know the table exists - so the catalog-level cache decides whether
+		// there is anything to do. The manager's table is committed the moment it is created, which
+		// is why it can be recorded as existing at once, unlike the base's transactional one.
+		auto table_id = TableIndex(std::stoull(query.substr(digits, digits_end - digits)));
+		auto &catalog = transaction.GetCatalog();
+		if (catalog.CheckInlinedDeletionTableCache(table_id, snapshot) != InlinedDeletionCacheResult::EXISTS) {
+			CreateInlinedDeletionTable(InlinedFileDeletionTableName(table_id));
+			catalog.CacheInlinedDeletionTableResult(table_id, snapshot, true);
+		}
 		query.erase(pos, digits_end + tail.size() - pos);
 	}
 	return DuckLakeMetadataManager::Execute(snapshot, query);
