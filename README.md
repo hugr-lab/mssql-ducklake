@@ -108,8 +108,8 @@ ALTER DATABASE CURRENT SET PARAMETERIZATION FORCED;
 Every query DuckLake and the mssql extension send carries its literals in the text (a table name, a
 `table_id`, a snapshot id), and SQL Server caches plans by text, so without this each distinct
 value is compiled on its first use — about 35 ms per table the first time it is touched. With it the
-server parameterizes those literals itself; the 1000-table benchmark ran 27% faster overall and its
-first write into each table three times faster (specs/012). It is a database-wide option, so it has
+server parameterizes those literals itself; the 1000-table benchmark ran a quarter faster overall
+and its first write into each table two to three times faster (specs/012). It is a database-wide option, so it has
 an opt-out — `SET mssql_ducklake_forced_parameterization = false` before the attach that shapes the
 catalog — and it is best-effort: a login allowed to create the catalog's tables but not to alter the
 database gets a working catalog without it (the statement above, run by someone who may, is the

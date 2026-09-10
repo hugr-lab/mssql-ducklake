@@ -593,8 +593,8 @@ void MSSQLMetadataManager::ApplyForcedParameterization() {
 	// execution compiles it: 28-37 ms for the metadata query, measured on the plan-cache counter
 	// (specs/009). A touch-each-table-once workload compiles once per table. With the option the
 	// server parameterizes the literals itself and one plan serves every value: the 1000-table
-	// benchmark went from 937 s to 686 s, the first write into each table three times faster, the
-	// first read after an attach five times (specs/012).
+	// benchmark went from 937 s to 686-698 s, the first write into each table two to three times
+	// faster, the first read after an attach four times (specs/012).
 	//
 	// A database-wide option, so it has an opt-out, and best-effort, so a login that may shape the
 	// schema but not alter the database - or a platform without the option, Fabric Warehouse and

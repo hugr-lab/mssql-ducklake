@@ -139,7 +139,7 @@ rewrites anything else and the distribution's format check fails on it.
   `ducklake_metadata`): keys, the UTF-8 BIN2 `VARCHAR`s, indexes — and `PARAMETERIZATION FORCED`
   on the database itself, best-effort and with `mssql_ducklake_forced_parameterization = false` as
   the opt-out (specs/012). Without it every distinct literal in a query is a plan compile on the
-  server: ~35 ms per table on its first touch (specs/009), 27% of the 1000-table benchmark.
+  server: ~35 ms per table on its first touch (specs/009), a quarter of the 1000-table benchmark.
 - **Both lakes at once**: `ducklake:postgres:` works through the embedded copy too — one extension
   serves postgres-cataloged and mssql-cataloged lakes in the same process.
 - **Attach syntax**: `ducklake:mssql:<ADO connection string>` — duckdb strips `mssql:` as an

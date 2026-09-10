@@ -102,7 +102,26 @@ whose sections carry per-platform syntax):
   `SIMPLE`; opted back in and re-stamped, the next shaping applies it.
 - The best-effort path by hand (D3), with a `db_ddladmin` login.
 - `make bench-scale --tables 1000 …` on this build: the catalog it creates is shaped with the option
-  by default, so the bench measures the shipped behaviour (table below).
+  by default, so the bench measures the shipped behaviour. Both arms in one run; the middle column
+  is the mssql-only run of specs/009 with the option set by hand before this code existed, and the
+  spread between the two is the write side's run-to-run noise (the postgres arm sits at 5.8 / 5.9):
+
+  | phase | main (009) | option by hand | **this build** | postgres |
+  | --- | ---: | ---: | ---: | ---: |
+  | `first_commits` | 56.9 | 19.2 | **29.1** | 5.8 |
+  | `second_commits` | 36.7 | 24.7 | 25.5 | 9.5 |
+  | `filtered_read` | 1.91 | 0.40 | **0.45** | 0.18 |
+  | `list_snapshots` / `table_info` | 0.18 / 0.27 | 0.02 / 0.03 | 0.02 / 0.03 | 0.01 / 0.01 |
+  | `partitioned_reattach` / `deep_reattach` | 2.55 / 2.68 | 1.09 / 0.97 | 0.95 / 0.99 | 0.25 / 0.26 |
+  | `flush_inlined` | 366 | 245 | 248 | 154 |
+  | `deep_history` | 114 | 77 | 78 | 32 |
+  | `merge_adjacent` | 44.8 | 33.0 | 34.2 | 21.8 |
+  | `evolution_read_latest` | 24.0 | 25.1 | 14.4 | 8.3 |
+  | **total** | **937** | **686** | **698** | **388** |
+
+  Against postgres the whole benchmark goes from 2.44x to **1.80x**. What is left is the write side
+  — `first_commits` 5x, `partitioned_commits` 5x, `second_commits` 2.7x — which is the commit's
+  DML path (specs/009, "what else the stream showed") and the next spec's subject.
 
 ## Alternatives considered
 
