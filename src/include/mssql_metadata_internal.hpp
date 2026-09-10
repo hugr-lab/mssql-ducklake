@@ -57,6 +57,30 @@ inline bool ConflictRewriteEnabled() {
 	return !disabled;
 }
 
+//! specs/014: an unrecognised catalog statement in the commit batch is an error rather than a
+//! fallback to the base. On in the integration suite, so that a ducklake bump that adds a shape
+//! fails the suite naming the statement; off for a user, whose catalog keeps working, slower.
+inline bool StrictBatchEnabled() {
+	static const bool enabled = getenv("MSSQL_DUCKLAKE_STRICT_BATCH") != nullptr;
+	return enabled;
+}
+
+//! Off switch for the whole rewrite (specs/014): every statement goes to the base, the way it did
+//! before. Exists so that the two paths can be run against each other - a test that cannot fail
+//! proves nothing - and so that a user can take the rewrite out of a diagnosis.
+inline bool BatchRewriteEnabled() {
+	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_BATCH_REWRITE") != nullptr;
+	return !disabled;
+}
+
+//! specs/014 D5: with the appender off, a commit's data-file rows, statistics and partition values
+//! are INSERT statements in the batch, which the T-SQL run sends with everything else. A switch
+//! while the two are measured against each other.
+inline bool AppenderDisabled() {
+	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_APPENDER") != nullptr;
+	return disabled;
+}
+
 //! Whether DuckLake's conflict-check query is still the text the specs/007 rewrite recognises. The
 //! constant lives with the rewrite in mssql_metadata_queries.cpp; ProbeServerCapabilities asks this
 //! at attach so that a ducklake bump editing the query fails loudly (specs/007).

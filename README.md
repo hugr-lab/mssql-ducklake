@@ -26,8 +26,8 @@ ATTACH 'ducklake:mssql:Server=host,1433;Database=lake_meta;User Id=…;Password=
 **Status: experimental.** The first release, v0.1.0 on the DuckDB v1.5.5 line, is in preparation.
 In place: the full DuckLake surface on a SQL Server catalog; DDL, inlined and file-backed writes,
 `UPDATE`, `DELETE`, `MERGE`; concurrent writers; a server-backed integration suite and a
-concurrency test in CI; a 1000-table benchmark against the PostgreSQL backend, at 1.8x of its total
-time — the [limitations](https://hugr-lab.github.io/mssql-ducklake/reference/limitations/) page
+concurrency test in CI; a 1000-table benchmark against the PostgreSQL backend, at 1.5x of its total
+time with commits at parity — the [limitations](https://hugr-lab.github.io/mssql-ducklake/reference/limitations/) page
 says what is not there yet. The design and every measurement behind it are in
 [`specs/`](specs/README.md). If the extension finds users, the manager is meant to be contributed
 upstream to DuckLake (the PostgreSQL manager is the in-tree precedent).

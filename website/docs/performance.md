@@ -16,24 +16,27 @@ phase, cold.
 
 | phase | SQL Server | PostgreSQL | ratio |
 | --- | ---: | ---: | ---: |
-| create 1000 tables | 160 s | 104 s | 1.5x |
-| first insert into each (inlined) | 29 s | 5.8 s | 5.1x |
-| second insert into each (a data file) | 25 s | 9.5 s | 2.7x |
-| 100 partitioned commits of 25 files | 32 s | 6.2 s | 5.2x |
-| 1000 commits into one table | 78 s | 32 s | 2.5x |
-| flush 1000 tables' inlined data | 248 s | 154 s | 1.6x |
-| re-attach | 0.79 s | 0.13 s | 6.2x |
-| first filtered read after an attach | 0.45 s | 0.18 s | 2.5x |
+| create 1000 tables | 150 s | 98 s | 1.5x |
+| first insert into each (inlined) | 16.7 s | 5.8 s | 2.9x |
+| second insert into each (a data file) | 11.4 s | 9.0 s | 1.3x |
+| 100 partitioned commits of 25 files | 30.7 s | 6.1 s | 5.0x |
+| 1000 commits into one table | 35 s | 30 s | 1.2x |
+| merge adjacent files, 1000 tables | 3.4 s | 22.4 s | 0.15x |
+| flush 1000 tables' inlined data | 240 s | 150 s | 1.6x |
+| re-attach | 0.82 s | 0.13 s | 6.4x |
+| first filtered read after an attach | 0.37 s | 0.18 s | 2.1x |
 | read at an old snapshot, 1000 snapshots deep | 0.02 s | 0.01 s | 2.0x |
-| read a table with 100 schema versions | 14 s | 8.3 s | 1.7x |
-| **whole benchmark** | **698 s** | **388 s** | **1.80x** |
+| read a table with 100 schema versions | 13.7 s | 7.5 s | 1.8x |
+| **whole benchmark** | **577 s** | **375 s** | **1.54x** |
 
-Reads are close: a warm read costs the same on both, the first read after an attach is a quarter
-of a second more, and an attach itself is 0.8 s on a 1000-table catalog — most of it the mssql
-extension discovering the schema. **Writes are the gap**: a commit is ~19 round trips through
-DuckDB's DML operators against the attached catalog, and the PostgreSQL manager sends its batch in
-one call. A server-side commit that does the same is the next piece of work; its experimental
-first form is [behind a switch](./writing.md#the-server-side-commit-experimental).
+Commits are at or near parity: a file-backed commit is one round trip — the manager sends the
+commit batch as its own T-SQL, statement by known statement ([Writing](./writing.md#how-a-commit-reaches-the-server))
+— and the compaction that rewrites many files' metadata is six times faster than on PostgreSQL.
+What remains: the first inlined write into a table (the user's rows go through DuckDB's path, and
+the table is touched for the first time), commits of many files (their rows go through DuckDB's
+appender per table; the mssql extension's bulk-load insert on the DuckDB 2.0 line changes that),
+the flush of many tables' inlined data, and the attach itself — 0.8 s on a 1000-table catalog,
+three TDS logins.
 
 ### What made the difference so far
 
@@ -46,6 +49,11 @@ first form is [behind a switch](./writing.md#the-server-side-commit-experimental
   extension's metadata query, a `table_id` in DuckLake's — is an ad-hoc plan compiled on first use,
   ~35 ms each; on this server that meant every first touch of every table. It is applied by the
   shaping and can be [opted out of](./reference/settings.md).
+- **The commit batch in T-SQL**: DuckLake's commit ran statement by statement through DuckDB's
+  DML operators — ~19 round trips and a catalog-sized scan for the stats update; recognised
+  exactly, from a closed list of the statements DuckLake writes, and sent as the manager's own T-SQL
+  in one call, a file-backed commit went from 25.5 ms to 11.4 (PostgreSQL: 9.0), the benchmark from
+  698 s to 577.
 - **The read layer in T-SQL**: the one lookup a read makes that could miss — does this table have
   an inlined-deletes table — goes to the server as one `mssql_scan()` statement; through the
   catalog path a miss made the mssql extension reload the schema's metadata, a second on a

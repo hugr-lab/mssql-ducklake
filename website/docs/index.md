@@ -57,7 +57,7 @@ Azure Blob, …); only the catalog is in SQL Server.
 is published, [build from source](./development.md). What is in place: the full DuckLake surface;
 DDL, inlined and file-backed writes, `UPDATE`, `DELETE`, `MERGE`; concurrent writers; re-attach;
 a server-backed integration suite and a concurrency test in CI; a benchmark against the PostgreSQL
-backend on a 1000-table catalog, currently at 1.8x of its total time. The
+backend on a 1000-table catalog, currently at 1.5x of its total time with commits at parity. The
 [limitations](./reference/limitations.md) page is the honest list of what is not there yet.
 
 The project's design and every measurement behind a decision are in the repository's

@@ -123,19 +123,19 @@ rewrites anything else and the distribution's format check fails on it.
   This extension is loaded explicitly first; after that the prefix is taken and no autoload fires.
 - **The manager only generates SQL** — like the postgres manager (the in-tree precedent) it never
   links its scanner; `mssql_exec('…', sql)` resolves at runtime.
-- **The catalog is keyed, and DuckLake's own SQL runs through DuckDB**: the manager does not
-  override `Execute` — there is no passthrough and no transpiler (spec 004). Every write DuckLake
-  generates (the commit batch, the inlined flush, expire/cleanup) runs as DuckDB SQL against the
-  attached catalog, statement by statement through the mssql extension's DML operators, and those
-  need a primary key for UPDATE and DELETE — which is why `EnsureCatalogShape` puts one on every
-  table DuckLake updates (spec 004 D3). The appender (spec 006) INSERTs a commit's data files,
-  statistics and partition values the same way. The price is round trips: ~19 per commit, plus a
-  full scan of `ducklake_table_column_stats` for its stats UPDATE (spec 009); the postgres manager
-  hands the batch to `postgres_execute` in one — the server-side commit is the open item.
+- **The commit batch is our T-SQL, statement by known statement** (spec 014, `Execute` in
+  `mssql_commit_batch.cpp`): DuckLake's batch is a closed list of shapes — captured off every write
+  it can make, `design/003` — and each is recognised exactly and sent as the manager's own T-SQL,
+  contiguous runs in one `mssql_exec` on the transaction's connection. No transpiler: a statement
+  matches to the character or goes to the base — DuckDB's DML operators against the keyed catalog
+  (spec 004 D3 is what makes that path work) — in order. The user's inlined rows always take the
+  base path; `MSSQL_DUCKLAKE_STRICT_BATCH=1` (the suite) makes any other fallback an error naming
+  the statement, which is how a ducklake bump that adds a shape is caught.
 - **Inlining is in scope**: DuckLake inlines small inserts into catalog tables (default limit 10);
   the manager owns the inlined-table DDL/types via the type hooks. The matrix and edge cases
   (FLOAT NaN, TIMESTAMP_NS, HUGEINT, STRUCT) are in the research note §5.
-- **Performance target: ≥ postgres backend.** Phase 1 parity (Execute passthrough,
+- **Performance target: ≥ postgres backend.** At 1.54x on the 1000-table bench with commits at
+  parity (spec 014); the plan was: phase 1 parity (Execute passthrough,
   `GetLatestSnapshotQuery` via `mssql_scan`, own `InitializeDuckLake` with PKs + indexes,
   `MaxIdentifierLength=128`); phase 2 beats it with a server-side `ducklake_commit` T-SQL
   procedure — data-only commits in one round trip with server-side retry. Research note §7 is the

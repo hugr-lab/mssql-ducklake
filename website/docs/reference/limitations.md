@@ -12,10 +12,11 @@ Stated as limitations, with where each stands. The specs linked are in the
   published the extension is built from source.
 - **Mutually exclusive with the stock `ducklake` extension**, and it must be loaded before the
   first `ATTACH 'ducklake:…'` ([why](../index.md#how-it-works)).
-- **Slower than the PostgreSQL backend on writes**: 1.8x on the whole 1000-table benchmark, 2.7 – 5x
-  on commit-heavy phases, because a commit runs through DuckDB's DML operators one statement at a
-  time ([Performance](../performance.md)). The server-side commit that closes this is designed
-  (specs/005) and shipped in an experimental, off-by-default form for data-file-only commits.
+- **Slower than the PostgreSQL backend overall**: 1.54x on the whole 1000-table benchmark, with
+  commits at or near parity since the batch goes to the server as T-SQL (specs/014); what remains
+  is the first inlined write into a table (2.9x), commits of many files (5x — their rows go through
+  DuckDB's appender until the mssql extension's bulk-load insert on the DuckDB 2.0 line), the flush
+  (1.6x) and the attach ([Performance](../performance.md)).
 - **Every first touch of a table pays a plan compile** in the mssql extension's per-table metadata
   query when the catalog's database is not forced-parameterized — ~35 ms each. The shaping applies
   the database option; on a database where the login may not, the fix is

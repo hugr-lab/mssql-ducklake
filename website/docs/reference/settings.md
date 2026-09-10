@@ -41,4 +41,7 @@ for ordinary use.
 | `MSSQL_DUCKLAKE_SERVER_COMMIT=1` | turns on the [server-side commit](../writing.md#the-server-side-commit-experimental) for commits that add data files and nothing else |
 | `MSSQL_DUCKLAKE_SERVER_COMMIT_MIN_FILES=<n>` | the commit size (data files) from which the server-side path is used; default 16, the measured crossover on a loopback link |
 | `MSSQL_DUCKLAKE_SERVER_COMMIT_SKIP_FETCH=1` | with the server-side commit, lets the server allocate the snapshot instead of the client fetching it first |
+| `MSSQL_DUCKLAKE_NO_BATCH_REWRITE=1` | runs every commit statement through DuckDB's DML path, the way it ran before the [T-SQL batch](../writing.md#how-a-commit-reaches-the-server) — for comparing the two paths, and for taking the rewrite out of a diagnosis |
+| `MSSQL_DUCKLAKE_STRICT_BATCH=1` | a commit statement the T-SQL batch does not recognise is an error naming the statement, instead of a fallback to DuckDB's path; the integration suite runs with it |
+| `MSSQL_DUCKLAKE_NO_APPENDER=1` | a commit's data-file rows, statistics and partition values travel in the batch as `INSERT` statements instead of through DuckDB's appender |
 | `MSSQL_DUCKLAKE_NO_CONFLICT_REWRITE=1` | runs DuckLake's conflict check in its original two-read form instead of the one-statement T-SQL form — exists so the concurrency regression test can be shown to fail |

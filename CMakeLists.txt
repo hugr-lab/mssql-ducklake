@@ -39,7 +39,8 @@ add_subdirectory(ducklake/src ${CMAKE_CURRENT_BINARY_DIR}/ducklake_embed)
 
 set(EXTENSION_SOURCES
     src/mssql_ducklake_extension.cpp src/mssql_metadata_manager.cpp src/mssql_catalog_shape.cpp
-    src/mssql_server_commit.cpp src/mssql_metadata_queries.cpp ${ALL_OBJECT_FILES})
+    src/mssql_server_commit.cpp src/mssql_metadata_queries.cpp src/mssql_commit_batch.cpp
+    ${ALL_OBJECT_FILES})
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
