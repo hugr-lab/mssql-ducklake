@@ -41,8 +41,11 @@ model, the full manager plan §7: transpiler, keys + filtered indexes, server-si
 src/
   mssql_ducklake_extension.cpp   # entry: exclusion gate (stock ducklake), mssql deps gate,
                                  #   ducklake_duckdb_cpp_init chain, Register("mssql") via call_once
-  mssql_metadata_manager.cpp     # the SQL Server metadata manager (specs/004+ fill the phases)
-  include/                       # mssql_ducklake_extension.hpp, mssql_metadata_manager.hpp
+  mssql_metadata_manager.cpp     # the manager: type matrix, talking to the server, inlined table, attach probe
+  mssql_catalog_shape.cpp        # what shapes a catalog: keys, indexes, collations, the database option (004, 006, 012)
+  mssql_server_commit.cpp        # phase 2: the commit staged and applied on the server (005)
+  mssql_metadata_queries.cpp     # the queries written in T-SQL: the conflict check (007), the read layer (008)
+  include/                       # the class header, mssql_metadata_internal.hpp (switches + shared helpers)
 ducklake/                        # submodule, EMBEDDED: add_subdirectory(ducklake/src) supplies
                                  #   ALL_OBJECT_FILES; never modified, never loaded separately
 extension_config.cmake           # loads: this extension (DONT_LINK) + mssql (DONT_LINK @ release tag)
@@ -117,13 +120,15 @@ rewrites anything else and the distribution's format check fails on it.
   This extension is loaded explicitly first; after that the prefix is taken and no autoload fires.
 - **The manager only generates SQL** — like the postgres manager (the in-tree precedent) it never
   links its scanner; `mssql_exec('…', sql)` resolves at runtime.
-- **Execute-passthrough kills the PK problem**: every ducklake write that carries an UPDATE or a
-  DELETE (commit batch, inlined flush, expire/cleanup) flows through one `Execute` seam; passed
-  through as raw T-SQL server-side, duckdb's DML path (rowid/PK) is not involved — mssql's
-  PK-required UPDATE/DELETE limitation never applies to the lake catalog. The one write that does
-  take duckdb's DML path is the appender's, since spec 006 turned it on: it INSERTs a commit's data
-  files, statistics and partition values, and mssql needs a key for UPDATE and DELETE but not for
-  INSERT — so the exception is safe, and those four tables carry primary keys regardless.
+- **The catalog is keyed, and DuckLake's own SQL runs through DuckDB**: the manager does not
+  override `Execute` — there is no passthrough and no transpiler (spec 004). Every write DuckLake
+  generates (the commit batch, the inlined flush, expire/cleanup) runs as DuckDB SQL against the
+  attached catalog, statement by statement through the mssql extension's DML operators, and those
+  need a primary key for UPDATE and DELETE — which is why `EnsureCatalogShape` puts one on every
+  table DuckLake updates (spec 004 D3). The appender (spec 006) INSERTs a commit's data files,
+  statistics and partition values the same way. The price is round trips: ~19 per commit, plus a
+  full scan of `ducklake_table_column_stats` for its stats UPDATE (spec 009); the postgres manager
+  hands the batch to `postgres_execute` in one — the server-side commit is the open item.
 - **Inlining is in scope**: DuckLake inlines small inserts into catalog tables (default limit 10);
   the manager owns the inlined-table DDL/types via the type hooks. The matrix and edge cases
   (FLOAT NaN, TIMESTAMP_NS, HUGEINT, STRUCT) are in the research note §5.
@@ -153,12 +158,15 @@ rewrites anything else and the distribution's format check fails on it.
   table commits too (it writes a delete file, no stats row). Every LATER write to that table fails:
   once stats exist the commit batch UPDATEs `ducklake_table_stats`, that UPDATE takes duckdb's DML
   path, and mssql needs a PK for it. A DELETE of an inlined row fails the same way on
-  `ducklake_inlined_data_<t>_<v>`. Exactly what the manager's Execute passthrough removes (research
-  note §4; spec 004). Pinned by `statement error` in the integration test.
+  `ducklake_inlined_data_<t>_<v>`. Exactly what the manager's primary keys remove (spec 004 D3).
+  Pinned by `statement error` in the integration test.
 - **`mssql_scan()` on the pinned connection**: v0.2.5 materializes only *catalog* scans; a plan
-  mixing `mssql_scan()` with a catalog scan, or two `mssql_scan()`s, inside a transaction still
-  fails (verified). The fix (mssql-extension #314) arrives with the duckdb 2.0 line; not a
-  blocker — on v1.5.5 the manager uses `mssql_scan()` only as the sole source of a query.
+  mixing `mssql_scan()` with a catalog scan, or two `mssql_scan()`s, inside a transaction fails
+  **depending on execution order** — measured on 20,000-row results (design 002 §5), a
+  `catalog JOIN mssql_scan` passes when the plan happens to drain the stream first and the same
+  pair fails as a CTE, so one lucky plan proves nothing. The fix (mssql-extension #314) arrives
+  with the duckdb 2.0 line; not a blocker — on v1.5.5 the manager uses `mssql_scan()` only as the
+  sole source of a query.
 
 ## Distribution
 
