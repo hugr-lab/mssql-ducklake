@@ -179,8 +179,9 @@ rewrites anything else and the distribution's format check fails on it.
 on pull requests. The org site (hugr-lab.github.io) links here. Rules that came from the mssql
 extension's site: links between pages are relative markdown links, never absolute site paths
 (`scripts/ci/check_docs_links.py` enforces it — an absolute link leaves the version the reader is
-in); **at each release run `npm run docusaurus docs:version <X.Y.Z>` in `website/` and commit the
-snapshot**, so the released docs serve at the root and the live tree as *Next*. A feature that
+in); the released docs serve at the root and the live tree as *Next*, and **the versions come
+from the release tags at deploy time** — `pages.yml` runs `docs:version` on each tag's tree, nothing
+is committed for it (specs/011; see Releasing). A feature that
 changes what a user sees lands with its page in `website/docs/`, the way it lands with its spec.
 
 ## Releasing
@@ -193,7 +194,9 @@ platform through the same reusable workflow as `distribution.yml`, and publishes
 with the binaries and `SHA256SUMS.txt`; the tag's push also runs `pages.yml`, which
 snapshots every release tag's docs as that version at deploy time — never commit
 `versioned_docs/` or `versions.json`. After the tag: the PR to duckdb/community-extensions with
-`description.yml`, and the constant to the next version with `-dev`.
+`description.yml`, its `ref` replaced by the tag's commit SHA (`git rev-list -n 1 vX.Y.Z` — the
+convention there; the repo's copy names the tag, since a commit cannot carry its own SHA), and the
+constant to the next version with `-dev`.
 
 ## Distribution
 
