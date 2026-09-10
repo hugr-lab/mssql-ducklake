@@ -43,7 +43,7 @@ specs are the shareable distillation of that work.
 | [005](005-server-side-commit/spec.md) | phase 2 — the commit as one call to the server | draft |
 | [006](006-write-path/spec.md) | the write path — the appender, MERGE, and the catalog's own storage | implemented |
 | [007](007-concurrent-commit/spec.md) | concurrent commits — the conflict check that read one table twice | implemented |
-| [008](008-tsql-read-layer/spec.md) | the T-SQL read layer — five scalar lookups through `mssql_scan` | draft |
+| [008](008-tsql-read-layer/spec.md) | the T-SQL read layer — one probe through `mssql_scan`, and why not five | implemented |
 | [009](009-inlined-first-write/spec.md) | the first inlined write, and what an attach costs | draft |
 | [010](010-manager-split/spec.md) | splitting the manager, and two documents that say the wrong thing | draft |
 | [011](011-first-release/spec.md) | the first release — v0.1.0 on the v1.5.5 line, through community-extensions | draft |
