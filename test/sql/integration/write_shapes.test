@@ -213,6 +213,46 @@ SELECT (SELECT v FROM lake.s1.t WHERE id = 4), (SELECT count(*) FROM lake.s1.int
 ----
 four!	1
 
+# Two tables whose SCHEMA changes in one commit: the snapshot writes a ducklake_schema_versions row
+# per table (DuckLakeMetadataManager::InsertNewSchema), and the key on that table has to tell them
+# apart. It did not - it was (begin_snapshot, schema_version) - so the server refused the second row
+# and every commit touching two tables failed, on its first try and on all ten retries (issue #30).
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE TABLE lake.s1.two_a AS SELECT 1 AS x;
+
+statement ok
+CREATE TABLE lake.s1.two_b AS SELECT 2 AS x;
+
+statement ok
+COMMIT;
+
+# and the same for two tables ALTERED in one commit, the other way into that set
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE lake.s1.two_a ADD COLUMN y INTEGER;
+
+statement ok
+ALTER TABLE lake.s1.two_b ADD COLUMN y INTEGER;
+
+statement ok
+COMMIT;
+
+query III
+SELECT (SELECT x FROM lake.s1.two_a), (SELECT x FROM lake.s1.two_b), (SELECT y FROM lake.s1.two_a);
+----
+1	2	NULL
+
+# on the server that is two rows of one snapshot, which is what the old key could not hold
+query I
+SELECT m FROM mssql_scan('srv', 'SELECT CAST(MAX(n) AS BIGINT) AS m FROM (SELECT COUNT(*) AS n FROM write_shapes.ducklake_schema_versions GROUP BY begin_snapshot, schema_version) t');
+----
+2
+
 # time travel still answers from the catalog the rewrite wrote
 query I
 SELECT count(*) FROM lake.s1.t AT (VERSION => 4);
@@ -256,7 +296,7 @@ DROP SCHEMA lake.s1 CASCADE;
 query II
 SELECT (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lake' AND schema_name = 's1'), (SELECT count(*) FROM ducklake_table_info('lake'));
 ----
-0	6
+0	8
 
 statement ok
 DETACH lake;

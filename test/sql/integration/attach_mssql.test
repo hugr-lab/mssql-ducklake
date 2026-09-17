@@ -538,13 +538,21 @@ SELECT t, l FROM mssql_scan('srv', 'SELECT ty.name AS t, CAST(c.max_length AS BI
 ----
 varchar	200
 
+# DuckLake writes a ducklake_schema_versions row per table whose schema changed in a snapshot, so
+# the table is half of what makes a row unique. The key was (begin_snapshot, schema_version), and
+# the server refused the second table of every commit that touched two (issue #30)
+query I
+SELECT k FROM mssql_scan('srv', 'SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.key_ordinal) AS k FROM sys.key_constraints kc JOIN sys.index_columns ic ON ic.object_id = kc.parent_object_id AND ic.index_id = kc.unique_index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id WHERE kc.name = ''pk_ducklake_schema_versions'' AND kc.schema_id = SCHEMA_ID(''dbo'')');
+----
+begin_snapshot,schema_version,table_id
+
 # the shape version this build wrote - on the catalog's anchor table, which is what
 # CatalogShapeIsCurrent reads on the next attach - and the stale schema-level one planted at the top
 # of this file is gone
 query I
 SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM sys.extended_properties WHERE class = 1 AND major_id = OBJECT_ID(''dbo.ducklake_metadata'') AND minor_id = 0 AND name = ''mssql_ducklake_shape''');
 ----
-4
+5
 
 query I
 SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.extended_properties WHERE class = 3 AND major_id = SCHEMA_ID(''dbo'') AND name = ''mssql_ducklake_shape''');
@@ -673,6 +681,69 @@ DROP TABLE rekeyed.fd;
 
 statement ok
 DETACH rekeyed;
+
+# A key an older build got wrong, on a catalog that build already shaped. The keys are added under
+# their NAME - `IF NOT EXISTS (... WHERE name = 'pk_<table>')` - so a corrected column list reaches
+# such a catalog only if the shaping drops what is there first; without that the stamp moved to the
+# new version and the wrong key stayed, which is how issue #30 outlived its fix everywhere it had
+# already been attached. The old two-column key is put back here, with the stamp removed, and the
+# next attach has to rebuild it over all three.
+statement ok
+SELECT mssql_exec('srv', 'EXEC sp_dropextendedproperty @name = N''mssql_ducklake_shape'', @level0type = N''SCHEMA'', @level0name = N''dbo'', @level1type = N''TABLE'', @level1name = N''ducklake_metadata'';
+ALTER TABLE dbo.ducklake_schema_versions DROP CONSTRAINT pk_ducklake_schema_versions;
+ALTER TABLE dbo.ducklake_schema_versions ADD CONSTRAINT pk_ducklake_schema_versions PRIMARY KEY (begin_snapshot, schema_version);');
+
+query I
+SELECT k FROM mssql_scan('srv', 'SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.key_ordinal) AS k FROM sys.key_constraints kc JOIN sys.index_columns ic ON ic.object_id = kc.parent_object_id AND ic.index_id = kc.unique_index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id WHERE kc.name = ''pk_ducklake_schema_versions'' AND kc.schema_id = SCHEMA_ID(''dbo'')');
+----
+begin_snapshot,schema_version
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS rekeyed_sv (DATA_PATH '__TEST_DIR__/lake');
+
+query I
+SELECT k FROM mssql_scan('srv', 'SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.key_ordinal) AS k FROM sys.key_constraints kc JOIN sys.index_columns ic ON ic.object_id = kc.parent_object_id AND ic.index_id = kc.unique_index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id WHERE kc.name = ''pk_ducklake_schema_versions'' AND kc.schema_id = SCHEMA_ID(''dbo'')');
+----
+begin_snapshot,schema_version,table_id
+
+# and the commit the old key refused: two tables created in one transaction, two altered in another
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE TABLE rekeyed_sv.pair_a AS SELECT 1 AS x;
+
+statement ok
+CREATE TABLE rekeyed_sv.pair_b AS SELECT 2 AS x;
+
+statement ok
+COMMIT;
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+ALTER TABLE rekeyed_sv.pair_a ADD COLUMN y INTEGER;
+
+statement ok
+ALTER TABLE rekeyed_sv.pair_b ADD COLUMN y INTEGER;
+
+statement ok
+COMMIT;
+
+query II
+SELECT (SELECT x FROM rekeyed_sv.pair_a), (SELECT x FROM rekeyed_sv.pair_b);
+----
+1	2
+
+statement ok
+DROP TABLE rekeyed_sv.pair_a;
+
+statement ok
+DROP TABLE rekeyed_sv.pair_b;
+
+statement ok
+DETACH rekeyed_sv;
 
 # A second lake in another schema of the same database gets its own indexes. It did not: index names
 # embed the table but not the schema, and `sys.indexes.name` is unique per table rather than per

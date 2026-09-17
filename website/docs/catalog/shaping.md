@@ -20,6 +20,11 @@ DuckLake updates or deletes from gets a primary key (`ducklake_table_stats(table
 `NOT NULL`; the tables keyed on a name (`ducklake_metadata`, the tag tables) get a `VARCHAR(200)`
 key column, inside SQL Server's 900-byte index limit.
 
+A key this extension has since corrected is rebuilt rather than left alone: on attach the shaping
+compares each key's columns with what the server has and drops the constraint when they differ, so
+a catalog created by an earlier build ends up with the current key instead of the one it was made
+with.
+
 ### Strings and their collation
 
 DuckLake's catalog stores its strings — names, paths, and the per-file minimum and maximum values
