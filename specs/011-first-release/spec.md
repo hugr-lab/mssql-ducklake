@@ -54,6 +54,19 @@ made by it start no workflows — `release: published` never fired. The push of 
 user's event and does; `pages.yml` now runs on `v*` tags (and on demand), and the release trigger
 is gone. The v0.1.0 deploy was dispatched by hand.
 
+**D2c — what v0.1.1 taught: the tag's run is refused by the environment, not by the trigger.** The
+tag-push trigger fired, and the job failed in two seconds having run no step at all: the
+`github-pages` environment carried one deployment branch policy, `main`, and a tag matches no
+branch policy. The v0.1.0 deploy never met this because it was dispatched from `main`. Fixed where
+it lives rather than in the workflow - the environment now also allows the tag pattern `v*`
+(`gh api repos/<repo>/environments/github-pages/deployment-branch-policies -f name='v*' -f
+type='tag'`), which is a repository setting and therefore not visible in this tree: if a fork or a
+new repository runs this workflow, that policy has to be added there too. Second, and it is the
+same two minutes: merging the release commit and pushing the tag start two `pages` runs eleven
+seconds apart, and `cancel-in-progress` in the `pages` concurrency group cancels the first. That is
+the right outcome - the tag's run is the one that carries the new version - but it means a failed
+tag run leaves the site on the previous release with nothing else about to publish it.
+
 **D3 — the version.** `MSSQL_DUCKLAKE_VERSION` is `0.1.0` in this commit; `description.yml` says
 `0.1.0` and `ref: v0.1.0`; the guard holds them together. After the release the constant goes to
 the next version with `-dev`, and the descriptor stays at the released tag until the next release
