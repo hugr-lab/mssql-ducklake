@@ -185,6 +185,22 @@ is the part DuckDB cannot express, applied as our T-SQL:
 - **Primary keys** on every table DuckLake updates or deletes from — twenty-three of them. Not only
   the ones a commit touches: expiry, cleanup, compaction and a repeated `set_option` write to
   another dozen, and each would fail the same way.
+- **A key covers what makes a row unique, and one of them did not.** `ducklake_schema_versions` was
+  keyed `(begin_snapshot, schema_version)`; DuckLake writes one row per table whose schema changed
+  in the snapshot (`InsertNewSchema`), so every commit touching two tables was refused by the server
+  as a duplicate key — on the first attempt and on all ten retries. Reported from a Fabric SQL
+  catalog as issue #30, three months after the shape was written, because the suite's transactions
+  never changed two tables at once and the 1000-table benchmark creates each table in its own
+  statement. The key is `(begin_snapshot, schema_version, table_id)`. All twenty-three were then
+  audited the way this should have been done first: a catalog driven until every keyed table held
+  rows, then the maximum number of rows per declared key. It is the only one that was wrong.
+- **A corrected key has to reach the catalogs already shaped.** The `ADD CONSTRAINT` is guarded by
+  the constraint's *name*, so a changed column list alone would leave every existing catalog on the
+  old key while the stamp moved to the new version — the fix would ship and change nothing where it
+  was needed. The shaping now drops a `pk_<table>` whose column list differs from the declared one,
+  compared as text against `sys.index_columns`, before adding it back. `SHAPE_VERSION` 5 is what
+  makes a shaped catalog re-run that. `table_id` also has to become `NOT NULL`, so the sweep
+  DuckLake's own migration does (`DELETE … WHERE table_id IS NULL`) runs first.
 - **Filtered indexes** `WHERE end_snapshot IS NULL` on the versioned tables — the condition almost
   every read carries. Neither postgres nor sqlite has indexes here; this is the first place we can
   be faster rather than equal.

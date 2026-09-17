@@ -85,7 +85,9 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	    {"ducklake_file_partition_value", "data_file_id, partition_key_index"},
 	    {"ducklake_column_mapping", "mapping_id"},
 	    {"ducklake_name_mapping", "mapping_id, column_id"},
-	    {"ducklake_schema_versions", "begin_snapshot, schema_version"},
+	    // one row per table whose schema changed in the snapshot, so the table is what tells two rows
+	    // of one snapshot apart (DuckLakeMetadataManager::InsertNewSchema; issue #30)
+	    {"ducklake_schema_versions", "begin_snapshot, schema_version, table_id"},
 	};
 	// The tag tables and the metadata table key on a name rather than an id. A primary key cannot be
 	// over MAX, so those are capped - 200 bytes of UTF-8 is a long name and well inside the
@@ -99,10 +101,41 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 
 	string columns_ddl;
 	string constraints_ddl;
+
+	// DuckLake's own migration adds ducklake_schema_versions.table_id nullable, fills it from history
+	// and then deletes the rows it could not fill (ducklake_metadata_manager.cpp). It runs before
+	// this - LoadExistingDuckLake, then ProbeServerCapabilities (ducklake_initializer.cpp) - so the
+	// only catalog still holding those rows is one whose migration did not finish. NULLs keep the
+	// column out of a key, so the sweep upstream does runs here too, before the NOT NULL below.
+	columns_ddl += StringUtil::Format("DELETE FROM %s.ducklake_schema_versions WHERE table_id IS NULL;\n", schema);
+
 	for (auto &entry : keys) {
-		for (auto &column : StringUtil::Split(entry.second, ',')) {
-			auto name = column;
+		auto names = StringUtil::Split(entry.second, ',');
+		// the key as the server spells one: the column names in key order, without the brackets a
+		// reserved word wears here
+		string declared;
+		for (auto &name : names) {
 			StringUtil::Trim(name);
+			if (!declared.empty()) {
+				declared += ",";
+			}
+			declared += StringUtil::Replace(StringUtil::Replace(name, "[", ""), "]", "");
+		}
+		// A key this build has since corrected, still on the table under the same name. The ADD below
+		// is guarded by the constraint's NAME, so a changed column list would otherwise never reach a
+		// catalog an older build already shaped - the stamp would move, the wrong key would stay, and
+		// only a hand-written ALTER could fix it. That is issue #30: ducklake_schema_versions was
+		// keyed without table_id, DuckLake writes one row per table of a snapshot, and every commit
+		// touching two tables was refused by the server. Compared as text against what sys says the
+		// key is today, so this costs nothing on a catalog that is already right.
+		columns_ddl += StringUtil::Format(
+		    "IF EXISTS (SELECT 1 FROM sys.key_constraints kc WHERE kc.name = 'pk_%s' AND kc.schema_id = SCHEMA_ID(%s) "
+		    "AND kc.type = 'PK' AND ISNULL((SELECT STRING_AGG(c.name, ',') WITHIN GROUP (ORDER BY ic.key_ordinal) "
+		    "FROM sys.index_columns ic JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
+		    "WHERE ic.object_id = kc.parent_object_id AND ic.index_id = kc.unique_index_id), '') <> '%s') "
+		    "ALTER TABLE %s.%s DROP CONSTRAINT pk_%s;\n",
+		    entry.first, schema_literal, declared, schema, entry.first, entry.first);
+		for (auto &name : names) {
 			// a key column has to be NOT NULL, and DuckLake declares none of them so
 			columns_ddl += StringUtil::Format("ALTER TABLE %s.%s ALTER COLUMN %s %s NOT NULL;\n", schema, entry.first,
 			                                  name, key_column_type(name));

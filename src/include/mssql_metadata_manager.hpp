@@ -159,8 +159,9 @@ private:
 	//! at 2 because 1 is implicitly every catalog shaped before this stamp existed: those carry no
 	//! property at all, read as older, and are converted once. 3 added forced parameterization of
 	//! the catalog's database (specs/012); 4 keys the inlined deletion tables an older build left
-	//! keyless (specs/014).
-	static constexpr int64_t SHAPE_VERSION = 4;
+	//! keyless (specs/014); 5 rebuilds ducklake_schema_versions' key over table_id as well (issue
+	//! #30 - without it a commit touching two tables is refused by the server).
+	static constexpr int64_t SHAPE_VERSION = 5;
 	//! Where that version is recorded: an extended property on the catalog's own ducklake_metadata
 	//! table - per catalog, invisible to DuckLake's queries, and gone the moment the catalog's
 	//! tables are, which is what makes a recreated catalog shape itself again.
