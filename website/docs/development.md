@@ -22,6 +22,23 @@ The build produces `build/release/duckdb` with both extensions under `build/rele
 `build/release/test/unittest 'test/sql/*'` runs the server-free suite and `scripts/ci/smoke_load.sh`
 the out-of-tree load and both gates.
 
+Trying that build in another DuckDB means an unsigned load, and **the mssql extension has to be
+loaded by hand there**:
+
+```sql
+-- duckdb -unsigned
+FORCE INSTALL 'build/release/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
+LOAD mssql;                -- install it from community first if it is not there
+LOAD mssql_ducklake;
+```
+
+An extension installed from a file is a custom-path install, and DuckDB does not autoload anything
+for one — so `LOAD mssql_ducklake` alone stops at the load-time check for the mssql extension, even
+with mssql installed. Worse, the `ATTACH 'ducklake:…'` that follows a refused load autoloads the
+**stock** ducklake for that prefix, and the attach then goes through DuckLake's generic manager: it
+appears to work, and the first commit past a table's first write fails instead. Installed from the
+community repository the autoload happens by itself and `LOAD mssql_ducklake` is enough.
+
 ### The integration suite
 
 `test/sql/integration/` runs against a real SQL Server holding a DuckLake catalog. The environment
