@@ -1,6 +1,8 @@
 # Spec 011: the first release — v0.1.0 on the v1.5.5 line
 
-- **Status**: implemented (v0.1.0 tagged 2026-09-10; duckdb/community-extensions#2683)
+- **Status**: implemented (v0.1.0 tagged 2026-09-10, duckdb/community-extensions#2683; v0.1.1
+  tagged 2026-09-17 by the same steps, duckdb/community-extensions#2728 - the first release this
+  process carried on its own, and it needed no hand-dispatched deploy)
 - **Date**: 2026-09-10
 - **Author**: VGSML
 
