@@ -8,6 +8,27 @@ sidebar_position: 8
 Versions of this documentation follow the releases: the dropdown shows the docs of each tag, and
 *Next* is what is being written for the coming one.
 
+## v0.1.1 — a catalog that takes two tables in one commit
+
+DuckDB **v1.5.5**, DuckLake `v1.5-variegata` embedded, the mssql extension **v0.2.5** or newer.
+A fix release: nothing else changed.
+
+**The fix.** A transaction that created or altered **two or more tables** failed to commit, with
+`Violation of PRIMARY KEY constraint 'pk_ducklake_schema_versions'` from the server and ten retries
+after it. DuckLake records one row per table whose schema changed in a snapshot, and the key this
+extension put on that table did not include the table — so the second table of the commit read as a
+duplicate. Reported from a Fabric SQL database as
+[issue #30](https://github.com/hugr-lab/mssql-ducklake/issues/30); a single-table commit, which is
+what the tests and the benchmark did, never met it.
+
+**What it means for an existing catalog.** Nothing to do: attach it with this version and the key
+is rebuilt in place, along with anything else the [shaping](./catalog/shaping.md) has corrected
+since the catalog was made. That repair is itself new — keys were applied by name, so a catalog
+already shaped kept the key it was made with. A catalog fixed by hand in the meantime reads as
+correct and is left alone.
+
+**Everything else** is as in v0.1.0 below, including the platforms.
+
 ## v0.1.0 — the first release
 
 DuckDB **v1.5.5**, DuckLake `v1.5-variegata` embedded, the mssql extension **v0.2.5** or newer.
