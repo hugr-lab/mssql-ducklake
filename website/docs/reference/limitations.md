@@ -8,8 +8,8 @@ sidebar_position: 2
 Stated as limitations, with where each stands. The specs linked are in the
 [repository](https://github.com/hugr-lab/mssql-ducklake/tree/main/specs).
 
-- **Experimental, first release in preparation.** v0.1.0 on the DuckDB v1.5.5 line; until it is
-  published the extension is built from source.
+- **Experimental.** v0.1.1 on the DuckDB v1.5.5 line, from the community extensions repository
+  ([Releases](../releases.md)).
 - **Mutually exclusive with the stock `ducklake` extension**, and it must be loaded before the
   first `ATTACH 'ducklake:…'` ([why](../index.md#how-it-works)).
 - **Slower than the PostgreSQL backend overall**: 1.54x on the whole 1000-table benchmark, with

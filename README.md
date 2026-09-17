@@ -29,7 +29,8 @@ ATTACH 'ducklake:mssql:Server=host,1433;Database=lake_meta;User Id=…;Password=
 > `mssql_ducklake` **before** the first `ATTACH 'ducklake:…'`, otherwise DuckDB autoloads the stock
 > extension for that prefix.
 
-**Status: experimental.** Released as v0.1.0 on the DuckDB v1.5.5 line.
+**Status: experimental.** Released as v0.1.1 on the DuckDB v1.5.5 line, installable with
+`INSTALL mssql_ducklake FROM community`.
 In place: the full DuckLake surface on a SQL Server catalog; DDL, inlined and file-backed writes,
 `UPDATE`, `DELETE`, `MERGE`; concurrent writers; a server-backed integration suite and a
 concurrency test in CI; a 1000-table benchmark against the PostgreSQL backend, at 1.5x of its total

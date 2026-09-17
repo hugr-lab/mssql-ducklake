@@ -37,15 +37,13 @@ const config: Config = {
           sidebarPath: './sidebars.ts',
           // Docs ARE the site: /mssql-ducklake/<page>/
           routeBasePath: '/',
-          // VERSIONING CONTRACT: at each release, run
-          //   npm run docusaurus docs:version <X.Y.Z>
-          // in website/ and commit the snapshot. Docusaurus then serves the
-          // latest RELEASED version at the root (the default) and the live
-          // docs/ tree as "Next" under /next/ with an "unreleased" banner - so
-          // in-progress docs for the coming release are reachable but never
-          // the landing default. Until the first snapshot exists (v0.1.0,
-          // specs/011), the current docs serve at the root and the version
-          // dropdown has nothing to switch to.
+          // VERSIONING CONTRACT: the versions are made at DEPLOY time, from
+          // the release tags - pages.yml runs `docusaurus docs:version <X.Y.Z>`
+          // on each tag's own tree (specs/011), so nothing is committed for
+          // them. Docusaurus then serves the latest RELEASED version at the
+          // root (the default) and the live docs/ tree as "Next" under /next/
+          // with an "unreleased" banner - so in-progress docs for the coming
+          // release are reachable but never the landing default.
           editUrl: 'https://github.com/hugr-lab/mssql-ducklake/tree/main/website/',
           showLastUpdateTime: true,
         },
