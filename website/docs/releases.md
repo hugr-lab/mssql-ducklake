@@ -8,6 +8,22 @@ sidebar_position: 8
 Versions of this documentation follow the releases: the dropdown shows the docs of each tag, and
 *Next* is what is being written for the coming one.
 
+## v0.1.2 — the DuckDB v1.5.6 line
+
+DuckDB **v1.5.6**, DuckLake `v1.5-variegata` embedded, the mssql extension **v0.2.5** or newer.
+A pin release: the extension's own code is byte-for-byte what v0.1.1 shipped.
+
+**What changed.** The release line moved to DuckDB v1.5.6, and the embedded DuckLake to the head of
+its v1.5 branch (a lock around the scan's profiling counters, and an error check moved in the
+PostgreSQL manager — neither reaches a SQL Server catalog). A DuckDB extension is built for one
+release line, so **v0.1.2 loads on v1.5.6 and v0.1.1 on v1.5.5**; installing from the community
+repository picks the right one for the DuckDB you are running.
+
+**Nothing to do for an existing catalog.** The catalog shape is unchanged from v0.1.1, so a catalog
+made by either version attaches to both.
+
+**Everything else** is as in v0.1.1 below, including the platforms.
+
 ## v0.1.1 — a catalog that takes two tables in one commit
 
 DuckDB **v1.5.5**, DuckLake `v1.5-variegata` embedded, the mssql extension **v0.2.5** or newer.
