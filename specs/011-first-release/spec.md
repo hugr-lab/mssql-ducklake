@@ -2,7 +2,10 @@
 
 - **Status**: implemented (v0.1.0 tagged 2026-09-10, duckdb/community-extensions#2683; v0.1.1
   tagged 2026-09-17 by the same steps, duckdb/community-extensions#2728 - the first release this
-  process carried on its own, and it needed no hand-dispatched deploy)
+  process carried on its own, and it needed no hand-dispatched deploy; v0.1.2 tagged 2026-09-30 for
+  the DuckDB v1.5.6 line, duckdb/community-extensions#2867 - and that PR is also how the extension
+  reaches a new DuckDB release when the upstream rebuild wave stalls, since a merged descriptor
+  builds against their current DuckDB and deploys)
 - **Date**: 2026-09-10
 - **Author**: VGSML
 
