@@ -14,7 +14,7 @@ duckdb_extension_load(mssql_ducklake
 # The runtime dependency, as a loadable (DONT_LINK): production pairs the extension with the
 # distributed mssql artifact, so the tests do too - loaded by build path
 # (`LOAD '__BUILD_DIRECTORY__/extension/mssql/...'`). The pin is the release tag built against
-# duckdb v1.5.5 (v0.2.5: the catalog's default schema is dbo, multi-scan plans on a pinned
+# the v1.5 line (v0.2.5: the catalog's default schema is dbo, multi-scan plans on a pinned
 # connection materialize - spec 003); its openssl/simdutf arrive through the merged vcpkg manifest.
 duckdb_extension_load(mssql
     DONT_LINK

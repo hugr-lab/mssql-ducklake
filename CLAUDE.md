@@ -21,11 +21,11 @@ model, the full manager plan §7: transpiler, keys + filtered indexes, server-si
 
   | Piece | Where | Pin |
   | --- | --- | --- |
-  | duckdb | submodule `duckdb/` | tag `v1.5.5` |
+  | duckdb | submodule `duckdb/` | tag `v1.5.6` |
   | ducklake | submodule `ducklake/` (EMBEDDED — compiled into the extension) | branch `v1.5-variegata` (SHA in the submodule) |
   | mssql | `extension_config.cmake` (runtime pair, test loadable) | tag `v0.2.5` |
-  | extension-ci-tools | submodule `extension-ci-tools/` | branch `v1.5.5` |
-  | CI reusable workflows | `.github/workflows/distribution.yml` | `@v1.5.5`, `duckdb_version: v1.5.5` |
+  | extension-ci-tools | submodule `extension-ci-tools/` | branch `v1.5.6` |
+  | CI reusable workflows | `.github/workflows/distribution.yml` | `@v1.5.6`, `duckdb_version: v1.5.6` |
 
   **Vendoring rule**: the ducklake submodule bumps on OUR schedule (manager work never waits for a
   ducklake release), and ducklake fixes reach users only with our bump — so bumps stay cheap and
@@ -168,7 +168,7 @@ rewrites anything else and the distribution's format check fails on it.
   **depending on execution order** — measured on 20,000-row results (design 002 §5), a
   `catalog JOIN mssql_scan` passes when the plan happens to drain the stream first and the same
   pair fails as a CTE, so one lucky plan proves nothing. The fix (mssql-extension #314) arrives
-  with the duckdb 2.0 line; not a blocker — on v1.5.5 the manager uses `mssql_scan()` only as the
+  with the duckdb 2.0 line; not a blocker — on the v1.5 line the manager uses `mssql_scan()` only as the
   sole source of a query.
 
 ## Documentation
@@ -200,7 +200,7 @@ constant to the next version with `-dev`.
 
 ## Distribution
 
-Experimental, through the **community extensions repository** on released DuckDB (v1.5.5);
+Experimental, through the **community extensions repository** on released DuckDB (v1.5.6);
 the GitHub release of each tag carries the same binaries. The
 description is honest: embeds ducklake at a named pin, mutually exclusive with the stock ducklake
 extension. The upstream track — a PR contributing the manager in-tree to ducklake (postgres-manager

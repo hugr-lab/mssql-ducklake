@@ -1,7 +1,7 @@
 # mssql_ducklake
 
 [![CI](https://github.com/hugr-lab/mssql-ducklake/actions/workflows/ci.yml/badge.svg)](https://github.com/hugr-lab/mssql-ducklake/actions/workflows/ci.yml)
-[![DuckDB](https://img.shields.io/static/v1?label=duckdb&message=v1.5.5&color=blue)](https://github.com/duckdb/duckdb/releases/tag/v1.5.5)
+[![DuckDB](https://img.shields.io/static/v1?label=duckdb&message=v1.5.6&color=blue)](https://github.com/duckdb/duckdb/releases/tag/v1.5.6)
 [![Latest release](https://img.shields.io/github/v/release/hugr-lab/mssql-ducklake?label=release&color=blue)](https://github.com/hugr-lab/mssql-ducklake/releases/latest)
 [![Docs](https://img.shields.io/badge/docs-hugr--lab.github.io%2Fmssql--ducklake-1c7d78)](https://hugr-lab.github.io/mssql-ducklake/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -29,8 +29,9 @@ ATTACH 'ducklake:mssql:Server=host,1433;Database=lake_meta;User Id=…;Password=
 > `mssql_ducklake` **before** the first `ATTACH 'ducklake:…'`, otherwise DuckDB autoloads the stock
 > extension for that prefix.
 
-**Status: experimental.** Released as v0.1.1 on the DuckDB v1.5.5 line, installable with
-`INSTALL mssql_ducklake FROM community`.
+**Status: experimental.** Released as v0.1.1 for the DuckDB v1.5.5 line, installable with
+`INSTALL mssql_ducklake FROM community`; `main` builds against v1.5.6, which the next release ships
+for.
 In place: the full DuckLake surface on a SQL Server catalog; DDL, inlined and file-backed writes,
 `UPDATE`, `DELETE`, `MERGE`; concurrent writers; a server-backed integration suite and a
 concurrency test in CI; a 1000-table benchmark against the PostgreSQL backend, at 1.5x of its total
@@ -41,7 +42,7 @@ upstream to DuckLake (the PostgreSQL manager is the in-tree precedent).
 
 ## Versions
 
-One release line, bumped together: duckdb `v1.5.5`, ducklake `v1.5-variegata` (embedded), mssql
+One release line, bumped together: duckdb `v1.5.6`, ducklake `v1.5-variegata` (embedded), mssql
 `v0.2.5` or newer at runtime. The embedded ducklake bumps on this repository's schedule; the pin is
 named in every release. mssql v0.2.5 is the minimum because it answers `dbo` as the catalog's
 default schema — older versions answer DuckDB's `main` and the attach fails.

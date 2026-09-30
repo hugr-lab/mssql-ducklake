@@ -9,7 +9,7 @@ One release line, bumped together in one commit:
 
 | piece | pin | role |
 | --- | --- | --- |
-| DuckDB | **v1.5.5** | the release line the extension is built and distributed for |
+| DuckDB | **v1.5.6** | the release line the extension is built and distributed for |
 | DuckLake | branch `v1.5-variegata` (embedded, at a named commit) | compiled into the extension, unmodified |
 | mssql extension | **v0.2.5** or newer at runtime | the runtime pair: `mssql_exec`/`mssql_scan`, the catalog attach, the TDS codecs |
 

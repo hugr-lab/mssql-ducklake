@@ -33,7 +33,7 @@ default schema regardless, and a login that must write elsewhere names its schem
 
 ### Client
 
-- DuckDB **v1.5.5**; the extension is built for that release line and ships through the DuckDB
+- DuckDB **v1.5.6**; the extension is built for that release line and ships through the DuckDB
   community extensions repository for it.
 - The mssql extension **v0.2.5 or newer** ([Versions](../versions.md)).
 - Not WebAssembly: the mssql extension is raw TDS sockets, so neither extension has a wasm build.

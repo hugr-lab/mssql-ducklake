@@ -53,8 +53,9 @@ Azure Blob, …); only the catalog is in SQL Server.
 
 ## Status
 
-**Experimental.** Released as v0.1.1 on the DuckDB v1.5.5 line, from the community extensions
-repository: `INSTALL mssql_ducklake FROM community` ([Getting started](./getting-started.md)). What
+**Experimental.** Released as v0.1.1 for the DuckDB v1.5.5 line, from the community extensions
+repository: `INSTALL mssql_ducklake FROM community` ([Getting started](./getting-started.md)). The
+next release is built for v1.5.6 ([Versions](./versions.md)). What
 is in place: the full DuckLake surface;
 DDL, inlined and file-backed writes, `UPDATE`, `DELETE`, `MERGE`; concurrent writers; re-attach;
 a server-backed integration suite and a concurrency test in CI; a benchmark against the PostgreSQL
