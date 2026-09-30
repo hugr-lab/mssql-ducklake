@@ -7,7 +7,7 @@ sidebar_position: 2
 
 ### Prerequisites
 
-- DuckDB **v1.5.5** — the release line this extension is built on ([Versions](./versions.md)).
+- DuckDB **v1.5.6** — the release line this extension is built on ([Versions](./versions.md)).
 - The **mssql extension v0.2.5 or newer**. Older versions answer DuckDB's `main` when DuckLake asks
   the catalog for its default schema, and the attach fails with `Schema 'main' not found`.
   `INSTALL mssql FROM community` gives a current version; `SELECT mssql_version()` says which one is
