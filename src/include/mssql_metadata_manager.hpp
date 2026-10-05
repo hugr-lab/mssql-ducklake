@@ -174,8 +174,11 @@ private:
 	//! property at all, read as older, and are converted once. 3 added forced parameterization of
 	//! the catalog's database (specs/012); 4 keys the inlined deletion tables an older build left
 	//! keyless (specs/014); 5 rebuilds ducklake_schema_versions' key over table_id as well (issue
-	//! #30 - without it a commit touching two tables is refused by the server).
-	static constexpr int64_t SHAPE_VERSION = 5;
+	//! #30 - without it a commit touching two tables is refused by the server). 6 is format
+	//! 1.1-dev1: the catalog tables it adds, keyed and collated - and the stamp doubles as the
+	//! answer to "has this build's migration run", which is what keeps DuckLake's per-attach re-run
+	//! of a dev format from re-shaping the catalog every time (MigrateV10Dev).
+	static constexpr int64_t SHAPE_VERSION = 6;
 	//! Where that version is recorded: an extended property on the catalog's own ducklake_metadata
 	//! table - per catalog, invisible to DuckLake's queries, and gone the moment the catalog's
 	//! tables are, which is what makes a recreated catalog shape itself again.

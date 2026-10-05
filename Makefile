@@ -45,7 +45,7 @@ MSSQL_DUCKLAKE_TEST_DSN ?= Server=$(MSSQL_DUCKLAKE_HOST),$(MSSQL_DUCKLAKE_PORT);
 
 DOCKER_COMPOSE := docker compose -f $(PROJ_DIR)docker/docker-compose.yml
 
-.PHONY: docker-up docker-down docker-status test-integration
+.PHONY: docker-up docker-down docker-status test-integration bench-attach-probe
 # only the docker goals see the variables (the password stays out of every build process's
 # environment); the assignment form is the one make 3.81 (macOS) accepts for target-specific exports
 docker-up docker-down docker-status: export MSSQL_DUCKLAKE_PORT := $(MSSQL_DUCKLAKE_PORT)
@@ -96,6 +96,21 @@ bench-scale: export MSSQL_DUCKLAKE_PG_DSN := $(MSSQL_DUCKLAKE_PG_DSN)
 bench-scale:
 	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
 	python3 scripts/bench/scale_catalog.py $(BENCH_SCALE_ARGS)
+
+# A one-off probe that needs the connection string without printing it (design/005 scratch).
+#   make bench-script SCRIPT=/path/to/probe.py
+bench-script: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
+bench-script:
+	python3 $(SCRIPT)
+
+# One ATTACH of an existing catalog, statement by statement, both pushdown arms (design/005): what
+# the 1.6-1.8x on attach is actually spent on. Needs only `make docker-up` and a catalog already
+# built by bench-scale.
+#   make bench-attach-probe PROBE_ARGS='--full --debug-counts'
+bench-attach-probe: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
+bench-attach-probe:
+	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
+	python3 scripts/bench/attach_probe.py $(PROBE_ARGS)
 
 # The comparison specs/005 is about: the same workload committed by DuckLake's own loop and by the
 # server-side apply, differing only by MSSQL_DUCKLAKE_SERVER_COMMIT. No postgres, so it needs only

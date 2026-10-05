@@ -167,10 +167,28 @@ void MSSQLMetadataManager::MigrateV10(bool allow_failures) {
 	MigrateToV1_1Dev1();
 }
 
-//! The attach-time path. Upstream splits it in two halves and logs a warning for each, because
-//! either can fail on a catalog it has already half-migrated; ours cannot, so there is nothing to
-//! swallow and the error is the answer here too.
+//! The attach-time path, and DuckLake runs it on EVERY writable attach: `1.1-dev1` is a development
+//! format, its version string does not move when upstream adds another column under the same name,
+//! so a catalog stamped by an earlier build can be missing a later addition and re-applying is the
+//! only way to know (ducklake_initializer.cpp). Upstream's re-run is nine cheap duckdb statements.
+//! Ours is one server-side batch - but it ends by dropping the shape stamp, and that made
+//! EnsureCatalogShape re-shape the whole catalog on every attach: 0.8 s of the 1.8 s an attach of a
+//! 1000-table catalog cost, measured by scripts/bench/attach_probe.py. So the stamp answers the
+//! question instead of being invalidated by it: it is written after the shaping, which runs after
+//! the migration, so a current stamp means a build wanting this shape has already done both. The
+//! version is 1.1-dev1 here by construction - that is the branch DuckLake took to get here - and a
+//! 1.0 catalog arrives at MigrateV10, which always runs.
+//!
+//! This is why SHAPE_VERSION has to move when the MIGRATION changes and not only when the shaping
+//! does: the stamp now stands for both.
+//!
+//! Upstream also splits the re-run in two halves and logs a warning for each, because either can
+//! fail on a catalog it has already half-migrated; ours cannot, so there is nothing to swallow and
+//! the error is the answer here too.
 void MSSQLMetadataManager::MigrateV10Dev() {
+	if (CatalogShapeIsCurrent()) {
+		return;
+	}
 	MigrateToV1_1Dev1();
 }
 

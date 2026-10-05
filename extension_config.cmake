@@ -15,7 +15,9 @@ duckdb_extension_load(mssql_ducklake
 # (`LOAD '__BUILD_DIRECTORY__/extension/mssql/...'`). The pin is the release tag built against
 # the v1.5 line (v0.2.5: the catalog's default schema is dbo, multi-scan plans on a pinned
 # connection materialize - spec 003); its openssl/simdutf arrive through the merged vcpkg manifest.
+# RECON, local only (design/005): the pushdown fix for the attach probe's shape is a local commit
+# in the sibling repo, not pushed - 998660e, "LIMIT 0 is no gain". Put the branch back before merge.
 duckdb_extension_load(mssql
-    GIT_URL https://github.com/hugr-lab/mssql-extension
-    GIT_TAG spec/079-e2
+    GIT_URL /Users/vgribanov/projects/hugr-lab/mssql-extension
+    GIT_TAG 998660e
 )
