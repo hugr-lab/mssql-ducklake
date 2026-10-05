@@ -327,6 +327,30 @@ SELECT count(*), sum(v), count(DISTINCT part) FROM lake.parts;
 ----
 1000	499500	50
 
+# The merged bounds are in the COLUMN's order, not in the text order the values are stored in -
+# fifty partitions of 0..49 merged as text give max '9'. DuckDB builds a perfect-hash aggregate from
+# this bound, so a wrong one is not a missed pruning but a failed query ("aggregate group 16 exceeded
+# total groups 16"). The server-side commit merges these itself (specs/005 phase 2), which is the
+# path this caught; DuckLake computes them in C++ on the default path. Both must answer the same.
+query II
+SELECT mn, mx FROM mssql_scan('srv', 'SELECT cs.min_value AS mn, cs.max_value AS mx FROM dbo.ducklake_table_column_stats cs JOIN dbo.ducklake_table tbl ON tbl.table_id = cs.table_id AND tbl.end_snapshot IS NULL JOIN dbo.ducklake_column col ON col.table_id = cs.table_id AND col.column_id = cs.column_id AND col.end_snapshot IS NULL WHERE tbl.table_name = ''parts'' AND col.column_name = ''part''');
+----
+0	49
+
+# A value no numeric cast can read - a HUGEINT past DECIMAL(38,10)'s range - leaves the bound
+# unknown rather than guessed, on either path. A filter then prunes nothing and answers correctly,
+# which is what makes NULL the safe choice: a bound that is merely wrong would drop this row.
+statement ok
+CREATE TABLE lake.huge(h HUGEINT);
+
+statement ok
+INSERT INTO lake.huge VALUES (99999999999999999999999999999999999999), (-99999999999999999999999999999999999999);
+
+query II
+SELECT count(*), max(h) FROM lake.huge WHERE h > 0;
+----
+1	99999999999999999999999999999999999999
+
 # fifty rows in the catalog to match, written by the appender inside the commit's own transaction
 query I
 SELECT count(*) FROM mssql_scan('srv', 'SELECT f.data_file_id FROM dbo.ducklake_data_file f JOIN dbo.ducklake_table t ON t.table_id = f.table_id WHERE t.table_name = ''parts'' AND f.end_snapshot IS NULL');

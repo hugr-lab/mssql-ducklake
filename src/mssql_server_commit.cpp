@@ -144,23 +144,81 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
         VALUES (s.table_id, s.added_records, s.added_records, s.added_bytes);
 
     -- Per-column totals: widen the range, and remember a null or a NaN once one appears.
+    --
+    -- The bounds are compared in the COLUMN's order, which for a numeric column is not the text
+    -- order its values are stored in: fifty partitions of 0..49 merged as text gave max '9', DuckDB
+    -- built a perfect-hash aggregate from that bound and met a value outside it. Only the numeric
+    -- families need a cast - an ISO date or timestamp, a boolean ('false' < 'true'), a string, a
+    -- blob and a uuid are already in DuckDB's order under the BIN2 collation. The type comes from
+    -- ducklake_column, whose rows a data-only commit's table already has.
+    --
+    -- A numeric value the cast cannot read - a HUGEINT past DECIMAL's range, a NaN, an infinity -
+    -- makes the bound unknown rather than a guess. DuckLake reads NULL as "no statistics" and prunes
+    -- nothing; a bound that is merely wrong prunes rows that should have been returned, which is the
+    -- one failure mode worth paying for.
     MERGE {SCHEMA}.ducklake_table_column_stats AS t
     USING (
-        SELECT table_id, column_id,
-               MAX(CASE WHEN has_null_count = 1 AND null_count > 0 THEN 1 ELSE 0 END) AS any_null,
-               MAX(CASE WHEN has_contains_nan = 1 AND contains_nan = 1 THEN 1 ELSE 0 END) AS any_nan,
-               MIN(CASE WHEN has_min = 1 THEN min_value END) AS min_value,
-               MAX(CASE WHEN has_max = 1 THEN max_value END) AS max_value
-        FROM #ducklake_staged_data_file_column_stats
-        GROUP BY table_id, column_id
+        SELECT g.table_id, g.column_id, g.any_null, g.any_nan, g.is_numeric,
+               CASE WHEN g.unreadable = 0 THEN
+                   (SELECT TOP 1 m.min_value
+                    FROM #ducklake_staged_data_file_column_stats m
+                    WHERE m.table_id = g.table_id AND m.column_id = g.column_id AND m.has_min = 1
+                    ORDER BY CASE WHEN g.is_numeric = 1 THEN TRY_CAST(m.min_value AS DECIMAL(38, 10)) END ASC,
+                             CASE WHEN g.is_numeric = 0 THEN m.min_value COLLATE {COLLATION} END ASC)
+               END AS min_value,
+               CASE WHEN g.unreadable = 0 THEN
+                   (SELECT TOP 1 m.max_value
+                    FROM #ducklake_staged_data_file_column_stats m
+                    WHERE m.table_id = g.table_id AND m.column_id = g.column_id AND m.has_max = 1
+                    ORDER BY CASE WHEN g.is_numeric = 1 THEN TRY_CAST(m.max_value AS DECIMAL(38, 10)) END DESC,
+                             CASE WHEN g.is_numeric = 0 THEN m.max_value COLLATE {COLLATION} END DESC)
+               END AS max_value,
+               g.unreadable
+        FROM (
+            SELECT s.table_id, s.column_id,
+                   MAX(CASE WHEN s.has_null_count = 1 AND s.null_count > 0 THEN 1 ELSE 0 END) AS any_null,
+                   MAX(CASE WHEN s.has_contains_nan = 1 AND s.contains_nan = 1 THEN 1 ELSE 0 END) AS any_nan,
+                   MAX(CASE WHEN c.column_type LIKE 'int%' OR c.column_type LIKE 'uint%'
+                                 OR c.column_type LIKE 'decimal%' OR c.column_type LIKE 'numeric%'
+                                 OR c.column_type IN ('hugeint', 'uhugeint', 'float', 'double', 'real')
+                            THEN 1 ELSE 0 END) AS is_numeric,
+                   MAX(CASE WHEN (c.column_type LIKE 'int%' OR c.column_type LIKE 'uint%'
+                                  OR c.column_type LIKE 'decimal%' OR c.column_type LIKE 'numeric%'
+                                  OR c.column_type IN ('hugeint', 'uhugeint', 'float', 'double', 'real'))
+                                 AND ((s.has_min = 1 AND TRY_CAST(s.min_value AS DECIMAL(38, 10)) IS NULL)
+                                      OR (s.has_max = 1 AND TRY_CAST(s.max_value AS DECIMAL(38, 10)) IS NULL))
+                            THEN 1 ELSE 0 END) AS unreadable
+            FROM #ducklake_staged_data_file_column_stats s
+            LEFT JOIN {SCHEMA}.ducklake_column c
+                   ON c.table_id = s.table_id AND c.column_id = s.column_id AND c.end_snapshot IS NULL
+            GROUP BY s.table_id, s.column_id
+        ) g
     ) AS s ON t.table_id = s.table_id AND t.column_id = s.column_id
     WHEN MATCHED THEN UPDATE SET
         contains_null = CASE WHEN t.contains_null = 1 OR s.any_null = 1 THEN 1 ELSE t.contains_null END,
         contains_nan = CASE WHEN t.contains_nan = 1 OR s.any_nan = 1 THEN 1 ELSE t.contains_nan END,
-        min_value = CASE WHEN t.min_value IS NULL OR s.min_value COLLATE {COLLATION} < t.min_value COLLATE {COLLATION}
-                         THEN s.min_value ELSE t.min_value END,
-        max_value = CASE WHEN t.max_value IS NULL OR s.max_value COLLATE {COLLATION} > t.max_value COLLATE {COLLATION}
-                         THEN s.max_value ELSE t.max_value END
+        min_value = CASE
+            WHEN s.unreadable = 1 THEN NULL
+            WHEN s.min_value IS NULL THEN t.min_value
+            WHEN t.min_value IS NULL THEN s.min_value
+            WHEN s.is_numeric = 0 THEN
+                CASE WHEN s.min_value COLLATE {COLLATION} < t.min_value COLLATE {COLLATION}
+                     THEN s.min_value ELSE t.min_value END
+            WHEN TRY_CAST(t.min_value AS DECIMAL(38, 10)) IS NULL THEN NULL
+            WHEN TRY_CAST(s.min_value AS DECIMAL(38, 10)) < TRY_CAST(t.min_value AS DECIMAL(38, 10))
+                 THEN s.min_value
+            ELSE t.min_value END,
+        max_value = CASE
+            WHEN s.unreadable = 1 THEN NULL
+            WHEN s.max_value IS NULL THEN t.max_value
+            WHEN t.max_value IS NULL THEN s.max_value
+            WHEN s.is_numeric = 0 THEN
+                CASE WHEN s.max_value COLLATE {COLLATION} > t.max_value COLLATE {COLLATION}
+                     THEN s.max_value ELSE t.max_value END
+            WHEN TRY_CAST(t.max_value AS DECIMAL(38, 10)) IS NULL THEN NULL
+            WHEN TRY_CAST(s.max_value AS DECIMAL(38, 10)) > TRY_CAST(t.max_value AS DECIMAL(38, 10))
+                 THEN s.max_value
+            ELSE t.max_value END
     WHEN NOT MATCHED THEN INSERT (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
         VALUES (s.table_id, s.column_id, s.any_null, s.any_nan, s.min_value, s.max_value, NULL);
 
