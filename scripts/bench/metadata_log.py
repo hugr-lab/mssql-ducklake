@@ -29,6 +29,7 @@ doubled slash is rejected by DuckLake, after which everything in the session fai
 
 import argparse
 import collections
+import os
 import re
 import subprocess
 import sys
@@ -70,11 +71,24 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=150, help="characters of each shape to show")
     args = parser.parse_args()
 
-    script = LOAD + open(args.workload).read() + DUMP
+    # `${MSSQL_DUCKLAKE_TEST_DSN}` in the workload is substituted from the environment, the way the
+    # test runner does it, so a server-backed workload never has to carry the connection string in a
+    # file - and whatever comes back is redacted before it is printed.
+    dsn = os.environ.get("MSSQL_DUCKLAKE_TEST_DSN", "")
+    workload = open(args.workload).read()
+    if "${MSSQL_DUCKLAKE_TEST_DSN}" in workload:
+        if not dsn:
+            sys.exit("the workload wants MSSQL_DUCKLAKE_TEST_DSN (make metadata-log exports it)")
+        workload = workload.replace("${MSSQL_DUCKLAKE_TEST_DSN}", dsn)
+
+    def redact(text: str) -> str:
+        return text.replace(dsn, "<dsn>") if dsn else text
+
+    script = LOAD + workload + DUMP
     proc = subprocess.run([args.duckdb, "-unsigned", "-csv", "-noheader"], input=script,
                           capture_output=True, text=True, timeout=7200)
     if proc.returncode != 0:
-        sys.exit(f"the session failed:\n{proc.stderr[-2000:]}")
+        sys.exit(f"the session failed:\n{redact(proc.stderr[-2000:])}")
     # the dump's rows carry a record separator so the log's own commas and newlines cannot split them
     parsed = []
     for chunk in proc.stdout.split("\x1e")[1:]:

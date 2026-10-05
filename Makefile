@@ -135,6 +135,7 @@ test-integration:
 # Every metadata query DuckLake issued over a workload, by shape, with cost and path (specs/008).
 # WORKLOAD is a SQL file that starts with its own ATTACH; the two extensions are loaded for it.
 .PHONY: metadata-log
+metadata-log: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
 metadata-log:
 	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
 	@test -n "$(WORKLOAD)" || { echo "usage: make metadata-log WORKLOAD=path/to/workload.sql"; exit 1; }
