@@ -103,7 +103,7 @@ ORDER BY table_id NULLS FIRST;
 //!
 //! The inner text travels inside a DuckDB string literal, so each of its own quotes is doubled once.
 constexpr const char *MSSQL_CONFLICT_CHECK_QUERY = R"(
-FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, '
+FROM mssql_scan_unsafe({METADATA_CATALOG_NAME_LITERAL}, '
 SELECT s.snapshot_id, s.schema_version, s.next_catalog_id, s.next_file_id,
        COALESCE((SELECT STRING_AGG(changes_made, '','')
                  FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot_changes c
@@ -126,7 +126,12 @@ SELECT NULL, NULL, NULL, NULL, NULL,
 FROM {METADATA_SCHEMA_ESCAPED}.ducklake_table_stats ts
 LEFT JOIN {METADATA_SCHEMA_ESCAPED}.ducklake_table_column_stats cs ON cs.table_id = ts.table_id
 WHERE ts.record_count IS NOT NULL AND ts.file_size_bytes IS NOT NULL
-ORDER BY table_id'))";
+ORDER BY table_id', columns := {
+    'snapshot_id': 'BIGINT', 'schema_version': 'BIGINT', 'next_catalog_id': 'BIGINT',
+    'next_file_id': 'BIGINT', 'changes': 'VARCHAR', 'table_id': 'BIGINT', 'column_id': 'BIGINT',
+    'record_count': 'BIGINT', 'next_row_id': 'BIGINT', 'file_size_bytes': 'BIGINT',
+    'contains_null': 'BOOLEAN', 'contains_nan': 'BOOLEAN', 'min_value': 'VARCHAR',
+    'max_value': 'VARCHAR', 'extra_stats': 'VARCHAR'}))";
 
 } // namespace
 
@@ -188,8 +193,9 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Query(DuckLakeSnapshot snapshot, s
 //! placeholders: {METADATA_SCHEMA_ESCAPED} and {SNAPSHOT_ID} are substituted by the base's Query
 //! after this, on the finished statement, which is why the schema is the identifier form and not
 //! the literal one - a literal would arrive with quotes the doubling below has already passed.
-static string ServerScan(const string &tsql) {
-	return "FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, '" + StringUtil::Replace(tsql, "'", "''") + "')";
+static string ServerScan(const string &tsql, const string &columns) {
+	return "FROM mssql_scan_unsafe({METADATA_CATALOG_NAME_LITERAL}, '" + StringUtil::Replace(tsql, "'", "''") +
+	       "', columns := " + columns + ")";
 }
 
 //! The first row's first column as an idx_t, or `absent` when the scan returned no row.
@@ -243,8 +249,12 @@ string MSSQLMetadataManager::GetInlinedDeletionTableName(TableIndex table_id, Du
 	if (cached == InlinedDeletionCacheResult::DOES_NOT_EXIST) {
 		return string();
 	}
-	auto query = ServerScan(StringUtil::Format(
-	    "SELECT CASE WHEN OBJECT_ID('{METADATA_SCHEMA_ESCAPED}.%s') IS NULL THEN 0 ELSE 1 END AS present", table_name));
+	// a CASE over two integer literals is an `int` on the server, so INTEGER and not BIGINT
+	auto query = ServerScan(
+	    StringUtil::Format("SELECT CASE WHEN OBJECT_ID('{METADATA_SCHEMA_ESCAPED}.%s') IS NULL THEN 0 ELSE 1 END "
+	                       "AS present",
+	                       table_name),
+	    "{'present': 'INTEGER'}");
 	auto result = transaction.Query(snapshot, query);
 	auto present = ScalarOf(*result, "Failed to look up the inlined deletion table in DuckLake: ", 0) != 0;
 	if (!present) {
@@ -285,9 +295,10 @@ string MSSQLMetadataManager::GetLatestSnapshotQuery() const {
 	//
 	// TOP 1 descending rather than the base's MAX subquery: same row, one seek down the primary key
 	// this manager puts on ducklake_snapshot, and no self-join for the server to unpick.
-	return R"(FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, 'SELECT TOP 1 snapshot_id, )"
+	return R"(FROM mssql_scan_unsafe({METADATA_CATALOG_NAME_LITERAL}, 'SELECT TOP 1 snapshot_id, )"
 	       R"(schema_version, next_catalog_id, next_file_id FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot )"
-	       R"(ORDER BY snapshot_id DESC'))";
+	       R"(ORDER BY snapshot_id DESC', columns := {'snapshot_id': 'BIGINT', 'schema_version': 'BIGINT', )"
+	       R"('next_catalog_id': 'BIGINT', 'next_file_id': 'BIGINT'}))";
 }
 
 } // namespace duckdb

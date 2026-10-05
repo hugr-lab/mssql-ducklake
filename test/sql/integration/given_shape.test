@@ -1,0 +1,79 @@
+# name: test/sql/integration/given_shape.test
+# description: The manager's scans with their shape given, and what that makes possible (mssql specs/081)
+# group: [integration]
+
+# `mssql_scan_unsafe(ctx, query, columns := {...})` states the result's shape instead of asking the
+# server for it, so bind sends nothing and takes no connection. Two things follow, and this file
+# pins both: the manager's own statements no longer pay a describe, and a server scan can be
+# composed with a catalog read inside a transaction - which is what the read layer could not do
+# (specs/008 kept every server scan as the SOLE source of its query, because the failure was the
+# bind taking the transaction's pinned connection and it depended on the plan's execution order).
+require-env MSSQL_DUCKLAKE_TEST_DSN
+
+statement ok
+SET autoload_known_extensions = false;
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
+
+statement ok
+ATTACH '${MSSQL_DUCKLAKE_TEST_DSN}' AS srv (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('srv', 'IF OBJECT_ID(''dbo.given_shape_probe'') IS NOT NULL DROP TABLE dbo.given_shape_probe;
+CREATE TABLE dbo.given_shape_probe(id BIGINT, n INT, flag BIT, v VARCHAR(50), d DATE);
+INSERT INTO dbo.given_shape_probe VALUES (1, 10, 1, ''one'', ''2026-01-02''), (2, 20, 0, NULL, NULL);');
+
+# the types as the catalog reads SQL Server's: int is INTEGER, bit is BOOLEAN, a varchar is a string
+query IIIII
+SELECT id, n, flag, v, d FROM mssql_scan_unsafe('srv', 'SELECT id, n, flag, v, d FROM dbo.given_shape_probe ORDER BY id', columns := {'id': 'BIGINT', 'n': 'INTEGER', 'flag': 'BOOLEAN', 'v': 'VARCHAR', 'd': 'DATE'}) ORDER BY id;
+----
+1	10	true	one	2026-01-02
+2	20	false	NULL	NULL
+
+# a shape that does not match is an error at execution naming both, never a wrong answer
+statement error
+SELECT id FROM mssql_scan_unsafe('srv', 'SELECT id, n FROM dbo.given_shape_probe', columns := {'id': 'BIGINT'});
+----
+cannot read
+
+# the trap `COUNT(*)` is: an int on the server, so BIGINT is refused and COUNT_BIG is how to mean it
+statement error
+SELECT c FROM mssql_scan_unsafe('srv', 'SELECT COUNT(*) AS c FROM dbo.given_shape_probe', columns := {'c': 'BIGINT'});
+----
+cannot read
+
+query I
+SELECT c FROM mssql_scan_unsafe('srv', 'SELECT COUNT_BIG(*) AS c FROM dbo.given_shape_probe', columns := {'c': 'BIGINT'});
+----
+2
+
+# Composed, inside a transaction. All three of these are shapes the released pin could not run on
+# the pinned connection, and the last is the one their 2/n names: a UNION ALL of a catalog scan and
+# a server scan.
+statement ok
+BEGIN TRANSACTION;
+
+query I
+SELECT (SELECT count(*) FROM srv.dbo.given_shape_probe) = (SELECT count(*) FROM mssql_scan_unsafe('srv', 'SELECT id FROM dbo.given_shape_probe', columns := {'id': 'BIGINT'}));
+----
+true
+
+query I
+SELECT a.n = b.n FROM (SELECT count(*) AS n FROM mssql_scan_unsafe('srv', 'SELECT id FROM dbo.given_shape_probe', columns := {'id': 'BIGINT'})) a, (SELECT count(*) AS n FROM mssql_scan_unsafe('srv', 'SELECT id FROM dbo.given_shape_probe', columns := {'id': 'BIGINT'})) b;
+----
+true
+
+query I
+SELECT count(*) FROM (SELECT id FROM srv.dbo.given_shape_probe UNION ALL SELECT id FROM mssql_scan_unsafe('srv', 'SELECT id FROM dbo.given_shape_probe', columns := {'id': 'BIGINT'})) u;
+----
+4
+
+statement ok
+COMMIT;
+
+statement ok
+SELECT mssql_exec('srv', 'DROP TABLE dbo.given_shape_probe;');

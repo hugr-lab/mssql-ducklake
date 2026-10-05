@@ -351,8 +351,10 @@ void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_tra
 		applied->GetErrorObject().Throw("The server-side DuckLake commit failed: ");
 	}
 	auto result = connection.Query(
-	    StringUtil::Format("SELECT snapshot_id, schema_version, had_flushes FROM mssql_scan(%s, 'SELECT snapshot_id, "
-	                       "schema_version, had_flushes FROM #ducklake_commit_result')",
+	    StringUtil::Format("SELECT snapshot_id, schema_version, had_flushes FROM mssql_scan_unsafe(%s, "
+	                       "'SELECT snapshot_id, schema_version, had_flushes FROM #ducklake_commit_result', "
+	                       "columns := {'snapshot_id': 'BIGINT', 'schema_version': 'BIGINT', "
+	                       "'had_flushes': 'BOOLEAN'})",
 	                       CatalogLiteral()));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("The server-side DuckLake commit did not report its snapshot: ");

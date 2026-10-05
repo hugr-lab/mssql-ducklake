@@ -40,10 +40,15 @@ bool MSSQLMetadataManager::CatalogShapeIsCurrent() {
 	// attach trusted it, and the catalog stayed without keys until the first UPDATE failed. A stamp on
 	// the table dies with the table, so a recreated catalog is shaped again - the self-healing the
 	// old constraint marker had by construction.
+	// `mssql_scan_unsafe` rather than `mssql_scan`: the shape is ours to state, so bind sends
+	// nothing to the server - no `sp_describe_first_result_set` and no connection taken at bind at
+	// all (mssql specs/081). The declared type has to be what the stream brings, exactly, and the
+	// statement casts to it so the two cannot drift.
 	auto result = connection.Query(StringUtil::Format(
-	    "SELECT shape FROM mssql_scan(%s, 'SELECT TRY_CAST(CAST(value AS VARCHAR(32)) AS BIGINT) AS shape "
+	    "SELECT shape FROM mssql_scan_unsafe(%s, 'SELECT TRY_CAST(CAST(value AS VARCHAR(32)) AS BIGINT) AS shape "
 	    "FROM sys.extended_properties WHERE class = 1 "
-	    "AND major_id = OBJECT_ID(QUOTENAME(''%s'') + ''.ducklake_metadata'') AND minor_id = 0 AND name = ''%s''')",
+	    "AND major_id = OBJECT_ID(QUOTENAME(''%s'') + ''.ducklake_metadata'') AND minor_id = 0 AND name = ''%s''', "
+	    "columns := {'shape': 'BIGINT'})",
 	    CatalogLiteral(), schema_name, SHAPE_VERSION_PROPERTY));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to inspect the DuckLake catalog on SQL Server: ");
@@ -544,10 +549,13 @@ void MSSQLMetadataManager::InitializeDuckLake(bool has_explicit_schema, DuckLake
 	// The catalog's string columns are stored with a UTF-8 collation, so the server has to have one.
 	// Asking for the collation itself rather than the version: Azure SQL Database reports major
 	// version 12 while supporting it, and the version was only ever a proxy for this question.
-	auto probe = connection.Query(StringUtil::Format(
-	    "SELECT collations FROM mssql_scan(%s, 'SELECT COUNT(*) AS collations FROM sys.fn_helpcollations() "
-	    "WHERE name = ''%s''')",
-	    CatalogLiteral(), VARCHAR_COLLATION));
+	// COUNT_BIG rather than COUNT: `COUNT(*)` is an `int` on the server and a given shape is checked
+	// strictly, so declaring BIGINT over COUNT would fail at execution - and BIGINT is what this is
+	// read back as.
+	auto probe = connection.Query(
+	    StringUtil::Format("SELECT collations FROM mssql_scan_unsafe(%s, 'SELECT COUNT_BIG(*) AS collations "
+	                       "FROM sys.fn_helpcollations() WHERE name = ''%s''', columns := {'collations': 'BIGINT'})",
+	                       CatalogLiteral(), VARCHAR_COLLATION));
 	if (probe->HasError()) {
 		probe->GetErrorObject().Throw("Failed to ask SQL Server for its collations: ");
 	}

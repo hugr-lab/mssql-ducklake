@@ -163,6 +163,8 @@ def main() -> int:
     parser.add_argument("--refill-inlined", type=int, default=0,
                         help="first put an inlined table back under this many lake tables (s<i %% schemas>.t<i>)")
     parser.add_argument("--refill-schemas", type=int, default=10, help="schemas those tables are spread over")
+    parser.add_argument("--shape-ab", type=int, default=0,
+                        help="N calls of one statement through mssql_scan and mssql_scan_unsafe, in a transaction")
     parser.add_argument("--synth-tables", type=int, default=0,
                         help="make N plain remote tables and time one plan that scans all of them")
     parser.add_argument("--keep-synth", action="store_true", help="leave those tables behind")
@@ -178,6 +180,28 @@ def main() -> int:
         return "MSSQL_DUCKLAKE_TEST_DSN is needed (make bench-attach-probe sets it)"
     dsn, env = args.mssql_dsn, dict(os.environ)
     build = os.path.abspath(args.build)
+
+    if args.shape_ab:
+        # What a given shape saves per call: the same statement through mssql_scan (which describes
+        # it first) and through mssql_scan_unsafe (which does not), N times in a row, inside a
+        # transaction - which is where the describe takes the pinned connection.
+        n = args.shape_ab
+        cat = '"__ducklake_metadata_lake"."dbo"'
+        inner = ("SELECT TOP 1 snapshot_id, schema_version, next_catalog_id, next_file_id "
+                 "FROM dbo.ducklake_snapshot ORDER BY snapshot_id DESC")
+        declared = ("columns := {'snapshot_id': 'BIGINT', 'schema_version': 'BIGINT', "
+                    "'next_catalog_id': 'BIGINT', 'next_file_id': 'BIGINT'}")
+        print(f"the manager's latest-snapshot statement, {n} calls in a transaction, ms")
+        print(f"{'':>16} {'ON':>7} {'OFF':>7}")
+        for fn, extra_arg in (("mssql_scan", ""), ("mssql_scan_unsafe", ", " + declared)):
+            call = f"SELECT snapshot_id FROM {fn}('__ducklake_metadata_lake', '{inner}'{extra_arg})"
+            body = "BEGIN TRANSACTION;\n" + "".join(f"{call};\n" for _ in range(n)) + "COMMIT;"
+            got = {}
+            for arm in ARMS:
+                timed = run_arm(args.duckdb, build, dsn, arm, env, args.read_only, body)
+                got[arm] = sum(ms for ms, m in timed if fn + "(" in m and "SELECT snapshot_id" in m)
+            print(f"{fn:>16} {got['true']:>7} {got['false']:>7}")
+        return 0
 
     if args.synth_tables:
         # The shape on its own, independent of any DuckLake state: N DISTINCT remote tables under one
