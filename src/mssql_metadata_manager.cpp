@@ -1,4 +1,5 @@
 #include "mssql_metadata_manager.hpp"
+#include "metadata_manager/ducklake_metadata_manager_v1_1.hpp"
 #include "mssql_metadata_internal.hpp"
 
 #include "common/ducklake_types.hpp"
@@ -134,6 +135,10 @@ string MSSQLMetadataManager::SchemaIdentifier() const {
 	return DuckLakeUtil::SQLIdentifierToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
 }
 
+string MSSQLMetadataManager::SchemaLiteral() const {
+	return DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
+}
+
 string MSSQLMetadataManager::CatalogLiteral() const {
 	return DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataDatabaseName());
 }
@@ -196,13 +201,27 @@ void MSSQLMetadataManager::ClearCache() {
 
 void MSSQLMetadataManager::InvalidateTableCache(const string &table_name) {
 	auto &connection = transaction.GetConnection();
-	auto result = connection.Query(
-	    StringUtil::Format("SELECT mssql_invalidate_cache(%s, %s, %s)", CatalogLiteral(),
-	                       DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName()),
-	                       DuckLakeUtil::SQLLiteralToString(table_name)));
+	auto result = connection.Query(StringUtil::Format(
+	    "SELECT mssql_invalidate_cache(%s, %s, %s)", CatalogLiteral(),
+	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName()),
+	    DuckLakeUtil::SQLLiteralToString(table_name)));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to refresh the SQL Server catalog cache: ");
 	}
+}
+
+//! DuckLake wraps its metadata manager in a per-format subclass (DuckLakeMetadataManagerV1_1<Base>)
+//! and, without the hook this overrides, picks the base by dynamic_cast over its three built-ins -
+//! so a registered manager is replaced by the generic DuckDB-SQL one on any format past 1.0, and
+//! everything this class does (the shaping, the T-SQL batch, the rewrites) silently stops applying.
+//! The wrapper is a template over the base manager, so the composition is the one the built-ins get:
+//! the format's DDL comes from the wrapper's seven overrides, and ours keys and collates the result.
+unique_ptr<DuckLakeMetadataManager> MSSQLMetadataManager::CreateVersionedManager(DuckLakeTransaction &transaction,
+                                                                                 DuckLakeVersion version) {
+	if (version == DuckLakeVersion::V1_1_DEV_1) {
+		return make_uniq<DuckLakeMetadataManagerV1_1<MSSQLMetadataManager>>(transaction);
+	}
+	return nullptr;
 }
 
 void MSSQLMetadataManager::ProbeServerCapabilities() {
@@ -262,14 +281,17 @@ string MSSQLMetadataManager::GetInlinedTableQueries(DuckLakeSnapshot commit_snap
 		                              TSQLColumnType(DuckLakeTypes::FromString(column.type)));
 	}
 	// An inlined row is updated (its end_snapshot is set) and deleted, so this table needs a key for
-	// the same reason the catalog's own tables do.
+	// the same reason the catalog's own tables do. The metadata columns are named by the catalog's
+	// DuckLake format (design/005).
+	auto names = InlinedColumnNames(transaction);
 	auto statement = StringUtil::Format(
 	    "IF OBJECT_ID(QUOTENAME(%s) + '.' + QUOTENAME(%s)) IS NULL "
-	    "CREATE TABLE %s.%s(row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT%s, "
-	    "CONSTRAINT %s PRIMARY KEY (row_id, begin_snapshot));",
+	    "CREATE TABLE %s.%s(%s BIGINT NOT NULL, %s BIGINT NOT NULL, %s BIGINT%s, "
+	    "CONSTRAINT %s PRIMARY KEY (%s, %s));",
 	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName()),
-	    DuckLakeUtil::SQLLiteralToString(table_name), SchemaIdentifier(), SQLIdentifier(table_name), columns,
-	    SQLIdentifier("pk_" + table_name));
+	    DuckLakeUtil::SQLLiteralToString(table_name), SchemaIdentifier(), SQLIdentifier(table_name),
+	    SQLIdentifier(names.row_id), SQLIdentifier(names.begin_snapshot), SQLIdentifier(names.end_snapshot), columns,
+	    SQLIdentifier("pk_" + table_name), SQLIdentifier(names.row_id), SQLIdentifier(names.begin_snapshot));
 	RunServerSideOutsideTransaction(statement, "Failed to create the inlined data table: ");
 	// Refresh the extension's view of THIS table now, before returning into the batch being built.
 	// DuckLake clears the cache only after the commit batch has run - CommitChanges builds it (and

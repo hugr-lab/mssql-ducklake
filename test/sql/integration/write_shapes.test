@@ -292,11 +292,22 @@ DROP TABLE lake.s1.intx;
 statement ok
 DROP SCHEMA lake.s1 CASCADE;
 
-# the tables are gone from the schema; ducklake_table_info keeps listing what the snapshots knew
+# The tables are gone from the schema, and ducklake_table_info reports none. The older pin listed
+# the eight it had seen; this is not a format difference and not the batch's doing - DuckLake's
+# GetTableSizes selects ducklake_table at the CURRENT snapshot (`{SNAPSHOT_ID} >= begin_snapshot AND
+# ({SNAPSHOT_ID} < end_snapshot OR end_snapshot IS NULL)`), the cascade now ends the tables as well
+# as the schema, so none is current. Reproduced away from SQL Server on a local-file lake at both
+# 1.0 and 1.1, which answers 0 either way (design/005). The rows are ENDED, not deleted - the next
+# query is what says so, because a rewrite that deleted history would answer 0 here too.
 query II
 SELECT (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lake' AND schema_name = 's1'), (SELECT count(*) FROM ducklake_table_info('lake'));
 ----
-0	8
+0	0
+
+query I
+SELECT dropped FROM mssql_scan('srv', 'SELECT CAST(COUNT(*) AS BIGINT) AS dropped FROM write_shapes.ducklake_table WHERE end_snapshot IS NOT NULL');
+----
+8
 
 statement ok
 DETACH lake;

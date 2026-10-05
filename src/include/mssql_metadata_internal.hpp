@@ -90,4 +90,9 @@ bool ConflictCheckQueryIsDuckLakes();
 //! text the Execute seam recognises (specs/006 D5b). Asked at attach for the same reason.
 bool InlinedDeletionDdlIsDuckLakes(DuckLakeMetadataManager &manager);
 
+//! The inlined tables' own metadata columns are named by the catalog's DuckLake format: bare on 1.0,
+//! `_ducklake_`-prefixed from 1.1-dev1 (DuckLakeInlinedColNames). Our inlined DDL is ours to write,
+//! so it has to follow the format rather than hard-code the 1.0 names (design/005).
+DuckLakeInlinedColNames InlinedColumnNames(DuckLakeTransaction &transaction);
+
 } // namespace duckdb

@@ -1,0 +1,243 @@
+# name: test/sql/integration/migrate_v11.test
+# description: A format 1.0 catalog upgraded to 1.1-dev1 by our own T-SQL migration (design/005)
+# group: [integration]
+
+# The upgrade path for a catalog an earlier release created. DuckLake's migration is
+# `ALTER TABLE … ADD COLUMN {IF_NOT_EXISTS}` and `CREATE TABLE {IF_NOT_EXISTS}` through duckdb,
+# which SQL Server has no form for - so the manager overrides the three migration virtuals and
+# writes the same migration as guarded T-SQL. This file walks a 1.0 catalog with data in it, both
+# inlined and file-backed, to 1.1-dev1 and back through a full round trip; then attaches it twice
+# more, because an idempotent migration is the whole point of the guards. Its catalog lives in a
+# schema of its own, made here, so the other files' per-schema counts are not disturbed.
+require-env MSSQL_DUCKLAKE_TEST_DSN
+
+require parquet
+
+statement ok
+SET autoload_known_extensions = false;
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
+
+statement ok
+ATTACH '${MSSQL_DUCKLAKE_TEST_DSN}' AS srv (TYPE mssql);
+
+# a schema of its own, fresh: a run that died leaves it populated, and DROP SCHEMA refuses that
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''migrate_v11'';
+EXEC sp_executesql @sql;
+IF SCHEMA_ID(''migrate_v11'') IS NULL EXEC(''CREATE SCHEMA migrate_v11'');');
+
+# ---------------------------------------------------------------------------
+# A catalog at format 1.0, the way a 0.1.x release left it
+# ---------------------------------------------------------------------------
+
+statement ok
+SET ducklake_default_version = '1.0';
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/migrate_v11', METADATA_SCHEMA 'migrate_v11');
+
+query I
+SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM migrate_v11.ducklake_metadata WHERE [key] = ''version''');
+----
+1.0
+
+# one file-backed table and one that stays inlined, so the migration has both to carry
+statement ok
+CREATE TABLE lake.filed AS SELECT i AS id, 'row' || i AS v FROM range(100) r(i);
+
+statement ok
+CREATE TABLE lake.inlined(id INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO lake.inlined VALUES (1, 'one'), (2, 'two');
+
+# DuckLake made an inlined table for each of the two - the file-backed one gets one too, it is just
+# empty - and at 1.0 their metadata columns carry the bare names. Counted as "tables whose three
+# metadata columns are not named this way", so the assertion does not depend on how many there are.
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT t.name FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''migrate_v11'' AND t.name LIKE ''ducklake_inlined_data[_]%'' AND t.name <> ''ducklake_inlined_data_tables''');
+----
+2
+
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT t.name FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''migrate_v11'' AND t.name LIKE ''ducklake_inlined_data[_]%'' AND t.name <> ''ducklake_inlined_data_tables'' AND (SELECT count(*) FROM sys.columns c WHERE c.object_id = t.object_id AND c.name IN (''row_id'', ''begin_snapshot'', ''end_snapshot'')) <> 3');
+----
+0
+
+# and 1.1's additions are not
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT 1 AS n WHERE OBJECT_ID(''migrate_v11.ducklake_view_column_tag'') IS NOT NULL OR COL_LENGTH(''migrate_v11.ducklake_data_file'', ''row_group_count'') IS NOT NULL');
+----
+0
+
+statement ok
+DETACH lake;
+
+# ---------------------------------------------------------------------------
+# The upgrade. A plain attach of a 1.0 catalog stays at 1.0 - DuckLake resolves
+# the target to the catalog's own version, so nothing migrates and none of our
+# overrides fire; the upgrade is the user asking for it
+# ---------------------------------------------------------------------------
+
+statement ok
+RESET ducklake_default_version;
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/migrate_v11', METADATA_SCHEMA 'migrate_v11');
+
+query II
+SELECT (SELECT count(*) FROM lake.filed), v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM migrate_v11.ducklake_metadata WHERE [key] = ''version''');
+----
+100	1.0
+
+statement ok
+DETACH lake;
+
+# and this is the upgrade: AUTOMATIC_MIGRATION takes the loud path, MigrateV10, which is ours
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/migrate_v11', METADATA_SCHEMA 'migrate_v11', AUTOMATIC_MIGRATION TRUE);
+
+query I
+SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM migrate_v11.ducklake_metadata WHERE [key] = ''version''');
+----
+1.1-dev1
+
+# every column 1.1-dev1 adds, in this catalog's types: BOOLEAN is BIT here
+query II
+SELECT t, c FROM mssql_scan('srv', 'SELECT t.name AS t, c.name AS c FROM sys.columns c JOIN sys.tables t ON t.object_id = c.object_id JOIN sys.schemas s ON s.schema_id = t.schema_id JOIN sys.types ty ON ty.user_type_id = c.user_type_id WHERE s.name = ''migrate_v11'' AND ((c.name = ''row_group_count'' AND ty.name = ''bigint'') OR (c.name IN (''min_is_exact'', ''max_is_exact'') AND ty.name = ''bit'') OR (c.name = ''parent_schema_id'' AND ty.name = ''bigint''))') ORDER BY t, c;
+----
+ducklake_data_file	row_group_count
+ducklake_delete_file	row_group_count
+ducklake_file_column_stats	max_is_exact
+ducklake_file_column_stats	min_is_exact
+ducklake_schema	parent_schema_id
+ducklake_table_column_stats	max_is_exact
+ducklake_table_column_stats	min_is_exact
+
+# the table it adds, with the catalog's UTF-8 BIN2 collation on its strings like every other
+query II
+SELECT c, coll FROM mssql_scan('srv', 'SELECT c.name AS c, c.collation_name AS coll FROM sys.columns c WHERE c.object_id = OBJECT_ID(''migrate_v11.ducklake_view_column_tag'') AND c.collation_name IS NOT NULL') ORDER BY c;
+----
+column_name	Latin1_General_100_BIN2_UTF8
+key	Latin1_General_100_BIN2_UTF8
+value	Latin1_General_100_BIN2_UTF8
+
+# every inlined table's metadata columns carry 1.1's prefix now, and none keeps a bare name. The
+# registry table `ducklake_inlined_data_tables` is excluded from both: the rename walks the tables
+# the registry LISTS, so the registry itself is not one of them - and the inlined DELETION tables
+# keep bare names by design (specs/006 D5b, and ducklake writes that DDL bare too).
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT t.name FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''migrate_v11'' AND t.name LIKE ''ducklake_inlined_data[_]%'' AND t.name <> ''ducklake_inlined_data_tables'' AND (SELECT count(*) FROM sys.columns c WHERE c.object_id = t.object_id AND c.name IN (''_ducklake_row_id'', ''_ducklake_begin_snapshot'', ''_ducklake_end_snapshot'')) <> 3');
+----
+0
+
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT t.name FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''migrate_v11'' AND t.name LIKE ''ducklake_inlined_data[_]%'' AND t.name <> ''ducklake_inlined_data_tables'' AND (SELECT count(*) FROM sys.columns c WHERE c.object_id = t.object_id AND c.name IN (''row_id'', ''begin_snapshot'', ''end_snapshot'')) <> 0');
+----
+0
+
+# the migration drops the shape stamp, so the shaping of this same attach keys and collates what it
+# just created: the stamp is back at this build's version and the new table has its primary key
+query I
+SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM sys.extended_properties WHERE class = 1 AND major_id = OBJECT_ID(''migrate_v11.ducklake_metadata'') AND minor_id = 0 AND name = ''mssql_ducklake_shape''');
+----
+5
+
+query I
+SELECT cols FROM mssql_scan('srv', 'SELECT STRING_AGG(c.name, '','') WITHIN GROUP (ORDER BY ic.key_ordinal) AS cols FROM sys.key_constraints kc JOIN sys.index_columns ic ON ic.object_id = kc.parent_object_id AND ic.index_id = kc.unique_index_id JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id WHERE kc.parent_object_id = OBJECT_ID(''migrate_v11.ducklake_view_column_tag'')');
+----
+view_id,column_name,begin_snapshot,key
+
+# ---------------------------------------------------------------------------
+# The data written at 1.0 reads back, and the lake still takes writes
+# ---------------------------------------------------------------------------
+
+query III
+SELECT count(*), min(v), max(v) FROM lake.filed;
+----
+100	row0	row99
+
+query II
+SELECT id, v FROM lake.inlined ORDER BY id;
+----
+1	one
+2	two
+
+statement ok
+INSERT INTO lake.inlined VALUES (3, 'three');
+
+statement ok
+INSERT INTO lake.filed SELECT i, 'late' || i FROM range(100, 200) r(i);
+
+statement ok
+DELETE FROM lake.inlined WHERE id = 1;
+
+statement ok
+DELETE FROM lake.filed WHERE id < 50;
+
+query II
+SELECT count(*), sum(id) FROM lake.inlined;
+----
+2	5
+
+query I
+SELECT count(*) FROM lake.filed;
+----
+150
+
+# a view, whose column tags live in the table the migration created
+statement ok
+CREATE VIEW lake.v AS SELECT id FROM lake.filed WHERE id > 150;
+
+query I
+SELECT count(*) FROM lake.v;
+----
+49
+
+# ---------------------------------------------------------------------------
+# Attached twice more. A 1.1-dev1 catalog re-runs the migration on every
+# writable attach - that is DuckLake's own dispatch, dev formats evolve in
+# place - and upstream's unguarded form is exactly what failed there, with
+# `error 2705: Column name 'row_group_count' … specified more than once`
+# swallowed into a warning. Every statement in ours is guarded, so a re-run
+# changes nothing instead of failing.
+# ---------------------------------------------------------------------------
+
+statement ok
+DETACH lake;
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/migrate_v11', METADATA_SCHEMA 'migrate_v11');
+
+statement ok
+DETACH lake;
+
+# the loud path too: an explicitly requested migration has nothing left to do and must still pass
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/migrate_v11', METADATA_SCHEMA 'migrate_v11', AUTOMATIC_MIGRATION TRUE);
+
+query I
+SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM migrate_v11.ducklake_metadata WHERE [key] = ''version''');
+----
+1.1-dev1
+
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT t.name FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''migrate_v11'' AND t.name LIKE ''ducklake_inlined_data[_]%'' AND t.name <> ''ducklake_inlined_data_tables'' AND (SELECT count(*) FROM sys.columns c WHERE c.object_id = t.object_id AND c.name IN (''_ducklake_row_id'', ''_ducklake_begin_snapshot'', ''_ducklake_end_snapshot'')) <> 3');
+----
+0
+
+query II
+SELECT count(*), sum(id) FROM lake.inlined;
+----
+2	5
+
+statement ok
+DETACH lake;

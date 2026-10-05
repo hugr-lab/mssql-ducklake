@@ -82,6 +82,10 @@ public:
 	//! one call; until that call exists these hand back to the client-side loop, so the fast path is
 	//! opt-in and every refusal is a fallback rather than a failure.
 	void ProbeServerCapabilities() override;
+	//! Our own versioned variant, so DuckLake's format wrapper composes with this manager instead of
+	//! replacing it (design/005: without the hook a registered manager is dropped on format 1.1).
+	unique_ptr<DuckLakeMetadataManager> CreateVersionedManager(DuckLakeTransaction &transaction,
+	                                                           DuckLakeVersion version) override;
 	//! Read the latest snapshot through `mssql_scan` rather than through the attached catalog - the
 	//! postgres manager's trick. Worth about a tenth of a repeat read, this being one of roughly four
 	//! catalog queries a read makes (specs/005 D13).
@@ -146,6 +150,16 @@ private:
 	string TSQLColumnType(const LogicalType &type) const;
 	//! Keys, indexes and collations, written so that running them twice is a no-op.
 	void EnsureCatalogShape();
+	//! The 1.0 -> 1.1-dev1 migration, ours in T-SQL rather than DuckLake's statements run through
+	//! duckdb: `ADD COLUMN {IF_NOT_EXISTS}` has no T-SQL form, so the upstream batch fails the moment
+	//! a column is already there and the catalog silently stays at 1.0 (design/005). Overriding the
+	//! three virtuals is the seam - their SQL is never touched.
+	void MigrateV10(bool allow_failures = false) override;
+	void MigrateV10Dev() override;
+	void MigrateInlinedColumnNames(bool probe_renamed) override;
+	//! The one implementation behind all three: every statement guarded, so running it twice is a
+	//! no-op rather than an error.
+	void MigrateToV1_1Dev1();
 	//! The last step of that shaping, and the only one outside the transaction and allowed to fail:
 	//! `PARAMETERIZATION FORCED` on the catalog's database (specs/012). Skipped when the
 	//! `mssql_ducklake_forced_parameterization` setting is false.
@@ -175,6 +189,8 @@ private:
 	void RunServerSideOutsideTransaction(const string &tsql, const string &context);
 	//! The schema the catalog lives in, quoted for T-SQL.
 	string SchemaIdentifier() const;
+	//! The same schema as a SQL literal - what `OBJECT_ID`, `SCHEMA_ID` and `sys.schemas` take.
+	string SchemaLiteral() const;
 	//! The name of the attached mssql catalog, as a SQL literal - `mssql_exec`'s first argument.
 	string CatalogLiteral() const;
 

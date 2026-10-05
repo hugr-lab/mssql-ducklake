@@ -80,7 +80,7 @@ query II
 SELECT key, value FROM mssql_scan('srv', 'SELECT [key], [value] FROM dbo.ducklake_metadata WHERE [key] IN (''version'', ''encrypted'')') ORDER BY key;
 ----
 encrypted	false
-version	1.0
+version	1.1-dev1
 
 query I
 SELECT snapshot_id FROM ducklake_snapshots('lake');
@@ -233,7 +233,7 @@ NULL	NULL	NULL	1.5	-7	второй	{'a': 2}
 # collation (specs/006 D4) while sys.tables.name carries the database's, and SQL Server refuses to
 # compare two explicit collations without being told which one wins.
 query II
-SELECT name, typ FROM mssql_scan('srv', 'SELECT c.name, ty.name AS typ FROM dbo.ducklake_inlined_data_tables idt JOIN dbo.ducklake_table lt ON lt.table_id = idt.table_id AND lt.table_name = ''types'' JOIN sys.tables t ON t.name = idt.table_name COLLATE DATABASE_DEFAULT JOIN sys.columns c ON c.object_id = t.object_id JOIN sys.types ty ON ty.user_type_id = c.user_type_id WHERE c.column_id > 3') ORDER BY name;
+SELECT name, typ FROM mssql_scan('srv', 'SELECT DISTINCT c.name, ty.name AS typ FROM dbo.ducklake_inlined_data_tables idt JOIN dbo.ducklake_table lt ON lt.table_id = idt.table_id AND lt.table_name = ''types'' JOIN sys.tables t ON t.name = idt.table_name COLLATE DATABASE_DEFAULT AND t.schema_id = SCHEMA_ID(''dbo'') JOIN sys.columns c ON c.object_id = t.object_id JOIN sys.types ty ON ty.user_type_id = c.user_type_id WHERE c.column_id > 3') ORDER BY name;
 ----
 d	date
 f	varchar
@@ -469,9 +469,11 @@ SELECT count(*) > 0 FROM duckdb_logs() WHERE type = 'DuckLakeMetadata' AND messa
 ----
 true
 
-# and the four counters are still catalog scans - the warm path, kept on purpose
+# and the four counters are still catalog scans - the warm path, kept on purpose. RECON
+# (design/005): 1.1 writes that aggregate as COALESCE(SUM(record_count), 0), so the pattern follows
+# the aggregate rather than its exact spelling - what the test is pinning is the path, not the text.
 query I
-SELECT count(*) > 0 FROM duckdb_logs() WHERE type = 'DuckLakeMetadata' AND message LIKE '%SUM(record_count) FROM "__ducklake_metadata_lake"%';
+SELECT count(*) > 0 FROM duckdb_logs() WHERE type = 'DuckLakeMetadata' AND message LIKE '%SUM(record_count)%"__ducklake_metadata_lake"%';
 ----
 true
 

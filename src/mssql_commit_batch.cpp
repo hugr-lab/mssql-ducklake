@@ -2,6 +2,7 @@
 #include "mssql_metadata_internal.hpp"
 
 #include "common/ducklake_util.hpp"
+#include "common/ducklake_version.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/database.hpp"
 #include "storage/ducklake_catalog.hpp"
@@ -44,18 +45,20 @@ const unordered_map<string, string> &CatalogColumns() {
 	    {"ducklake_metadata", "sssn"},
 	    {"ducklake_snapshot", "ntnnn"},
 	    {"ducklake_snapshot_changes", "nssss"},
-	    {"ducklake_schema", "nunnssb"},
+	    {"ducklake_schema", "nunnssbn"},
 	    {"ducklake_table", "nunnnssb"},
 	    {"ducklake_view", "nunnnssss"},
 	    {"ducklake_tag", "nnnss"},
 	    {"ducklake_column_tag", "nnnnss"},
-	    {"ducklake_data_file", "nnnnnsbsnnnnnsnn"},
-	    {"ducklake_file_column_stats", "nnnnnnssbs"},
+	    // 1.1: tags on a view's columns, keyed on the column NAME rather than an id
+	    {"ducklake_view_column_tag", "nsnnss"},
+	    {"ducklake_data_file", "nnnnnsbsnnnnnsnnn"},
+	    {"ducklake_file_column_stats", "nnnnnnssbsbb"},
 	    {"ducklake_file_variant_stats", "nnnssnnnssbs"},
-	    {"ducklake_delete_file", "nnnnnsbsnnnsn"},
+	    {"ducklake_delete_file", "nnnnnsbsnnnsnn"},
 	    {"ducklake_column", "nnnnnssssbnss"},
 	    {"ducklake_table_stats", "nnnn"},
-	    {"ducklake_table_column_stats", "nnbbsss"},
+	    {"ducklake_table_column_stats", "nnbbsssbb"},
 	    {"ducklake_partition_info", "nnnn"},
 	    {"ducklake_partition_column", "nnnns"},
 	    {"ducklake_file_partition_value", "nnns"},
@@ -312,6 +315,41 @@ bool RewriteInsert(const string &stmt, const string &schema, string &tsql) {
 		kinds = entry->second;
 	}
 	SkipSpace(stmt, pos);
+	// 1.1 writes some of these with an explicit column list -
+	// `INSERT INTO t (schema_id, schema_uuid, …) VALUES (…)`. T-SQL takes the same list, so it is
+	// carried through verbatim; the kinds stay positional, and a listed column count that does not
+	// match the table's refuses the rewrite rather than guessing (the strict guard then names it).
+	string column_list;
+	if (pos < stmt.size() && stmt[pos] == '(') {
+		auto close = stmt.find(')', pos);
+		if (close == string::npos) {
+			return false;
+		}
+		auto listed = stmt.substr(pos + 1, close - pos - 1);
+		idx_t listed_count = 1;
+		for (auto ch : listed) {
+			if (ch == ',') {
+				listed_count++;
+			}
+		}
+		if (listed_count != kinds.size()) {
+			return false;
+		}
+		string rendered_list;
+		for (auto &name : StringUtil::Split(listed, ',')) {
+			auto trimmed = name;
+			StringUtil::Trim(trimmed);
+			for (auto ch : trimmed) {
+				if (!IsIdentifierChar(ch)) {
+					return false;
+				}
+			}
+			rendered_list += (rendered_list.empty() ? "" : ", ") + QuotedIfReserved(trimmed);
+		}
+		column_list = " (" + rendered_list + ")";
+		pos = close + 1;
+		SkipSpace(stmt, pos);
+	}
 	auto keyword = ReadIdentifier(stmt, pos);
 	if (StringUtil::Upper(keyword) != "VALUES") {
 		return false;
@@ -338,7 +376,7 @@ bool RewriteInsert(const string &stmt, const string &schema, string &tsql) {
 		}
 		rows.push_back("(" + rendered + ")");
 	}
-	tsql = ChunkedStatements("INSERT INTO " + schema + "." + table + " VALUES ", rows, ";");
+	tsql = ChunkedStatements("INSERT INTO " + schema + "." + table + column_list + " VALUES ", rows, ";");
 	return true;
 }
 
@@ -373,8 +411,32 @@ bool NumericBody(const string &body, const string &schema, string &out) {
 			result += lit.text;
 			continue;
 		}
+		if (c == '\'') {
+			// 1.1 writes the per-column statistics refresh as a direct UPDATE with the min/max
+			// values as string literals in the SET list, where 1.0 carried them in a CTE's VALUES.
+			// The literal is rendered the way every other catalog string is: N'...', so the text
+			// travels as UTF-16 into the UTF-8 column rather than through the database's code page.
+			Literal lit;
+			if (!ReadLiteral(body, pos, lit) || lit.kind != LiteralKind::STRING) {
+				return false;
+			}
+			result += "N'" + lit.text + "'";
+			continue;
+		}
 		if (IsIdentifierChar(c)) {
 			auto word = ReadIdentifier(body, pos);
+			// 1.1 writes `CAST(true AS BOOLEAN)` into the stats refresh's SET list, and DuckDB's
+			// spelling of a boolean is not T-SQL's: `true`/`false` are column references to SQL
+			// Server (error 207 "Invalid column name 'true'"), and BOOLEAN is not a type name
+			auto upper_word = StringUtil::Upper(word);
+			if (upper_word == "TRUE" || upper_word == "FALSE") {
+				result += upper_word == "TRUE" ? "1" : "0";
+				continue;
+			}
+			if (upper_word == "BOOLEAN") {
+				result += "BIT";
+				continue;
+			}
 			auto next = pos;
 			SkipSpace(body, next);
 			if (next < body.size() && body[next] == '(') {
@@ -696,7 +758,14 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 	// finds nothing left to replace.
 	SubstituteSnapshotPlaceholders(snapshot, query);
 	const auto schema = SchemaIdentifier();
-	const bool strict = StrictBatchEnabled();
+	// The kinds table above describes THIS build's format. A catalog left at an older one writes
+	// tuples of other widths, the rewrite declines them by construction and the base path carries
+	// them - correct, just not in one round trip. So the strict switch, which asks "is there a shape
+	// this build should have recognised", only speaks at the format the table was written for; at the
+	// next ducklake bump LATEST moves ahead of the table and the suite starts naming statements
+	// again, which is how the bump's re-audit is triggered.
+	const bool strict =
+	    StrictBatchEnabled() && transaction.GetCatalog().GetDuckLakeVersion() == DUCKLAKE_LATEST_VERSION;
 	const bool rewrite = BatchRewriteEnabled();
 
 	string run;

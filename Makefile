@@ -39,7 +39,9 @@ MSSQL_DUCKLAKE_IMAGE := $(call unquote,$(MSSQL_DUCKLAKE_IMAGE))
 # The metadata connection string, ADO form: the tests put it behind the `ducklake:mssql:` prefix,
 # and it is that `mssql:` (not `mssql://`, which duckdb deliberately leaves alone) that duckdb strips
 # to pick the mssql storage for the catalog ATTACH. The login is sa - the only one the container has.
-MSSQL_DUCKLAKE_TEST_DSN ?= Server=$(MSSQL_DUCKLAKE_HOST),$(MSSQL_DUCKLAKE_PORT);Database=$(MSSQL_DUCKLAKE_DB);User Id=sa;Password=$(MSSQL_DUCKLAKE_PASS)
+# TrustServerCertificate: the container serves its own self-signed certificate, and since mssql's
+# specs/074 a connection that cannot verify the certificate is refused instead of downgraded.
+MSSQL_DUCKLAKE_TEST_DSN ?= Server=$(MSSQL_DUCKLAKE_HOST),$(MSSQL_DUCKLAKE_PORT);Database=$(MSSQL_DUCKLAKE_DB);User Id=sa;Password=$(MSSQL_DUCKLAKE_PASS);TrustServerCertificate=yes
 
 DOCKER_COMPOSE := docker compose -f $(PROJ_DIR)docker/docker-compose.yml
 
@@ -108,9 +110,11 @@ bench-paths:
 test-integration: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
 # specs/014: a commit statement the T-SQL batch does not recognise fails the suite, naming it
 test-integration: export MSSQL_DUCKLAKE_STRICT_BATCH := 1
+# One file while working on it: make test-integration INTEGRATION_TESTS=test/sql/integration/migrate_v11.test
+INTEGRATION_TESTS ?= $(PROJ_DIR)test/sql/integration/*
 test-integration:
 	@test -x build/release/test/unittest || { echo "build first: GEN=ninja make"; exit 1; }
-	build/release/test/unittest '$(PROJ_DIR)test/sql/integration/*' 2>&1 | tee build/integration.log
+	build/release/test/unittest '$(INTEGRATION_TESTS)' 2>&1 | tee build/integration.log
 	scripts/ci/assert_ran.sh build/integration.log 1 1 'require-env MSSQL_DUCKLAKE_TEST_DSN'
 
 # Every metadata query DuckLake issued over a workload, by shape, with cost and path (specs/008).

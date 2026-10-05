@@ -130,6 +130,10 @@ ORDER BY table_id'))";
 
 } // namespace
 
+DuckLakeInlinedColNames InlinedColumnNames(DuckLakeTransaction &transaction) {
+	return DuckLakeInlinedColNames(transaction.GetCatalog().SupportsV1_1Metadata());
+}
+
 bool ConflictCheckQueryIsDuckLakes() {
 	// RECON (design/005): ducklake main takes `include_exactness` here and emits a different query for
 	// each value, so the exact-match rewrite of specs/007 now has TWO texts to recognise, not one.
@@ -139,6 +143,8 @@ bool ConflictCheckQueryIsDuckLakes() {
 }
 
 void MSSQLMetadataManager::CreateInlinedDeletionTable(const string &table_name) {
+	// the inlined DELETION table keeps the bare names on 1.1 - only the inlined DATA tables took the
+	// `_ducklake_` prefix (ducklake_metadata_manager.cpp:3719 writes this DDL bare); design/005
 	auto statement = StringUtil::Format(
 	    "IF OBJECT_ID(QUOTENAME(%s) + '.' + QUOTENAME(%s)) IS NULL "
 	    "CREATE TABLE %s.%s(file_id BIGINT NOT NULL, row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL, "

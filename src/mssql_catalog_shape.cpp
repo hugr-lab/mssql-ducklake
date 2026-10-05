@@ -31,7 +31,8 @@ bool MSSQLMetadataManager::CatalogShapeIsCurrent() {
 	auto &connection = transaction.GetConnection();
 	// the inner statement travels inside a duckdb string literal, so each of its own quotes is
 	// doubled once - the same shape the collation probe above uses
-	auto schema_name = StringUtil::Replace(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName(), "'", "''''");
+	auto schema_name =
+	    StringUtil::Replace(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName(), "'", "''''");
 	// The stamp sits on ducklake_metadata - the catalog's own anchor table, the one DuckLake probes to
 	// decide whether a catalog exists - and not on the schema. It was on the schema for one day, and
 	// that was a regression: a catalog whose tables were dropped and recreated (with our shaping
@@ -54,9 +55,129 @@ bool MSSQLMetadataManager::CatalogShapeIsCurrent() {
 	return row->GetValue(0, 0).GetValue<int64_t>() >= SHAPE_VERSION;
 }
 
+//===--------------------------------------------------------------------===//
+// The 1.0 -> 1.1-dev1 migration, in T-SQL (design/005)
+//===--------------------------------------------------------------------===//
+
+//! Why this is ours. DuckLake's migration is `ALTER TABLE … ADD COLUMN {IF_NOT_EXISTS} …` plus a
+//! `CREATE TABLE {IF_NOT_EXISTS}`, and it goes to duckdb, which sends it on to the catalog: the
+//! mssql extension's ALTER has no form for `IF NOT EXISTS`, so the guard is dropped and attaching a
+//! 1.0 catalog that is already part-way through the migration dies on the first statement -
+//!
+//!   SQL Server error 2705: Column names in each table must be unique.
+//!   Column name 'row_group_count' in table 'dbo.ducklake_data_file' is specified more than once.
+//!
+//! - which `MigrateV10Dev` turns into a warning, leaving the catalog at 1.0 for good. So the three
+//! migration virtuals are overridden and none of their SQL is touched: the same migration, written
+//! the way the shaping writes everything, each step guarded by the server's own catalog views, so a
+//! re-run is a no-op instead of an error. The pre-1.0 migrations have the same problem and are
+//! left alone: every catalog a release of this extension created is at 1.0 or later, because 1.0 was
+//! the latest format on the line it shipped on.
+void MSSQLMetadataManager::MigrateToV1_1Dev1() {
+	// renaming first means a collision in a user's inlined table aborts while the catalog still
+	// says 1.0, which is the order upstream picked for the same reason
+	MigrateInlinedColumnNames(true);
+
+	const string schema = SchemaIdentifier();
+	const string schema_literal = SchemaLiteral();
+
+	// the columns 1.1-dev1 adds, in this catalog's types rather than DuckLake's spelling: BOOLEAN is
+	// BIT here
+	const vector<pair<string, string>> added_columns = {
+	    {"ducklake_data_file", "row_group_count BIGINT"},    {"ducklake_delete_file", "row_group_count BIGINT"},
+	    {"ducklake_file_column_stats", "min_is_exact BIT"},  {"ducklake_file_column_stats", "max_is_exact BIT"},
+	    {"ducklake_table_column_stats", "min_is_exact BIT"}, {"ducklake_table_column_stats", "max_is_exact BIT"},
+	    {"ducklake_schema", "parent_schema_id BIGINT"},
+	};
+	string ddl;
+	for (auto &entry : added_columns) {
+		auto column = StringUtil::Split(entry.second, ' ')[0];
+		ddl += StringUtil::Format("IF COL_LENGTH(QUOTENAME(%s) + '.%s', '%s') IS NULL "
+		                          "ALTER TABLE %s.%s ADD %s;\n",
+		                          schema_literal, entry.first, column, schema, entry.first, entry.second);
+	}
+	// the table 1.1 adds - with our VARCHAR collation, like every other string column in the catalog,
+	// and `key` quoted because it is a T-SQL keyword
+	ddl += StringUtil::Format("IF OBJECT_ID(QUOTENAME(%s) + '.ducklake_view_column_tag') IS NULL "
+	                          "CREATE TABLE %s.ducklake_view_column_tag(view_id BIGINT, "
+	                          "column_name VARCHAR(MAX) COLLATE %s, begin_snapshot BIGINT, end_snapshot BIGINT, "
+	                          "[key] VARCHAR(MAX) COLLATE %s, value VARCHAR(MAX) COLLATE %s);\n",
+	                          schema_literal, schema, VARCHAR_COLLATION, VARCHAR_COLLATION, VARCHAR_COLLATION);
+	// the value is named as well as the key: this runs on a 1.0 or an already-migrated catalog and
+	// nothing else, so a stray call cannot relabel a catalog of some later format as this one
+	ddl += StringUtil::Format("UPDATE %s.ducklake_metadata SET value = N'1.1-dev1' "
+	                          "WHERE [key] = N'version' AND value IN (N'1.0', N'1.1-dev1');\n",
+	                          schema);
+	// the catalog now holds a table and columns the shaping has never seen, and the shaping only runs
+	// when its stamp is behind - so the stamp goes, and the EnsureCatalogShape of this same attach
+	// keys, collates and indexes what just appeared
+	ddl += StringUtil::Format("IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 1 AND major_id = "
+	                          "OBJECT_ID(QUOTENAME(%s) + '.ducklake_metadata') AND minor_id = 0 AND name = '%s') "
+	                          "EXEC sp_dropextendedproperty @name = N'%s', @level0type = N'SCHEMA', @level0name = %s, "
+	                          "@level1type = N'TABLE', @level1name = N'ducklake_metadata';\n",
+	                          schema_literal, SHAPE_VERSION_PROPERTY, SHAPE_VERSION_PROPERTY, schema_literal);
+
+	RunServerSideOutsideTransaction(ddl, "Failed to migrate the DuckLake catalog to v1.1-dev1: ");
+}
+
+//! Format 1.1 prefixes the metadata columns of the inlined DATA tables with `_ducklake_` - those
+//! only: the inlined deletion tables keep the bare names (specs/006 D5b, and ducklake writes that
+//! DDL bare too). One dynamic batch renames every table the catalog's own registry lists, so it is
+//! a no-op the second time without a probe; `sp_rename` carries the primary key along with the
+//! column. `probe_renamed` has nothing to switch off here - the batch costs one round trip either
+//! way.
+void MSSQLMetadataManager::MigrateInlinedColumnNames(bool probe_renamed) {
+	const string schema = SchemaIdentifier();
+	const string schema_literal = SchemaLiteral();
+	// the metadata columns are the table's first three by construction, which is also how DuckLake
+	// finds them - so `column_id <= 3` keeps a user column that happens to be called `row_id` out of
+	// it, and a user column already called `_ducklake_row_id` makes sp_rename fail, as it should.
+	// The join needs a collation: `table_name` is the catalog's own VARCHAR under the UTF-8 BIN2
+	// collation and `sys.tables.name` is sysname under the database's, which `=` refuses to mix.
+	// STRING_AGG over a DISTINCT derived table rather than the `SELECT @sql += ...` the shaping uses:
+	// a registry row per schema version means the same table is listed more than once, and assigning
+	// to a variable in a SELECT that also says DISTINCT has no defined result - it renamed nothing.
+	// All of the renames or none: a user column colliding with a prefixed name fails one sp_rename,
+	// and a catalog left half-prefixed is one a 1.0 build can no longer read
+	auto statement = StringUtil::Format(R"(
+DECLARE @rename NVARCHAR(MAX);
+SELECT @rename = STRING_AGG(CAST(stmt AS NVARCHAR(MAX)), CHAR(10))
+FROM (SELECT DISTINCT N'EXEC sp_rename N' + CHAR(39) + QUOTENAME(%s) + N'.' + QUOTENAME(t.name) + N'.'
+                    + QUOTENAME(c.name) + CHAR(39) + N', N' + CHAR(39) + N'_ducklake_' + c.name + CHAR(39)
+                    + N', N' + CHAR(39) + N'COLUMN' + CHAR(39) + N';' AS stmt
+      FROM %s.ducklake_inlined_data_tables idt
+      JOIN sys.tables t ON t.name = idt.table_name COLLATE DATABASE_DEFAULT AND t.schema_id = SCHEMA_ID(%s)
+      JOIN sys.columns c ON c.object_id = t.object_id AND c.column_id <= 3
+      WHERE c.name IN ('row_id', 'begin_snapshot', 'end_snapshot')) renames;
+IF @rename IS NOT NULL
+BEGIN
+	SET XACT_ABORT ON;
+	BEGIN TRANSACTION;
+	EXEC sp_executesql @rename;
+	COMMIT TRANSACTION;
+END;
+)",
+	                                    schema_literal, schema, schema_literal);
+	RunServerSideOutsideTransaction(statement, "Failed to rename the inlined metadata columns to v1.1-dev1: ");
+}
+
+//! The explicit path, `ATTACH … (AUTOMATIC_MIGRATION TRUE)`: every statement is guarded, so a
+//! failure here is a real one and is left to surface.
+void MSSQLMetadataManager::MigrateV10(bool allow_failures) {
+	MigrateToV1_1Dev1();
+}
+
+//! The attach-time path. Upstream splits it in two halves and logs a warning for each, because
+//! either can fail on a catalog it has already half-migrated; ours cannot, so there is nothing to
+//! swallow and the error is the answer here too.
+void MSSQLMetadataManager::MigrateV10Dev() {
+	MigrateToV1_1Dev1();
+}
+
 void MSSQLMetadataManager::EnsureCatalogShape() {
 	const string schema = SchemaIdentifier();
-	const string schema_literal = DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
+	const string schema_literal =
+	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
 
 	// Primary keys. DuckLake declares a few itself; the rest are ours, and they are what make the
 	// catalog writable at all: the mssql extension builds a row identity out of the primary key, and
@@ -71,6 +192,8 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	    {"ducklake_column", "table_id, column_id, begin_snapshot"},
 	    {"ducklake_tag", "object_id, begin_snapshot, [key]"},
 	    {"ducklake_column_tag", "table_id, column_id, begin_snapshot, [key]"},
+	    // 1.1: the same shape for a view's column tags, keyed on the column name
+	    {"ducklake_view_column_tag", "view_id, column_name, begin_snapshot, [key]"},
 	    {"ducklake_partition_info", "partition_id"},
 	    {"ducklake_partition_column", "partition_id, partition_key_index"},
 	    {"ducklake_sort_info", "sort_id"},
@@ -93,10 +216,20 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	// over MAX, so those are capped - 200 bytes of UTF-8 is a long name and well inside the
 	// 900-byte index limit.
 	auto key_column_type = [&](const string &name) {
-		if (name == "[key]" || name == "variant_path") {
+		if (name == "[key]" || name == "variant_path" || name == "column_name") {
 			return StringUtil::Format("VARCHAR(200) COLLATE %s", VARCHAR_COLLATION);
 		}
 		return string("BIGINT");
+	};
+
+	// A table one format added is not in a catalog of an older one - and the attach that migrates
+	// shapes on the same pass, so the shaping meets both. Every statement that names a table is
+	// guarded by its existence rather than by the catalog's version: the version says what SHOULD be
+	// there, the server says what is, and a migration that stopped half-way is the case where those
+	// two disagree. The dynamic blocks are generated from sys.columns and are existence-safe already.
+	auto if_table_exists = [&](const string &table, const string &body) {
+		return StringUtil::Format("IF OBJECT_ID(QUOTENAME(%s) + '.%s') IS NOT NULL\nBEGIN\n%sEND;\n", schema_literal,
+		                          table, body);
 	};
 
 	string columns_ddl;
@@ -107,7 +240,9 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	// this - LoadExistingDuckLake, then ProbeServerCapabilities (ducklake_initializer.cpp) - so the
 	// only catalog still holding those rows is one whose migration did not finish. NULLs keep the
 	// column out of a key, so the sweep upstream does runs here too, before the NOT NULL below.
-	columns_ddl += StringUtil::Format("DELETE FROM %s.ducklake_schema_versions WHERE table_id IS NULL;\n", schema);
+	columns_ddl += if_table_exists(
+	    "ducklake_schema_versions",
+	    StringUtil::Format("DELETE FROM %s.ducklake_schema_versions WHERE table_id IS NULL;\n", schema));
 
 	for (auto &entry : keys) {
 		auto names = StringUtil::Split(entry.second, ',');
@@ -128,7 +263,8 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 		// keyed without table_id, DuckLake writes one row per table of a snapshot, and every commit
 		// touching two tables was refused by the server. Compared as text against what sys says the
 		// key is today, so this costs nothing on a catalog that is already right.
-		columns_ddl += StringUtil::Format(
+		string key_ddl;
+		key_ddl += StringUtil::Format(
 		    "IF EXISTS (SELECT 1 FROM sys.key_constraints kc WHERE kc.name = 'pk_%s' AND kc.schema_id = SCHEMA_ID(%s) "
 		    "AND kc.type = 'PK' AND ISNULL((SELECT STRING_AGG(c.name, ',') WITHIN GROUP (ORDER BY ic.key_ordinal) "
 		    "FROM sys.index_columns ic JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id "
@@ -137,15 +273,18 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 		    entry.first, schema_literal, declared, schema, entry.first, entry.first);
 		for (auto &name : names) {
 			// a key column has to be NOT NULL, and DuckLake declares none of them so
-			columns_ddl += StringUtil::Format("ALTER TABLE %s.%s ALTER COLUMN %s %s NOT NULL;\n", schema, entry.first,
-			                                  name, key_column_type(name));
+			key_ddl += StringUtil::Format("ALTER TABLE %s.%s ALTER COLUMN %s %s NOT NULL;\n", schema, entry.first, name,
+			                              key_column_type(name));
 		}
+		columns_ddl += if_table_exists(entry.first, key_ddl);
 		// idempotent, so that an existing catalog can be brought up to shape on attach and a run
 		// that failed partway can be resumed
-		constraints_ddl += StringUtil::Format(
-		    "IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE name = 'pk_%s' AND schema_id = SCHEMA_ID(%s)) "
-		    "ALTER TABLE %s.%s ADD CONSTRAINT pk_%s PRIMARY KEY (%s);\n",
-		    entry.first, schema_literal, schema, entry.first, entry.first, entry.second);
+		constraints_ddl += if_table_exists(
+		    entry.first,
+		    StringUtil::Format(
+		        "IF NOT EXISTS (SELECT 1 FROM sys.key_constraints WHERE name = 'pk_%s' AND schema_id = SCHEMA_ID(%s)) "
+		        "ALTER TABLE %s.%s ADD CONSTRAINT pk_%s PRIMARY KEY (%s);\n",
+		        entry.first, schema_literal, schema, entry.first, entry.first, entry.second));
 	}
 
 	// The statistics DuckLake compares server-side. Its min/max values are the bytes DuckDB computed
@@ -157,8 +296,9 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	    {"ducklake_file_variant_stats", "min_value"}, {"ducklake_file_variant_stats", "max_value"},
 	};
 	for (auto &entry : stats_columns) {
-		columns_ddl += StringUtil::Format("ALTER TABLE %s.%s ALTER COLUMN %s VARCHAR(MAX) COLLATE %s;\n", schema,
-		                                  entry.first, entry.second, VARCHAR_COLLATION);
+		columns_ddl += if_table_exists(
+		    entry.first, StringUtil::Format("ALTER TABLE %s.%s ALTER COLUMN %s VARCHAR(MAX) COLLATE %s;\n", schema,
+		                                    entry.first, entry.second, VARCHAR_COLLATION));
 	}
 
 	// A partition value is bounded so it can be an index key. DuckLake declares it an unbounded
@@ -166,9 +306,10 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	// pruning predicate below would have nothing to seek. 200 bytes of UTF-8 is far more than a
 	// partition key ever is (a date, a tenant, a bucket) and well inside the 900-byte index limit;
 	// a longer one is refused by the server rather than silently truncated.
-	columns_ddl += StringUtil::Format("ALTER TABLE %s.ducklake_file_partition_value ALTER COLUMN partition_value "
-	                                  "VARCHAR(200) COLLATE %s NULL;\n",
-	                                  schema, VARCHAR_COLLATION);
+	columns_ddl += if_table_exists("ducklake_file_partition_value",
+	                               StringUtil::Format("ALTER TABLE %s.ducklake_file_partition_value ALTER COLUMN "
+	                                                  "partition_value VARCHAR(200) COLLATE %s NULL;\n",
+	                                                  schema, VARCHAR_COLLATION));
 
 	// Everything else DuckLake declared as a string. mssql maps DuckDB's VARCHAR to NVARCHAR, which
 	// is UTF-16: two bytes per character for catalog content that is paths, type names and
@@ -254,12 +395,13 @@ EXEC sp_executesql @key;
 	};
 	for (auto &entry : visibility_indexes) {
 		const auto visible = "ix_" + entry.first + "_visible";
-		constraints_ddl += StringUtil::Format("IF NOT EXISTS (%s) CREATE INDEX %s ON %s.%s(%s);\n",
-		                                      index_exists(visible), visible, schema, entry.first, entry.second);
 		// the filtered index this replaces, left behind by an older build of this extension
 		const auto live = "ix_" + entry.first + "_live";
-		constraints_ddl += StringUtil::Format("IF EXISTS (%s) DROP INDEX %s ON %s.%s;\n", index_exists(live), live,
-		                                      schema, entry.first);
+		constraints_ddl += if_table_exists(
+		    entry.first, StringUtil::Format("IF NOT EXISTS (%s) CREATE INDEX %s ON %s.%s(%s);\n"
+		                                    "IF EXISTS (%s) DROP INDEX %s ON %s.%s;\n",
+		                                    index_exists(visible), visible, schema, entry.first, entry.second,
+		                                    index_exists(live), live, schema, entry.first));
 	}
 
 	// The rest keep the filtered form: their hot reads are the catalog load, which asks for the
@@ -272,9 +414,10 @@ EXEC sp_executesql @key;
 	};
 	for (auto &entry : live_indexes) {
 		const auto live = "ix_" + entry.first + "_live";
-		constraints_ddl +=
+		constraints_ddl += if_table_exists(
+		    entry.first,
 		    StringUtil::Format("IF NOT EXISTS (%s) CREATE INDEX %s ON %s.%s(%s) WHERE end_snapshot IS NULL;\n",
-		                       index_exists(live), live, schema, entry.first, entry.second);
+		                       index_exists(live), live, schema, entry.first, entry.second));
 	}
 
 	// The per-column statistics a filtered read prunes with: the largest table in the catalog, a row
@@ -292,9 +435,11 @@ EXEC sp_executesql @key;
 	// neither an index key nor something worth duplicating into one. No filtered form either: stats
 	// have no end_snapshot, they belong to a file and the file is what expires.
 	const string stats_lookup = "ix_ducklake_file_column_stats_lookup";
-	constraints_ddl += StringUtil::Format(
-	    "IF NOT EXISTS (%s) CREATE INDEX %s ON %s.ducklake_file_column_stats(table_id, column_id);\n",
-	    index_exists(stats_lookup), stats_lookup, schema);
+	constraints_ddl += if_table_exists(
+	    "ducklake_file_column_stats",
+	    StringUtil::Format(
+	        "IF NOT EXISTS (%s) CREATE INDEX %s ON %s.ducklake_file_column_stats(table_id, column_id);\n",
+	        index_exists(stats_lookup), stats_lookup, schema));
 
 	// Partition pruning, which is the whole reason to partition: DuckLake turns a filter on a
 	// partition key into
@@ -305,10 +450,11 @@ EXEC sp_executesql @key;
 	// file-column-stats index worth 15x. All three predicate columns are in the key, so the server
 	// seeks and reads nothing it does not return; this is what the VARCHAR(200) above is for.
 	const string partition_lookup = "ix_ducklake_file_partition_value_lookup";
-	constraints_ddl += StringUtil::Format("IF NOT EXISTS (%s) CREATE INDEX %s ON "
-	                                      "%s.ducklake_file_partition_value(table_id, partition_key_index, "
-	                                      "partition_value);\n",
-	                                      index_exists(partition_lookup), partition_lookup, schema);
+	constraints_ddl += if_table_exists(
+	    "ducklake_file_partition_value",
+	    StringUtil::Format("IF NOT EXISTS (%s) CREATE INDEX %s ON "
+	                       "%s.ducklake_file_partition_value(table_id, partition_key_index, partition_value);\n",
+	                       index_exists(partition_lookup), partition_lookup, schema));
 
 	// Last, and only if everything above succeeded: the version stamp CatalogShapeIsCurrent reads.
 	// It is what lets a catalog shaped by an older build of this extension be brought up to the
