@@ -32,9 +32,9 @@ namespace {
 //! of the build) stays what Version() returns, for duckdb_extensions().
 void MssqlDucklakeVersionFun(DataChunk &args, ExpressionState &state, Vector &result) {
 #ifdef MSSQL_DUCKLAKE_VERSION
-	result.Reference(Value(MSSQL_DUCKLAKE_VERSION));
+	result.Reference(Value(MSSQL_DUCKLAKE_VERSION), count_t(args.size()));
 #else
-	result.Reference(Value(MssqlDucklakeExtension().Version()));
+	result.Reference(Value(MssqlDucklakeExtension().Version()), count_t(args.size()));
 #endif
 }
 

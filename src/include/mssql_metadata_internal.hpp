@@ -88,6 +88,6 @@ bool ConflictCheckQueryIsDuckLakes();
 
 //! Whether DuckLake's commit loop still writes the inlined deletion table's DDL into the batch in the
 //! text the Execute seam recognises (specs/006 D5b). Asked at attach for the same reason.
-bool InlinedDeletionDdlIsDuckLakes();
+bool InlinedDeletionDdlIsDuckLakes(DuckLakeMetadataManager &manager);
 
 } // namespace duckdb

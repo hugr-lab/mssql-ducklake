@@ -131,7 +131,11 @@ ORDER BY table_id'))";
 } // namespace
 
 bool ConflictCheckQueryIsDuckLakes() {
-	return DuckLakeMetadataManager::GetSnapshotAndStatsAndChangesQuery() == DUCKLAKE_CONFLICT_CHECK_QUERY;
+	// RECON (design/005): ducklake main takes `include_exactness` here and emits a different query for
+	// each value, so the exact-match rewrite of specs/007 now has TWO texts to recognise, not one.
+	// This checks the false form only - enough to build and run; the port has to decide whether to
+	// carry both texts or to drop the rewrite in favour of DuckDB 2.0's own pushdown (design/004).
+	return DuckLakeMetadataManager::GetSnapshotAndStatsAndChangesQuery(false) == DUCKLAKE_CONFLICT_CHECK_QUERY;
 }
 
 void MSSQLMetadataManager::CreateInlinedDeletionTable(const string &table_name) {
@@ -139,7 +143,7 @@ void MSSQLMetadataManager::CreateInlinedDeletionTable(const string &table_name) 
 	    "IF OBJECT_ID(QUOTENAME(%s) + '.' + QUOTENAME(%s)) IS NULL "
 	    "CREATE TABLE %s.%s(file_id BIGINT NOT NULL, row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL, "
 	    "CONSTRAINT %s PRIMARY KEY (file_id, row_id, begin_snapshot));",
-	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName()),
+	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName()),
 	    DuckLakeUtil::SQLLiteralToString(table_name), SchemaIdentifier(), SQLIdentifier(table_name),
 	    SQLIdentifier("pk_" + table_name));
 	RunServerSideOutsideTransaction(statement, "Failed to create the inlined deletion table: ");

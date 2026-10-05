@@ -31,7 +31,7 @@ bool MSSQLMetadataManager::CatalogShapeIsCurrent() {
 	auto &connection = transaction.GetConnection();
 	// the inner statement travels inside a duckdb string literal, so each of its own quotes is
 	// doubled once - the same shape the collation probe above uses
-	auto schema_name = StringUtil::Replace(transaction.GetCatalog().MetadataSchemaName(), "'", "''''");
+	auto schema_name = StringUtil::Replace(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName(), "'", "''''");
 	// The stamp sits on ducklake_metadata - the catalog's own anchor table, the one DuckLake probes to
 	// decide whether a catalog exists - and not on the schema. It was on the schema for one day, and
 	// that was a regression: a catalog whose tables were dropped and recreated (with our shaping
@@ -56,7 +56,7 @@ bool MSSQLMetadataManager::CatalogShapeIsCurrent() {
 
 void MSSQLMetadataManager::EnsureCatalogShape() {
 	const string schema = SchemaIdentifier();
-	const string schema_literal = DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName());
+	const string schema_literal = DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
 
 	// Primary keys. DuckLake declares a few itself; the rest are ours, and they are what make the
 	// catalog writable at all: the mssql extension builds a row identity out of the primary key, and

@@ -600,12 +600,14 @@ constexpr const char *INLINED_DELETE_DDL_HEAD =
     "CREATE TABLE IF NOT EXISTS {METADATA_CATALOG}.ducklake_inlined_delete_";
 constexpr const char *INLINED_DELETE_DDL_TAIL = "(file_id BIGINT, row_id BIGINT, begin_snapshot BIGINT)";
 
-bool InlinedDeletionDdlIsDuckLakes() {
+bool InlinedDeletionDdlIsDuckLakes(DuckLakeMetadataManager &manager) {
 	DuckLakeInlinedFileDeletionInfo probe;
 	probe.table_id = TableIndex(7);
 	vector<DuckLakeInlinedFileDeletionInfo> one;
 	one.push_back(std::move(probe));
-	auto generated = DuckLakeMetadataManager::WriteNewInlinedFileDeletesSqlBatch(one);
+	// ducklake main made this a member (it marks the manager's cache for clearing); on the v1.5 line
+	// it was static. RECON: the real port wants a check that does not touch the live manager.
+	auto generated = manager.WriteNewInlinedFileDeletesSqlBatch(one);
 	return StringUtil::StartsWith(generated, string(INLINED_DELETE_DDL_HEAD) + "7" + INLINED_DELETE_DDL_TAIL + ";");
 }
 

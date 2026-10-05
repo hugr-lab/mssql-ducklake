@@ -7,7 +7,6 @@
 # like production does, with an explicit LOAD.
 duckdb_extension_load(mssql_ducklake
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
-    DONT_LINK
     LOAD_TESTS
 )
 
@@ -17,7 +16,6 @@ duckdb_extension_load(mssql_ducklake
 # the v1.5 line (v0.2.5: the catalog's default schema is dbo, multi-scan plans on a pinned
 # connection materialize - spec 003); its openssl/simdutf arrive through the merged vcpkg manifest.
 duckdb_extension_load(mssql
-    DONT_LINK
     GIT_URL https://github.com/hugr-lab/mssql-extension
-    GIT_TAG v0.2.5
+    GIT_TAG spec/079-e2
 )

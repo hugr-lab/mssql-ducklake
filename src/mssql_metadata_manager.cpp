@@ -131,7 +131,7 @@ string MSSQLMetadataManager::TSQLColumnType(const LogicalType &column_type) cons
 //===--------------------------------------------------------------------===//
 
 string MSSQLMetadataManager::SchemaIdentifier() const {
-	return DuckLakeUtil::SQLIdentifierToString(transaction.GetCatalog().MetadataSchemaName());
+	return DuckLakeUtil::SQLIdentifierToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
 }
 
 string MSSQLMetadataManager::CatalogLiteral() const {
@@ -175,7 +175,7 @@ void MSSQLMetadataManager::ClearCache() {
 	// Nothing recorded means we do not know what changed - the attach-time clear - and the schema is
 	// the honest answer then.
 	auto &connection = transaction.GetConnection();
-	auto schema = DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName());
+	auto schema = DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
 	vector<string> calls;
 	if (tables_pending_cache_refresh.empty()) {
 		calls.push_back(StringUtil::Format("SELECT mssql_invalidate_cache(%s, %s)", CatalogLiteral(), schema));
@@ -198,7 +198,7 @@ void MSSQLMetadataManager::InvalidateTableCache(const string &table_name) {
 	auto &connection = transaction.GetConnection();
 	auto result = connection.Query(
 	    StringUtil::Format("SELECT mssql_invalidate_cache(%s, %s, %s)", CatalogLiteral(),
-	                       DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName()),
+	                       DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName()),
 	                       DuckLakeUtil::SQLLiteralToString(table_name)));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to refresh the SQL Server catalog cache: ");
@@ -227,7 +227,7 @@ void MSSQLMetadataManager::ProbeServerCapabilities() {
 	// concurrent-commit crash comes back - silently, in a path only concurrent writers reach. So the
 	// mismatch is made loud here instead: one string comparison per attach, and a bump that touches
 	// the query fails the integration suite rather than shipping a correctness regression.
-	if (!InlinedDeletionDdlIsDuckLakes()) {
+	if (!InlinedDeletionDdlIsDuckLakes(*this)) {
 		throw InvalidInputException(
 		    "mssql_ducklake: DuckLake's DDL for a new inlined deletion table has changed in this ducklake "
 		    "pin. The commit batch seam creates that table keyed in its place (specs/006 D5b); re-audit "
@@ -267,7 +267,7 @@ string MSSQLMetadataManager::GetInlinedTableQueries(DuckLakeSnapshot commit_snap
 	    "IF OBJECT_ID(QUOTENAME(%s) + '.' + QUOTENAME(%s)) IS NULL "
 	    "CREATE TABLE %s.%s(row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL, end_snapshot BIGINT%s, "
 	    "CONSTRAINT %s PRIMARY KEY (row_id, begin_snapshot));",
-	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName()),
+	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName()),
 	    DuckLakeUtil::SQLLiteralToString(table_name), SchemaIdentifier(), SQLIdentifier(table_name), columns,
 	    SQLIdentifier("pk_" + table_name));
 	RunServerSideOutsideTransaction(statement, "Failed to create the inlined data table: ");
