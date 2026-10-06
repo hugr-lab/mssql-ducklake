@@ -369,11 +369,46 @@ small in rows. Their cost is the catalog reload (R4), not the commit, so they co
 | --- | --- | --- |
 | duckdb | the 2.0 line | a released tag |
 | ducklake | **untouched** (R1) | the bump's SHA |
-| mssql | local a71c57c | a pushed ref with 081 |
+| mssql | hugr-lab/mssql-extension#407 head 9f369d5 (pushed; 081 on top of main 88fe137) | a release tag |
 | `CMakeLists.txt` | the new `format.py` wants 80 columns | one reformat commit |
 | `make tidy-check` | the pattern without the trailing slash | validated in CI |
 | fast-path suite | — | in CI |
 | bench catalog | in its own schema | the integration suite resets `dbo`, and it wiped the bench catalog three times |
+
+## Against postgres, measured (2026-10-06)
+
+The same reduced bench (1000 tables, 10 schemas, 40 columns, no deep history, no partitioned tables)
+on both backends in one run. postgres_scanner is built from duckdb-postgres `main` (no binary exists
+for a dev duckdb), with one call patched for our duckdb pin.
+
+| phase | mssql | postgres | mssql / postgres |
+| --- | ---: | ---: | ---: |
+| `create_tables` | 179.3 | 186.7 | 0.96 |
+| `first_commits` (inlined inserts) | 25.8 | 18.2 | **1.42** |
+| `second_commits` (file-backed) | 21.9 | 63.7 | 0.34 |
+| `flush_inlined` | 147.6 | 137.1 | 1.08 |
+| `merge_adjacent` | 9.3 | 30.1 | 0.31 |
+| `partitioned_merge_adjacent` (a merge over the whole lake here) | 119.1 | 82.2 | **1.45** |
+| `filtered_read` | 0.44 | 0.22 | **2.01** |
+| `table_info` / `cleanup_files` / `deep_read_filtered` | 0.06 / 0.10 / 0.09 | 0.01 / 0.005 / 0.01 | **5–20** |
+| reattach phases | 0.4–0.7 | 0.9–1.3 | 0.35–0.72 |
+| **total** | **507.5** | **522.4** | **0.97** |
+
+**On this line the mssql backend is no longer the slower one overall.** The two largest phases,
+`create_tables` and `flush_inlined`, are at parity. Both are dominated by upstream's catalog loads,
+and the postgres manager pays those loads exactly as we do: its reads go through the base path.
+
+Where postgres is still ahead:
+
+1. **inlined inserts**, ~7.6 ms a commit;
+2. **a merge of adjacent files over the whole lake**, 37 s;
+3. **the read path**. The postgres manager overrides `GenerateFileListQuery` and the file-column-stats
+   CTE and runs the whole file-list query natively in postgres through one `postgres_query`. Ours goes
+   through the catalog path piece by piece, a restriction the given-shape scans now lift. It costs only
+   milliseconds per query, but it is paid on every read.
+
+The errors in both runs' logs are the reduced configuration's (queries for partitioned and deep
+tables it was told not to make), identical across every run of the day and on both backends.
 
 ## Dependencies on the mssql extension
 

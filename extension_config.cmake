@@ -15,10 +15,21 @@ duckdb_extension_load(mssql_ducklake
 # (`LOAD '__BUILD_DIRECTORY__/extension/mssql/...'`). The pin is the release tag built against
 # the v1.5 line (v0.2.5: the catalog's default schema is dbo, multi-scan plans on a pinned
 # connection materialize - spec 003); its openssl/simdutf arrive through the merged vcpkg manifest.
-# RECON, local only (design/005): the manager's scans are on spec 081's given-shape vehicle
-# (`mssql_scan_unsafe`), which lives in a local branch of the sibling repo - a71c57c, on top of
-# 998660e's pushdown fix. Neither is pushed. Put the branch back on a published ref before merge.
+# RECON (specs/015): the manager's scans are on spec 081's given-shape vehicle
+# (`mssql_scan_unsafe`), pushed as hugr-lab/mssql-extension#407 - branch spec/081-shape-vehicle,
+# head 9f369d5, on top of main 88fe137 (with #406's pushdown). Move to a release tag before merge.
 duckdb_extension_load(mssql
-    GIT_URL /Users/vgribanov/projects/hugr-lab/mssql-extension
-    GIT_TAG a71c57c
+    GIT_URL https://github.com/hugr-lab/mssql-extension
+    GIT_TAG 9f369d56003ea457ebee922ae268e11012e38851
+)
+
+# RECON (specs/015): the postgres arm of the bench. The 2.0-line duckdb is a dev build with no
+# published postgres_scanner, so it is built from source like mssql - a loadable, loaded by build
+# path. Not part of the release build. Its pin is on duckdb 097ee1d34a (09-30), ours is 4af9740da4:
+# one call changed in between (`Parser::ParseExpressionList` is no longer static), patched by hand
+# in build/release/_deps/postgres_scanner_extension_fc-src - redo it after a clean build.
+duckdb_extension_load(postgres_scanner
+    GIT_URL https://github.com/duckdb/duckdb-postgres
+    GIT_TAG f9db66ec5a5c35a30ce868d2b7233ffc0a21a08e
+    SUBMODULES database-connector
 )

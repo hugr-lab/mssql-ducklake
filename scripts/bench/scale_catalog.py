@@ -81,11 +81,17 @@ LOAD = (
 BENCH_SCHEMA = os.environ.get("MSSQL_DUCKLAKE_BENCH_SCHEMA", "bench").strip() or "bench"
 
 
+#! The postgres extension: the build's own when there is one (a dev duckdb has no published
+#! postgres_scanner to INSTALL - specs/015 builds it from source), otherwise the released one.
+_PG_BUILD = "build/release/extension/postgres_scanner/postgres_scanner.duckdb_extension"
+PG_LOAD = (f"LOAD '{_PG_BUILD}';" if os.path.exists(_PG_BUILD) else "INSTALL postgres; LOAD postgres;")
+
+
 def reset_sql(backend: str, mssql_dsn: str, pg_dsn: str) -> str:
     """Drop whatever the last run left, so the build below starts from nothing."""
     if backend == "postgres":
         return (
-            "INSTALL postgres; LOAD postgres;\n"
+            f"{PG_LOAD}\n"
             f"ATTACH '{pg_dsn}' AS pg (TYPE postgres);\n"
             "USE pg;\nDROP SCHEMA public CASCADE;\nCREATE SCHEMA public;\nUSE memory;\nDETACH pg;\n"
         )
@@ -109,7 +115,7 @@ def warmup_sql(backend: str, mssql_dsn: str, pg_dsn: str) -> str:
     measurement time and the other does not is not a comparison.
     """
     if backend == "postgres":
-        return f"INSTALL postgres; LOAD postgres;\nATTACH '{pg_dsn}' AS warm (TYPE postgres);\nSELECT 1;\n"
+        return f"{PG_LOAD}\nATTACH '{pg_dsn}' AS warm (TYPE postgres);\nSELECT 1;\n"
     return (
         f"ATTACH '{mssql_dsn}' AS warm (TYPE mssql);\n"
         "SELECT count(*) FROM mssql_scan('warm', 'SELECT 1 AS x');\n"
