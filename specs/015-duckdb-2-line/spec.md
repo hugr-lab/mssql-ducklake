@@ -217,12 +217,51 @@ The transition, in the order the measurements impose:
 | piece | on the branch | before merge |
 | --- | --- | --- |
 | duckdb | the 2.0 line | a released tag |
-| ducklake | main, **patched** — the versioned-manager hook (`CreateVersionedManager`) so a third-party manager survives `SetVersionedMetadataManager` | upstream takes the hook, or the bump ships pinned to format 1.0 |
+| ducklake | main, **patched** — today a 60-line hook (`CreateVersionedManager`) plus a header-only `DuckLakeMetadataManagerV1_1` so a third-party manager survives `SetVersionedMetadataManager` | D9: the manager is natively 1.1 and the patch shrinks to one line, which is upstream's bug to fix |
 | mssql | **local** `a71c57c` (spec 081 2/n on top of 998660e, the pushdown fix) | a pushed ref; 081 becomes its own PR after #406 |
 | `MSSQL_DUCKLAKE_TEST_DSN` | `TrustServerCertificate=yes` added by the Makefile — mssql specs/074 refuses an unverifiable certificate | stays |
 | `CMakeLists.txt` | the new duckdb's `format.py` wants it at 80 columns | one reformat commit |
 | `make tidy-check` | ci-tools' pattern `src/.*/` matches nothing in a flat `src/`; the code-quality job has passed vacuously since the repository started | the pattern without the slash, validated in CI |
 | `make test-integration-fast-path` | not in CI, which is how D6's bug survived | in CI |
+
+### D9 — the manager is natively 1.1, and registration needs nothing from upstream but one line
+
+Format 1.0 is not supported by the new version. That decides the registration question.
+
+How the 2.0-line ducklake works: a manager is created **per transaction** (`DuckLakeTransaction`'s
+constructor calls `DuckLakeMetadataManager::Create`, the registry by `MetadataType()`), and the
+factory does not take a version — rightly, the version belongs to the catalog. Version-dependent
+behaviour (the inlined-table column prefix, the exactness columns, the read queries) is driven from
+`catalog.SupportsV1_1Metadata()` at 28 sites, never from the manager's class. The class matters for
+exactly **seven virtuals**: the six catalog DDL statements and `GetVersionString()` (the base says
+`1.0`), used only when a catalog is created. `DuckLakeMetadataManagerV1_1<Base>` exists so the three
+built-ins get those seven without being edited.
+
+The obstacle is one function. `SetVersionedMetadataManager` runs at create (before
+`InitializeDuckLake`) and at load (after the migration), and for a class it does not know it
+**replaces the registered manager with a stock one** — so our `InitializeDuckLake` (collation probe,
+shaping) never runs at create, and `ProbeServerCapabilities` (our shaping) runs on the stock manager
+at load. Upstream's own comment ("re-fetch the metadata manager here — … may have swapped it out",
+`ducklake_initializer.cpp:126`) says the swap is known. Discarding what the registry supplied is a
+bug whether or not we exist, and ducklake#1066's libSQL manager meets the same wall.
+
+So:
+
+1. **registration is unchanged**: `DuckLakeMetadataManager::Register("mssql", create)`;
+2. **`MSSQLMetadataManager` overrides the seven itself** and answers `1.1-dev1`. No template, no
+   hook; the implementation is entirely in the extension, upstream contributes the header. And
+   `InitializeDuckLake` can emit our own DDL — keys, BIN2 `VARCHAR`s, `[key]` — rather than stock DDL
+   followed by `ALTER COLUMN`, which removes the first-attach rewrite specs/006 D4 measured;
+3. **a 1.0 catalog is refused** at attach with the message to use `AUTOMATIC_MIGRATION TRUE`.
+   DuckLake's dispatch would otherwise let it run as 1.0 (the target resolves to the catalog's own
+   version), and "not supported" has to mean a clear refusal, not a path that works by accident;
+4. **upstream needs one line**: `SetVersionedMetadataManager` leaves a manager alone whose
+   `GetVersionString()` already equals the requested version — symmetrical with its existing
+   `if (version == V1_0) return;` — and never replaces an unknown class with a stock one. Until it
+   lands that line is the whole submodule patch; the hook and the header-only template go.
+
+Filing (4) upstream is a decision for the owner (third-party repository); the issue is one diff line
+and the same need as #1066.
 
 ## Enforcement & security
 
@@ -268,6 +307,8 @@ The transition, in the order the measurements impose:
 
 ## Follow-ups
 
+- D9: the seven overrides, the 1.0 refusal, the one-line upstream issue (needs the go-ahead), and
+  dropping the hook and the header-only template from the submodule patch.
 - D6's exact comparison per type, and a decision on HUGEINT's top of range.
 - D7 steps 1–4, in order; measure after each.
 - The file-column-stats CTE of specs/008 as a direct scan (D5 makes it possible).
