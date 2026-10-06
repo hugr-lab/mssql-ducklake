@@ -237,17 +237,34 @@ rewriter vetoes nested-type constructors. A DDL commit runs the load twice.
    from that object. The upstream fix is small and measured: query the partitions, not the
    catalog. Filing it is the owner's decision (it is a third-party repository). A `DROP TABLE`
    commit makes no such call: one load per commit.
-2. **The tables+columns load as our T-SQL.** Override the read through `Query`, the same seam
-   specs/008 uses:
-   - the joins and snapshot filters run on the server;
-   - the nested parts come back as `FOR JSON`, through `mssql_scan_unsafe`;
-   - DuckDB rebuilds the lists with `from_json`.
+   **And a third place, measured after: the flush.** `ducklake_flush_inlined_data` costs ~214 ms a
+   table on the 1000-table catalog, and ~165 ms of that is a full catalog load **per table**. Each
+   table's flush asks for its schema version's `begin_snapshot`
+   (`SELECT begin_snapshot FROM ducklake_schema_versions WHERE table_id = ? AND schema_version = ?`)
+   and loads the whole catalog at that historical snapshot, to read the inlined rows with the schema
+   they were written under. Tables created in different schema versions share no cache entry. This
+   is upstream's per-schema-version whole-catalog load (specs/005 D12), and it is the bench's
+   `flush_inlined` phase (135–144 s).
 
-   The same result DuckLake would have assembled itself, for one server statement. We prefer the
-   mssql extension to push the joins of a vetoed plan (dependency M1), so that we do not carry our
-   own copy of DuckLake's load. If it cannot, we write it ourselves, behind the strict guard's kind
-   of exact text match: the override recognises DuckLake's statement by its text and falls back
-   when it does not match.
+   **So the cost to attack is one catalog load, ~165 ms here.** `create_tables` pays it twice per
+   table, the flush once per table, an attach once.
+
+2. ~~**The tables+columns load as our T-SQL.**~~ **Measured, and not worth it.** The catalog in
+   question has ~41k rows in `ducklake_column`, and the time is mostly moving them over TDS:
+
+   | what is read | ms |
+   | --- | ---: |
+   | DuckLake's tables+columns statement, catalog path (in a transaction, as a commit runs it) | 76–82 |
+   | the same tables × columns as one T-SQL join, without the tags | 80–93 |
+   | the same through T-SQL with `FOR JSON` for the nested parts | 312–337 |
+   | all of `ducklake_column` through the catalog path, nothing else | 56–62 |
+
+   (A first measurement that wrapped the statement in `SELECT count(*)` read 22–33 ms. That was the
+   optimizer dropping the correlated subqueries and the unused columns; the numbers above
+   materialise the full result.) Three quarters of a load is the transfer of the column rows. No
+   rewrite of the statement on our side can beat it, and the server-side join with JSON is four times
+   slower. What helps is *not loading*, and all three avoidable loads are upstream's. M1 loses its
+   point with this.
 3. **Composition.** The file-column-stats CTE from specs/008 becomes a direct scan.
 4. **Later:** all eight load statements from one call, when multiple result sets exist (M2).
 
@@ -308,6 +325,18 @@ why the small-commit design below has no temp tables at all (applied commit ~76�
 | reading the result back from `#temp` | 6.4 |
 | the latest snapshot and the conflict check | 8.0 |
 | the lock and the stats read (client merge) | 5.1 |
+
+**What is left of a data commit, measured after D7.1 and R5.** A one-file data commit costs ~21 ms
+in steady state, the same with the appender on or off. With it off, the appender's two round trips
+(6 ms) go, but DuckLake adds a schema/table path lookup (3 ms) for the `INSERT … VALUES`. What
+remains are three reads DuckLake's protocol makes on the client: the transaction's snapshot, the
+conflict check with the stored stats, and the paths. Then the batch, and ~8 ms of local work
+(writing the parquet file). With the merge on the client (above), a server procedure cannot remove
+those reads. **The small-commit procedure is worth a few milliseconds at most and drops in
+priority**; it still waits on M5.
+
+D7.1 is done: with the apply armed at its default threshold, `second_commits` is 20.8 s, against
+21.3 s for the client loop and 43 s for the prototype.
 
 **Small commits: one call, no temp tables.** Most commits are small. A data commit's five round
 trips become one:
@@ -406,11 +435,19 @@ Sent to the mssql session on 2026-10-06, ranked by the measurements above.
 
 Each step lands with its tests and its before/after numbers.
 
-1. ~~R4.1~~ — answered: both loads are upstream's (above); an issue is the owner's call.
-2. **R1** — first-use shaping, the patch dropped, both kinds tables, the per-format strict guard,
-   and the create-at-1.1 verification.
-3. **R5, bounds** — the exact comparison, once the HUGEINT question is decided.
-4. **R4.2** — the tables+columns load: ours, or M1's.
-5. **R5, small commits** — the procedure with the JSON payload, once M5 has an answer.
-6. **R5, the threshold before staging, and schema commits.**
-7. **R6** — before merge.
+1. ~~R4.1~~ — answered: both loads in a DDL commit are upstream's.
+2. ~~R1, R3~~ — both formats on an untouched ducklake; the migration marker (`334923a`).
+3. ~~R5, the merge~~ — the client merge, measured against the server one and kept; the server one
+   removed (`0f5dffb`, `68e0ff7`).
+4. ~~D7.1~~ — the apply's size decided before staging.
+5. ~~R4.2~~ — measured; a rewrite of the load cannot beat the transfer of the column rows.
+6. **Upstream, the owner's call** — four measured issues, the largest first:
+   - the flush's historical catalog load per table (~165 ms a table);
+   - the full catalog build for `partitions` only in a commit that creates tables (~105 ms);
+   - the reload after every DDL commit because the cache is not filled from the committed state;
+   - the registered manager discarded in the attach transaction at 1.1 (a one-line fix; we no longer
+     depend on it).
+7. **Ours, still open**: the sort-keys statement costs ~30 ms whenever it reads a new snapshot, on
+   two empty tables (twice per DDL commit, once per flushed table); the inlined-table creation
+   (5–14 ms) and the two cache invalidations (~6 ms) in a DDL commit.
+8. **R6** — before merge.

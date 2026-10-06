@@ -166,6 +166,8 @@ def main() -> int:
     parser.add_argument("--refill-inlined", type=int, default=0,
                         help="first put an inlined table back under this many lake tables (s<i %% schemas>.t<i>)")
     parser.add_argument("--refill-schemas", type=int, default=10, help="schemas those tables are spread over")
+    parser.add_argument("--flush-tables", type=int, default=0,
+                        help="N tables with inlined rows, one flush of them, broken down by statement")
     parser.add_argument("--insert-commits", type=int, default=0,
                         help="N inlined and N file-backed insert commits, broken down by statement")
     parser.add_argument("--create-tables", type=int, default=0,
@@ -187,6 +189,47 @@ def main() -> int:
         return "MSSQL_DUCKLAKE_TEST_DSN is needed (make bench-attach-probe sets it)"
     dsn, env = args.mssql_dsn, dict(os.environ)
     build = os.path.abspath(args.build)
+
+    if args.flush_tables:
+        # What the bench's flush_inlined phase is made of - 135-144 s for 1000 tables. N tables of the
+        # bench's width in a schema of their own, one small (inlined) insert each, then ONE flush of
+        # that schema; the flush's statements broken down by shape, per table.
+        n = args.flush_tables
+        kinds = ("BIGINT", "VARCHAR", "DECIMAL(18, 4)", "DATE", "DOUBLE")
+        exprs = ("{s}", "'v' || ({s})::VARCHAR", "({s} * 1.5)::DECIMAL(18, 4)",
+                 "DATE '2020-01-01' + ({s})::INTEGER", "({s} * 0.25)::DOUBLE")
+        cols = ", ".join(f"c{c} {kinds[c % 5]}" for c in range(40))
+        vals = ", ".join(exprs[c % 5].format(s="r") for c in range(40))
+        body = "CREATE SCHEMA IF NOT EXISTS lake.probe_fl;\n"
+        body += "".join(f"CREATE TABLE lake.probe_fl.t{i}(id BIGINT, {cols});\n" for i in range(n))
+        body += "".join(f"INSERT INTO lake.probe_fl.t{i} SELECT r, {vals} FROM range(0, 2) t(r);\n" for i in range(n))
+        body += "SELECT count(*) AS flushed FROM ducklake_flush_inlined_data('lake', schema_name := 'probe_fl');\n"
+        body += "".join(f"DROP TABLE lake.probe_fl.t{i};\n" for i in range(n))
+        timed = run_arm(args.duckdb, build, dsn, "false", env, False, body)
+        start = next((i for i, (_, m) in enumerate(timed) if "ducklake_flush_inlined_data" in m), None)
+        stop = next((i for i, (_, m) in enumerate(timed) if m.startswith("DROP TABLE lake.probe_fl")), len(timed))
+        if start is None:
+            print("the flush did not run - see the error above")
+            return 0
+        per = collections.defaultdict(lambda: [0, 0])
+        for ms, m in timed[start:stop]:
+            e = per[shape(redact(m, dsn))]
+            e[0] += 1
+            e[1] += ms
+        if args.full:
+            print("--- the flush, in order (first 45 statements) ---")
+            for ms, m in timed[start:start + 45]:
+                snap = re.search(r"WHERE (\d+) >= (?:tbl\.)?begin_snapshot", m) or re.search(
+                    r"ducklake_snapshot VALUES \((\d+), [^,]+, (\d+)", m)
+                tag = f"  [snapshot {snap.group(1)}{', schema ' + snap.group(2) if snap and snap.lastindex == 2 else ''}]" if snap else ""
+                print(f"{ms:>6}  {shape(redact(m, dsn))[:100]}{tag}")
+        total = sum(ms for ms, _ in timed[start:stop])
+        print(f"flush of {n} tables: {total} ms, {total / n:.1f} ms a table, "
+              f"{sum(c for c, _ in per.values()) / n:.1f} statements a table")
+        print(f"{'n/table':>8} {'ms/table':>9}  shape")
+        for shp, (count, ms) in sorted(per.items(), key=lambda kv: -kv[1][1])[: args.top]:
+            print(f"{count / n:>8.1f} {ms / n:>9.1f}  {shp[:140]}")
+        return 0
 
     if args.insert_commits:
         # What one data commit is made of: a table of the bench's width, then N inlined inserts
