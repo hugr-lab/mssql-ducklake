@@ -186,6 +186,11 @@ Two T-SQL facts cost a round each in the prototype:
 The upgrade is explicit: `ATTACH … (AUTOMATIC_MIGRATION TRUE)`. A plain attach of a 1.0 catalog
 stays at 1.0, and that is supported (R1).
 
+No performance work is planned for the migration: it runs once per catalog, when the format
+changes. The only cost that matters here is DuckLake *calling* it again on every writable attach
+while the format is `1.1-dev1`. That is attach cost, not migration cost, and R3's stamp check makes
+the repeated call return at once. When 1.1 is final, the repeated calls stop.
+
 ### R3 — shaping (as prototyped, moved)
 
 - Every statement that names a table is guarded by `OBJECT_ID`.
