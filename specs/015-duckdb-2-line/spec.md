@@ -71,12 +71,13 @@ one.
 **The pushdown rewriter is slow on one shape only**: many distinct remote scans in one plan. With
 1000 distinct tables under one `UNION ALL`, each read `LIMIT 0`, planning costs 2.95 s on and 1.20 s
 off at mssql `spec/079-e2`. On the mssql fix 998660e the same plan costs 0.63 s on and 0.016 s off.
-**Corrected 2026-10-06:** the 0.016 s "off" figure is not confirmed. It was the gap between the
-statement's log entry and the next one, in a session whose ATTACH had just run DuckLake's own probe
-of the same inlined tables (so their metadata was likely loaded already), and the mssql session
-measured ~0.2 s of plain DuckDB planning for any 1000-branch UNION ALL. Re-run on 9f369d5 against
-a catalog database grown to 4,724 tables: 1000 branches 11.0 s on, 7.9 s off, both dominated by
-metadata loads (mssql-extension#412) - a modest gap, not 40x.
+**Corrected 2026-10-06: there is no such gap.** The probe wrote its list of inlined tables as CSV
+with the header, so the first branch named a table `table_name`: every `--union-distinct`
+statement it ever measured failed (*Catalog Error*), and failed differently with pushdown on and
+off - the 0.63/0.016 above, and a re-run at 11.0/7.9 s that was mssql-extension#412's full reload on
+that failure. With the header fixed, on mssql 4e8df71 (#407 + #413): 1000 branches cost 2.8–3.0 s
+with pushdown on and off alike on the first run in a session (the cold metadata of 1000 tables),
+0.18 s on and 0.16 s off on the second.
 The fix removed the round trips; the dry run's own CPU is still there. Exactly one statement of an
 attach has this shape: DuckLake's probe of the inlined tables' column names. The prototype's own
 migration no longer issues it.

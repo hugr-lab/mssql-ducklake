@@ -512,7 +512,7 @@ def main() -> int:
         cat = f'"__ducklake_metadata_lake"."{BENCH_SCHEMA}"'
         listing = run_arm(args.duckdb, build, dsn, "false", env, False,
                           f"COPY (SELECT table_name FROM {cat}.ducklake_inlined_data_tables ORDER BY table_id) "
-                          f"TO '{args.names_csv}' (FORMAT csv);")
+                          f"TO '{args.names_csv}' (FORMAT csv, HEADER false);")
         names = [row.strip() for row in open(args.names_csv).read().splitlines() if row.strip()]
         print(f"inlined tables in the catalog: {len(names)}")
         print(f"{'branches':>9} {'ON':>7} {'OFF':>7} {'ON/OFF':>7}")
