@@ -274,6 +274,41 @@ A value that cannot be compared exactly leaves the per-table bound NULL. DuckLak
 statistics": file pruning is not affected, and only the table-level bound is lost. A guessed bound
 is never written.
 
+**Measured (2026-10-06): the merge goes to the client.** Both merges were built behind
+`MSSQL_DUCKLAKE_STATS_MERGE` (`client` by default, `server`) and compared:
+
+- **Correctness.** One workload of edge cases went through the client loop and through both merges:
+  negatives of differing lengths, a 128-bit HUGEINT, doubles in exponent form, dates, timestamps,
+  `timestamptz`, an all-NULL column turned sticky-unknown, a partitioned multi-file commit. The
+  stored per-table stats were byte-identical in all three. The client merge matched on its first
+  run. The server merge needed a second: the first run wrote `0` for an unknown NaN flag and
+  exactness for an absent bound — the second copy of the rules drifting, which is exactly the risk.
+- **Speed.** The 1000-table bench with the apply engaged on every commit
+  (`MSSQL_DUCKLAKE_SERVER_COMMIT_MIN_FILES=1`); `second_commits` is 1000 data commits of one file
+  each:
+
+  | | client loop | apply, client merge | apply, server merge |
+  | --- | ---: | ---: | ---: |
+  | `second_commits` | 21.3 s | 77.8 s | 166.8 s |
+  | total | 491.9 s | 552.2 s | 637.5 s |
+
+  The server merge costs ~90 ms more per commit than the client merge for the same apply.
+
+The decision is the client merge, and the server merge's code goes.
+
+**The `#temp` apply itself is 3.6x the client loop on a one-file commit**, and this breakdown is
+why the small-commit design below has no temp tables at all (applied commit ~76–96 ms against
+~19 ms):
+
+| what | ms per commit |
+| --- | ---: |
+| DuckLake's local staging: one `INSERT` per column (41) into duckdb temp tables | 16.4 |
+| three `COPY … TO` — one BCP per staged table | 24.0 |
+| the apply batch | 18.5 |
+| reading the result back from `#temp` | 6.4 |
+| the latest snapshot and the conflict check | 8.0 |
+| the lock and the stats read (client merge) | 5.1 |
+
 **Small commits: one call, no temp tables.** Most commits are small. A data commit's five round
 trips become one:
 

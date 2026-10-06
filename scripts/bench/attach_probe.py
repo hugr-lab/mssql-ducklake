@@ -26,6 +26,9 @@ import tempfile
 
 ARMS = ("true", "false")
 
+# the bench catalog's schema (scale_catalog.py builds it there; specs/015 R6)
+BENCH_SCHEMA = os.environ.get("MSSQL_DUCKLAKE_BENCH_SCHEMA", "bench").strip() or "bench"
+
 # a logged statement can be enormous - the sweep below builds plans of a thousand branches, and the
 # log holds their text
 csv.field_size_limit(1 << 28)
@@ -44,7 +47,7 @@ SET autoinstall_known_extensions = false;
 LOAD '{duckdb_build}/extension/mssql/mssql.duckdb_extension';
 LOAD '{duckdb_build}/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
 CALL enable_logging('QueryLog', storage = 'memory');
-ATTACH 'ducklake:mssql:{dsn}' AS lake (METADATA_PARAMETERS MAP {{'remote_pushdown': '{arm}'}}{', READ_ONLY' if read_only else ''});
+ATTACH 'ducklake:mssql:{dsn}' AS lake (METADATA_SCHEMA '{BENCH_SCHEMA}', METADATA_PARAMETERS MAP {{'remote_pushdown': '{arm}'}}{', READ_ONLY' if read_only else ''});
 SELECT count(*) AS tables FROM duckdb_tables() WHERE database_name = 'lake';
 CALL disable_logging();
 COPY (SELECT epoch_ms(timestamp) AS ms, message FROM duckdb_logs WHERE type = 'QueryLog' ORDER BY timestamp)
@@ -64,7 +67,7 @@ def union_sql(branches: int, columns: int = 1) -> str:
     exist.
     """
     cols = ", ".join(["table_id", "table_uuid", "table_name", "schema_id"][:columns])
-    branch = f"(SELECT {cols} FROM \"__ducklake_metadata_lake\".\"dbo\".ducklake_table LIMIT 0)"
+    branch = f"(SELECT {cols} FROM \"__ducklake_metadata_lake\".\"{BENCH_SCHEMA}\".ducklake_table LIMIT 0)"
     return " UNION ALL ".join([branch] * branches)
 
 
@@ -85,7 +88,7 @@ def refill_inlined(duckdb_bin: str, duckdb_build: str, dsn: str, env: dict, tabl
     ]
     for i in range(tables):
         sql.append(f"INSERT INTO lake.s{i % schemas}.t{i} (id) VALUES ({i}), ({i + 1});")
-    sql.append('SELECT count(*) AS inlined FROM "__ducklake_metadata_lake"."dbo".ducklake_inlined_data_tables;')
+    sql.append(f'SELECT count(*) AS inlined FROM "__ducklake_metadata_lake"."{BENCH_SCHEMA}".ducklake_inlined_data_tables;')
     proc = subprocess.run([duckdb_bin, "-unsigned", "-batch", "-no-agent"], input="\n".join(sql), env=env,
                           capture_output=True, text=True)
     out = redact(proc.stdout + proc.stderr, dsn)
@@ -268,9 +271,9 @@ def main() -> int:
         # it first) and through mssql_scan_unsafe (which does not), N times in a row, inside a
         # transaction - which is where the describe takes the pinned connection.
         n = args.shape_ab
-        cat = '"__ducklake_metadata_lake"."dbo"'
+        cat = f'"__ducklake_metadata_lake"."{BENCH_SCHEMA}"'
         inner = ("SELECT TOP 1 snapshot_id, schema_version, next_catalog_id, next_file_id "
-                 "FROM dbo.ducklake_snapshot ORDER BY snapshot_id DESC")
+                 f"FROM {BENCH_SCHEMA}.ducklake_snapshot ORDER BY snapshot_id DESC")
         declared = ("columns := {'snapshot_id': 'BIGINT', 'schema_version': 'BIGINT', "
                     "'next_catalog_id': 'BIGINT', 'next_file_id': 'BIGINT'}")
         print(f"the manager's latest-snapshot statement, {n} calls in a transaction, ms")
@@ -339,7 +342,7 @@ def main() -> int:
         # extension bind it once; DuckLake's probe names every inlined table in the catalog, so the
         # plan has N different remote scans and N bindings - and that is the shape no small catalog
         # produces.
-        cat = '"__ducklake_metadata_lake"."dbo"'
+        cat = f'"__ducklake_metadata_lake"."{BENCH_SCHEMA}"'
         listing = run_arm(args.duckdb, build, dsn, "false", env, False,
                           f"COPY (SELECT table_name FROM {cat}.ducklake_inlined_data_tables ORDER BY table_id) "
                           f"TO '{args.names_csv}' (FORMAT csv);")
@@ -367,7 +370,7 @@ def main() -> int:
         # What an attach paid before the manager took the migration over: DuckLake's own batch, as
         # ExecuteMigration sends it on the attach path (allow_failures, so the {IF_NOT_EXISTS}
         # placeholder is filled in - which the mssql extension's ALTER has no form for).
-        cat = '"__ducklake_metadata_lake"."dbo"'
+        cat = f'"__ducklake_metadata_lake"."{BENCH_SCHEMA}"'
         legacy = [
             f"ALTER TABLE {cat}.ducklake_data_file ADD COLUMN IF NOT EXISTS row_group_count BIGINT;",
             f"ALTER TABLE {cat}.ducklake_delete_file ADD COLUMN IF NOT EXISTS row_group_count BIGINT;",

@@ -75,6 +75,12 @@ LOAD = (
 )
 
 
+#! The catalog lives in a schema of its own. The integration suite resets `dbo` (attach_mssql.test),
+#! so a bench catalog there did not survive a test run - three rebuilds in one session (specs/015 R6)
+#! - and this reset used to drop `ducklake%` in EVERY schema, the suite's included.
+BENCH_SCHEMA = os.environ.get("MSSQL_DUCKLAKE_BENCH_SCHEMA", "bench").strip() or "bench"
+
+
 def reset_sql(backend: str, mssql_dsn: str, pg_dsn: str) -> str:
     """Drop whatever the last run left, so the build below starts from nothing."""
     if backend == "postgres":
@@ -88,7 +94,8 @@ def reset_sql(backend: str, mssql_dsn: str, pg_dsn: str) -> str:
         "SELECT mssql_exec('srv', 'DECLARE @s NVARCHAR(MAX)=N''''; "
         "SELECT @s += N''DROP TABLE ''+QUOTENAME(s.name)+N''.''+QUOTENAME(t.name)+N'';'' "
         "FROM sys.tables t JOIN sys.schemas s ON s.schema_id=t.schema_id "
-        "WHERE t.name LIKE ''ducklake%''; EXEC sp_executesql @s;');\n"
+        f"WHERE s.name = ''{BENCH_SCHEMA}'' AND t.name LIKE ''ducklake%''; EXEC sp_executesql @s; "
+        f"IF SCHEMA_ID(''{BENCH_SCHEMA}'') IS NULL EXEC(''CREATE SCHEMA {BENCH_SCHEMA}'');');\n"
         "DETACH srv;\n"
     )
 
@@ -125,7 +132,8 @@ def metadata_parameters() -> str:
 def attach_sql(backend: str, mssql_dsn: str, pg_dsn: str, data_path: str) -> str:
     if backend == "postgres":
         return f"ATTACH 'ducklake:postgres:{pg_dsn}' AS lake (DATA_PATH '{data_path}');"
-    return f"ATTACH 'ducklake:mssql:{mssql_dsn}' AS lake (DATA_PATH '{data_path}'{metadata_parameters()});"
+    return (f"ATTACH 'ducklake:mssql:{mssql_dsn}' AS lake (DATA_PATH '{data_path}', "
+            f"METADATA_SCHEMA '{BENCH_SCHEMA}'{metadata_parameters()});")
 
 
 def build_and_measure_sql(tables: int, rows: int, schemas: int, columns: int, deep_tables: int,
