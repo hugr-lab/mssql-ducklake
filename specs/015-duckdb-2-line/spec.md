@@ -191,14 +191,25 @@ changes. The only cost that matters here is DuckLake *calling* it again on every
 while the format is `1.1-dev1`. That is attach cost, not migration cost, and R3's stamp check makes
 the repeated call return at once. When 1.1 is final, the repeated calls stop.
 
-### R3 — shaping (as prototyped, moved)
+### R3 — shaping and the migration marker: two stamps, read together
 
 - Every statement that names a table is guarded by `OBJECT_ID`.
-- The stamp is written last, and it also stands for the migration.
-- `MigrateV10Dev`, the per-attach re-run of a dev format, returns when the stamp is current.
-- `SHAPE_VERSION` moves whenever the shaping or the migration changes.
-
-R1 moves the trigger from the attach to first use.
+- **The shape stamp** (`mssql_ducklake_shape` = `SHAPE_VERSION`) is written last by the shaping, and
+  it means only that: the catalog has this build's keys, collations and indexes. R1 moves the
+  shaping's trigger from the attach to first use.
+- **The migration marker** (`mssql_ducklake_migration` = the format plus the revision of our
+  migration, e.g. `1.1-dev1/1`) is written as the last step of our migration. On every writable
+  attach of a dev-format catalog, `MigrateV10Dev` compares the marker with the build's value. If
+  they are equal, it does nothing. If not, it runs the migration (idempotent) and rewrites the
+  marker. The revision exists because upstream can add a column under the same `1.1-dev1` name:
+  raising the revision brings already-migrated catalogs along, and only them.
+- Both are extended properties on `ducklake_metadata`, which DuckLake never reads. A row in its
+  key/value table would not do: DuckLake reads every row of that table on every attach. Both
+  properties are read **in one statement**, the one that reads the stamp today, so the check costs
+  no extra round trip.
+- The prototype tied the two into one stamp (`SHAPE_VERSION` 6 meant "shaped and migrated"), which
+  forced the rule "move `SHAPE_VERSION` when the migration changes". With two markers that rule is
+  gone: the shaping and the migration move independently.
 
 ### R4 — reads: the catalog load is the target
 
