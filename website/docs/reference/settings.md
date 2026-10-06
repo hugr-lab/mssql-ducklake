@@ -9,6 +9,7 @@ sidebar_position: 1
 
 | setting | type | default | meaning |
 | --- | --- | --- | --- |
+| `mssql_ducklake_async_statistics` | BOOLEAN | `true` | Whether shaping a catalog sets `AUTO_UPDATE_STATISTICS_ASYNC ON` on its database ([Shaping](../catalog/shaping.md#asynchronous-statistics)), so a query that finds stale statistics does not wait for their update. Read when the catalog is shaped, like the one below. `false` leaves the database's setting as it is. |
 | `mssql_ducklake_forced_parameterization` | BOOLEAN | `true` | Whether shaping a catalog sets `PARAMETERIZATION FORCED` on its database ([Shaping](../catalog/shaping.md#forced-parameterization)). Read when the catalog is shaped — at creation, or at the first attach with a build whose shape version is newer — not on every attach. `false` leaves the database's setting as it is. |
 
 DuckLake's own settings — `ducklake_max_retry_count`, `ducklake_retry_wait_ms`,

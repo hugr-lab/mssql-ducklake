@@ -60,7 +60,7 @@ that the mssql extension's metadata cache can see it before the first `INSERT` n
 
 ### Forced parameterization
 
-The last step is one statement outside the catalog's own tables:
+The last steps are two statements outside the catalog's own tables, database options. The first:
 
 ```sql
 ALTER DATABASE CURRENT SET PARAMETERIZATION FORCED;
@@ -78,6 +78,24 @@ before the attach that shapes the catalog — and it is best-effort: a login all
 catalog's tables but not to alter the database gets a working catalog without it, and a warning in
 `duckdb_logs()` naming the statement for someone who may run it. It is applied when the catalog is
 shaped, not on every attach: set it back and it stays back.
+
+### Asynchronous statistics
+
+And one more, the same way:
+
+```sql
+ALTER DATABASE CURRENT SET AUTO_UPDATE_STATISTICS_ASYNC ON;
+```
+
+A catalog grows by thousands of rows with every few hundred commits, so SQL Server's statistics on
+its tables go stale often — and by default the query that finds them stale recomputes them before
+it runs. After 1000 commits into one table, the first read of it waited 1.2 s for six statistics of
+`ducklake_file_column_stats` to be rebuilt, for a statement that then took 9 ms. With the option
+that query runs on the statistics it has and the update happens beside it: the same first read took
+90 ms. PostgreSQL behaves this way already, its `ANALYZE` being a background job.
+
+The opt-out is `SET mssql_ducklake_async_statistics = false`; like forced parameterization it is
+best-effort, applied when the catalog is shaped, and left alone afterwards.
 
 ### The shape stamp
 

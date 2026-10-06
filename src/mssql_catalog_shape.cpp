@@ -549,10 +549,10 @@ IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 3 AND major_id = 
 	RunServerSide(columns_ddl, "Failed to prepare the DuckLake catalog columns for SQL Server: ");
 	RunServerSide(constraints_ddl, "Failed to key and index the DuckLake catalog for SQL Server: ");
 
-	ApplyForcedParameterization();
+	ApplyDatabaseOptions();
 }
 
-void MSSQLMetadataManager::ApplyForcedParameterization() {
+void MSSQLMetadataManager::ApplyDatabaseOptions() {
 	// Every query the extension and DuckLake send this database carries its literals in the text -
 	// a table name in the metadata query, `WHERE table_id = 1053` in DuckLake's own - and SQL Server
 	// caches ad-hoc plans by text, so each distinct value is a plan of its own and its first
@@ -561,32 +561,42 @@ void MSSQLMetadataManager::ApplyForcedParameterization() {
 	// server parameterizes the literals itself and one plan serves every value: the 1000-table
 	// benchmark went from 937 s to 686-698 s, the first write into each table two to three times
 	// faster, the first read after an attach four times (specs/012).
-	//
-	// A database-wide option, so it has an opt-out, and best-effort, so a login that may shape the
+	ApplyDatabaseOption("mssql_ducklake_forced_parameterization", "PARAMETERIZATION FORCED",
+	                    "which costs a plan compile per distinct literal (specs/012)");
+	// A catalog grows by thousands of rows per minute of commits, so its statistics go stale often,
+	// and by default the query that finds them stale recomputes them before it runs: the first read
+	// after 1000 commits into one table waited 1.2 s on six statistics of ducklake_file_column_stats
+	// (300k rows) for a 9 ms statement. Asynchronous, that query runs on the old statistics and the
+	// recompute happens beside it - postgres' ANALYZE is a background job too (specs/017).
+	ApplyDatabaseOption("mssql_ducklake_async_statistics", "AUTO_UPDATE_STATISTICS_ASYNC ON",
+	                    "which makes the first query after many commits wait for its statistics (specs/017)");
+}
+
+void MSSQLMetadataManager::ApplyDatabaseOption(const char *setting, const char *option, const char *without_it) {
+	// Database-wide options, so each has an opt-out, and best-effort, so a login that may shape the
 	// schema but not alter the database - or a platform without the option, Fabric Warehouse and
 	// Synapse among them - still gets a working catalog. Applied here, with the rest of the shape,
-	// and not on every attach: a DBA who sets it back keeps it back.
+	// and not on every attach: a DBA who sets one back keeps it back.
 	auto client_context = transaction.context.lock();
 	if (!client_context) {
 		throw InternalException("MSSQLMetadataManager: the client context is gone");
 	}
 	Value wanted;
-	if (client_context->TryGetCurrentSetting("mssql_ducklake_forced_parameterization", wanted) &&
-	    !wanted.GetValue<bool>()) {
+	if (client_context->TryGetCurrentSetting(setting, wanted) && !wanted.GetValue<bool>()) {
 		return;
 	}
+	auto statement = StringUtil::Format("ALTER DATABASE CURRENT SET %s;", option);
 	try {
 		// ALTER DATABASE is refused inside a transaction; on its own connection it is also online -
 		// measured against a session holding uncommitted DDL and a row lock in this database, it
 		// completed in a second.
-		RunServerSideOutsideTransaction("ALTER DATABASE CURRENT SET PARAMETERIZATION FORCED;",
-		                                "Failed to set PARAMETERIZATION FORCED on the catalog's database: ");
+		RunServerSideOutsideTransaction(statement,
+		                                StringUtil::Format("Failed to set %s on the catalog's database: ", option));
 	} catch (std::exception &ex) {
 		DUCKDB_LOG_WARNING(*client_context,
-		                   StringUtil::Format("mssql_ducklake: the catalog's database keeps simple parameterization, "
-		                                      "which costs a plan compile per distinct literal (specs/012). To apply "
-		                                      "it by hand: ALTER DATABASE CURRENT SET PARAMETERIZATION FORCED. %s",
-		                                      ex.what()));
+		                   StringUtil::Format("mssql_ducklake: the catalog's database goes without %s, %s. To apply "
+		                                      "it by hand: %s %s",
+		                                      option, without_it, statement, ex.what()));
 	}
 }
 

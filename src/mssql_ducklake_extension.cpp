@@ -68,14 +68,19 @@ void LoadInternal(ExtensionLoader &loader) {
 	std::call_once(register_once, [] { DuckLakeMetadataManager::Register("mssql", MSSQLMetadataManager::Create); });
 
 	loader.SetDescription("DuckLake with SQL Server metadata catalog support (embeds ducklake)");
-	// The one database-wide thing the manager does to a catalog's database, and so the one with an
-	// opt-out (specs/012). Read when the catalog is shaped - at its creation, or at the first attach
+	// The database-wide things the manager does to a catalog's database, and so the ones with an
+	// opt-out (specs/012, 017). Read when the catalog is shaped - at its creation, or at the first attach
 	// with a build whose shape version is newer - not on every attach.
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption(
 	    "mssql_ducklake_forced_parameterization",
 	    "Set PARAMETERIZATION FORCED on a DuckLake catalog's SQL Server database when the catalog "
 	    "is shaped; one plan per query shape instead of one per literal",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    "mssql_ducklake_async_statistics",
+	    "Set AUTO_UPDATE_STATISTICS_ASYNC ON on a DuckLake catalog's SQL Server database when the "
+	    "catalog is shaped; a query that finds stale statistics no longer waits for their update",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
 	loader.RegisterFunction(
 	    ScalarFunction("mssql_ducklake_version", {}, LogicalType::VARCHAR, MssqlDucklakeVersionFun));

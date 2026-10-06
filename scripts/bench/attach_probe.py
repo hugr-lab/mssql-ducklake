@@ -170,6 +170,10 @@ def main() -> int:
                         help="read the bench table s<n%%10>.t<n> with the bench's filter, --rounds times, by statement")
     parser.add_argument("--flush-tables", type=int, default=0,
                         help="N tables with inlined rows, one flush of them, broken down by statement")
+    parser.add_argument("--deep-read", type=int, default=0,
+                        help="a table with this many file-backed commits (built once, kept), then the bench's "
+                             "deep_read_filtered read, broken down by statement")
+    parser.add_argument("--deep-build", action="store_true", help="with --deep-read: (re)build the table first")
     parser.add_argument("--merge-lake", type=int, default=0,
                         help="one merge of adjacent files over the whole lake, broken down by statement "
                              "(per table, for a lake of this many tables) - the bench's lake-wide merge")
@@ -251,6 +255,33 @@ def main() -> int:
         print(f"{'n/table':>8} {'ms/table':>9}  shape")
         for shp, (count, ms) in sorted(per.items(), key=lambda kv: -kv[1][1])[: args.top]:
             print(f"{count / n:>8.1f} {ms / n:>9.1f}  {shp[:140]}")
+        return 0
+
+    if args.deep_read:
+        # The bench's deep_read_filtered: a table with a deep history of small files (20 rows a
+        # commit), read with a filter that one file satisfies. Built once in probe_dr and kept.
+        n = args.deep_read
+        kinds = ("BIGINT", "VARCHAR", "DECIMAL(18, 4)", "DATE", "DOUBLE")
+        exprs = ("{s}", "'v' || ({s})::VARCHAR", "({s} * 1.5)::DECIMAL(18, 4)",
+                 "DATE '2020-01-01' + ({s})::INTEGER", "({s} * 0.25)::DOUBLE")
+        cols = ", ".join(f"c{c} {kinds[c % 5]}" for c in range(40))
+        if args.deep_build:
+            vals = lambda k: ", ".join(exprs[c % 5].format(s=f"({k} * 100 + r)") for c in range(40))
+            body = ("CREATE SCHEMA IF NOT EXISTS lake.probe_dr;\nDROP TABLE IF EXISTS lake.probe_dr.t;\n"
+                    f"CREATE TABLE lake.probe_dr.t(id BIGINT, {cols});\n")
+            body += "".join(f"INSERT INTO lake.probe_dr.t SELECT {k} * 100 + r, {vals(k)} FROM range(20) t(r);\n"
+                            for k in range(n))
+            run_arm(args.duckdb, build, dsn, "false", env, False, body)
+            print(f"built {n} commits")
+        read = "".join("SELECT count(*), sum(c0) FROM lake.probe_dr.t WHERE id BETWEEN 5 AND 9;\n" for _ in range(args.rounds))
+        timed = run_arm(args.duckdb, build, dsn, "false", env, False, read)
+        starts = [i for i, (_, m) in enumerate(timed) if m.startswith("SELECT count(*), sum(c0) FROM lake.probe_dr")]
+        for k, st in enumerate(starts):
+            stop = starts[k + 1] if k + 1 < len(starts) else len(timed)
+            print(f"--- read #{k}: {sum(ms for ms, _ in timed[st:stop])} ms")
+            if k in (0, len(starts) - 1):
+                for ms, m in timed[st:stop]:
+                    print(f"{ms:>7}  {shape(redact(m, dsn))[:150]}")
         return 0
 
     if args.merge_lake:

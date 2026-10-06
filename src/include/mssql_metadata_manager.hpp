@@ -216,9 +216,12 @@ private:
 	//! no-op rather than an error.
 	void MigrateToV1_1Dev1();
 	//! The last step of that shaping, and the only one outside the transaction and allowed to fail:
-	//! `PARAMETERIZATION FORCED` on the catalog's database (specs/012). Skipped when the
-	//! `mssql_ducklake_forced_parameterization` setting is false.
-	void ApplyForcedParameterization();
+	//! the catalog's database options - `PARAMETERIZATION FORCED` (specs/012) and
+	//! `AUTO_UPDATE_STATISTICS_ASYNC` (specs/017), each skipped when its setting is false.
+	void ApplyDatabaseOptions();
+	//! One of them: `ALTER DATABASE CURRENT SET <option>` unless `setting` is false, a warning
+	//! naming the statement when the server refuses it.
+	void ApplyDatabaseOption(const char *setting, const char *option, const char *without_it);
 	//! What the server says about this catalog, in one statement: does it exist yet, is its shape
 	//! this build's, and has this build's migration run on it (specs/015 R3).
 	struct CatalogMarkers {
@@ -241,7 +244,7 @@ private:
 	//! #30 - without it a commit touching two tables is refused by the server). 6 keys and collates
 	//! what format 1.1-dev1 adds, where it exists - every statement is guarded by the table's
 	//! existence, so the same version shapes a 1.0 catalog and a 1.1 one.
-	static constexpr int64_t SHAPE_VERSION = 6;
+	static constexpr int64_t SHAPE_VERSION = 7;
 	//! Where that version is recorded: an extended property on the catalog's own ducklake_metadata
 	//! table - per catalog, invisible to DuckLake's queries, and gone the moment the catalog's
 	//! tables are, which is what makes a recreated catalog shape itself again.

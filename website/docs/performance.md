@@ -65,7 +65,7 @@ three TDS logins.
 
 ### Advice
 
-- **A dedicated database for the catalog.** The one database-wide setting the shaping applies is
+- **A dedicated database for the catalog.** The two database-wide settings the shaping applies are
   then nobody else's concern, and the plan cache is the catalog's own.
 - **Measure your own workload** with the DuckLake metadata log: every metadata query with its
   time is in `duckdb_logs()` after

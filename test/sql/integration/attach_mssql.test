@@ -52,10 +52,18 @@ SELECT count(*) FROM mssql_scan('srv', 'SELECT t.name FROM sys.tables t JOIN sys
 ----
 0
 
-# The database option the shaping applies (specs/012), put back first so that this run proves the
-# attach set it rather than an earlier run
+# The database options the shaping applies (specs/012, 017), put back first so that this run proves
+# the attach set them rather than an earlier run
 statement ok
 SELECT mssql_exec('srv', 'ALTER DATABASE CURRENT SET PARAMETERIZATION SIMPLE;');
+
+statement ok
+SELECT mssql_exec('srv', 'ALTER DATABASE CURRENT SET AUTO_UPDATE_STATISTICS_ASYNC OFF;');
+
+query I
+SELECT a FROM mssql_scan('srv', 'SELECT CAST(is_auto_update_stats_async_on AS BIGINT) AS a FROM sys.databases WHERE database_id = DB_ID()');
+----
+0
 
 query I
 SELECT f FROM mssql_scan('srv', 'SELECT CAST(is_parameterization_forced AS BIGINT) AS f FROM sys.databases WHERE database_id = DB_ID()');
@@ -92,6 +100,12 @@ SELECT snapshot_id FROM ducklake_snapshots('lake');
 # compile (specs/009, 012)
 query I
 SELECT f FROM mssql_scan('srv', 'SELECT CAST(is_parameterization_forced AS BIGINT) AS f FROM sys.databases WHERE database_id = DB_ID()');
+----
+1
+
+# and updates its statistics beside the query that finds them stale, not before it (specs/017)
+query I
+SELECT a FROM mssql_scan('srv', 'SELECT CAST(is_auto_update_stats_async_on AS BIGINT) AS a FROM sys.databases WHERE database_id = DB_ID()');
 ----
 1
 
@@ -580,7 +594,7 @@ begin_snapshot,schema_version,table_id
 query I
 SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM sys.extended_properties WHERE class = 1 AND major_id = OBJECT_ID(''dbo.ducklake_metadata'') AND minor_id = 0 AND name = ''mssql_ducklake_shape''');
 ----
-6
+7
 
 query I
 SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.extended_properties WHERE class = 3 AND major_id = SCHEMA_ID(''dbo'') AND name = ''mssql_ducklake_shape''');
@@ -601,19 +615,31 @@ SELECT count(*) FROM mssql_scan('srv', 'SELECT c.name FROM sys.columns c JOIN sy
 ----
 1
 
-# The database option is the one thing the shaping does outside the catalog's own schema, so it has
-# an opt-out. Put the database back to SIMPLE and opt out: this re-shaping must leave it alone
+# The database options are the one thing the shaping does outside the catalog's own schema, so each
+# has an opt-out. Put the database back to SIMPLE and synchronous statistics and opt out of both:
+# this re-shaping must leave them alone
 statement ok
 SELECT mssql_exec('srv', 'ALTER DATABASE CURRENT SET PARAMETERIZATION SIMPLE;');
 
 statement ok
+SELECT mssql_exec('srv', 'ALTER DATABASE CURRENT SET AUTO_UPDATE_STATISTICS_ASYNC OFF;');
+
+statement ok
 SET mssql_ducklake_forced_parameterization = false;
+
+statement ok
+SET mssql_ducklake_async_statistics = false;
 
 statement ok
 ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS upgraded (DATA_PATH '__TEST_DIR__/lake');
 
 query I
 SELECT f FROM mssql_scan('srv', 'SELECT CAST(is_parameterization_forced AS BIGINT) AS f FROM sys.databases WHERE database_id = DB_ID()');
+----
+0
+
+query I
+SELECT a FROM mssql_scan('srv', 'SELECT CAST(is_auto_update_stats_async_on AS BIGINT) AS a FROM sys.databases WHERE database_id = DB_ID()');
 ----
 0
 
@@ -636,6 +662,9 @@ statement ok
 RESET mssql_ducklake_forced_parameterization;
 
 statement ok
+RESET mssql_ducklake_async_statistics;
+
+statement ok
 SELECT mssql_exec('srv', 'EXEC sp_dropextendedproperty @name = N''mssql_ducklake_shape'', @level0type = N''SCHEMA'', @level0name = N''dbo'', @level1type = N''TABLE'', @level1name = N''ducklake_metadata'';');
 
 statement ok
@@ -643,6 +672,11 @@ ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS reshaped (DATA_PATH '__TES
 
 query I
 SELECT f FROM mssql_scan('srv', 'SELECT CAST(is_parameterization_forced AS BIGINT) AS f FROM sys.databases WHERE database_id = DB_ID()');
+----
+1
+
+query I
+SELECT a FROM mssql_scan('srv', 'SELECT CAST(is_auto_update_stats_async_on AS BIGINT) AS a FROM sys.databases WHERE database_id = DB_ID()');
 ----
 1
 

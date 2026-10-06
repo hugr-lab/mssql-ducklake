@@ -151,7 +151,7 @@ SELECT count(*) FROM mssql_scan('srv', 'SELECT t.name FROM sys.tables t JOIN sys
 query I
 SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM sys.extended_properties WHERE class = 1 AND major_id = OBJECT_ID(''migrate_v11.ducklake_metadata'') AND minor_id = 0 AND name = ''mssql_ducklake_shape''');
 ----
-6
+7
 
 query I
 SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(64)) AS v FROM sys.extended_properties WHERE class = 1 AND major_id = OBJECT_ID(''migrate_v11.ducklake_metadata'') AND minor_id = 0 AND name = ''mssql_ducklake_migration''');
