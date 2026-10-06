@@ -163,6 +163,10 @@ def main() -> int:
     parser.add_argument("--refill-inlined", type=int, default=0,
                         help="first put an inlined table back under this many lake tables (s<i %% schemas>.t<i>)")
     parser.add_argument("--refill-schemas", type=int, default=10, help="schemas those tables are spread over")
+    parser.add_argument("--insert-commits", type=int, default=0,
+                        help="N inlined and N file-backed insert commits, broken down by statement")
+    parser.add_argument("--create-tables", type=int, default=0,
+                        help="N CREATE TABLE commits of the bench's width, broken down by statement")
     parser.add_argument("--shape-ab", type=int, default=0,
                         help="N calls of one statement through mssql_scan and mssql_scan_unsafe, in a transaction")
     parser.add_argument("--synth-tables", type=int, default=0,
@@ -180,6 +184,80 @@ def main() -> int:
         return "MSSQL_DUCKLAKE_TEST_DSN is needed (make bench-attach-probe sets it)"
     dsn, env = args.mssql_dsn, dict(os.environ)
     build = os.path.abspath(args.build)
+
+    if args.insert_commits:
+        # What one data commit is made of: a table of the bench's width, then N inlined inserts
+        # (2 rows) and N file-backed inserts (200 rows), each its own commit, broken down the same way.
+        n = args.insert_commits
+        kinds = ("BIGINT", "VARCHAR", "DECIMAL(18, 4)", "DATE", "DOUBLE")
+        exprs = ("{s}", "'v' || ({s})::VARCHAR", "({s} * 1.5)::DECIMAL(18, 4)",
+                 "DATE '2020-01-01' + ({s})::INTEGER", "({s} * 0.25)::DOUBLE")
+        cols = ", ".join(f"c{c} {kinds[c % 5]}" for c in range(40))
+        vals = ", ".join(exprs[c % 5].format(s="r") for c in range(40))
+        body = ("CREATE SCHEMA IF NOT EXISTS lake.probe_ic;\n"
+                f"CREATE TABLE lake.probe_ic.t(id BIGINT, {cols});\n")
+        for i in range(n):
+            body += f"INSERT INTO lake.probe_ic.t SELECT r, {vals} FROM range({i * 2}, {i * 2 + 2}) t(r);\n"
+        for i in range(n):
+            body += f"INSERT INTO lake.probe_ic.t SELECT r, {vals} FROM range({10000 + i * 200}, {10200 + i * 200}) t(r);\n"
+        body += "DROP TABLE lake.probe_ic.t;\n"
+        timed = run_arm(args.duckdb, build, dsn, "false", env, False, body)
+        starts = [i for i, (_, m) in enumerate(timed) if m.startswith("INSERT INTO lake.probe_ic")]
+        end = next((i for i, (_, m) in enumerate(timed) if m.startswith("DROP TABLE lake.probe_ic")), len(timed))
+        for label, group in (("inlined (2 rows)", starts[:n]), ("file-backed (200 rows)", starts[n:])):
+            per, user_ms = collections.defaultdict(lambda: [0, 0]), []
+            for start in group:
+                k = starts.index(start)
+                stop = starts[k + 1] if k + 1 < len(starts) else end
+                user_ms.append(sum(ms for ms, _ in timed[start:stop]))
+                for ms, m in timed[start:stop]:
+                    e = per[shape(redact(m, dsn))]
+                    e[0] += 1
+                    e[1] += ms
+            print(f"\n=== {label}: {len(group)} commits, mean {sum(user_ms) / max(len(group), 1):.1f} ms, each {user_ms}")
+            print(f"{'n/commit':>9} {'ms/commit':>10}  shape")
+            for shp, (count, ms) in sorted(per.items(), key=lambda kv: -kv[1][1])[: args.top]:
+                print(f"{count / len(group):>9.1f} {ms / len(group):>10.1f}  {shp[:140]}")
+        return 0
+
+    if args.create_tables:
+        # What one CREATE TABLE commit is made of - the bench's create_tables phase, 169 ms a table on
+        # the 1000-table catalog. Same width as the bench (id + 40 mixed columns), each its own
+        # commit, in a schema of its own so nothing of the bench's is touched.
+        n = args.create_tables
+        kinds = ("BIGINT", "VARCHAR", "DECIMAL(18, 4)", "DATE", "DOUBLE")
+        cols = ", ".join(f"c{c} {kinds[c % 5]}" for c in range(40))
+        body = "CREATE SCHEMA IF NOT EXISTS lake.probe_ct;\n" + "".join(
+            f"CREATE TABLE lake.probe_ct.t{i}(id BIGINT, {cols});\n" for i in range(n))
+        body += "".join(f"DROP TABLE lake.probe_ct.t{i};\n" for i in range(n))
+        timed = run_arm(args.duckdb, build, dsn, "false", env, False, body)
+        creates = [i for i, (ms, m) in enumerate(timed) if m.startswith("CREATE TABLE lake.probe_ct")]
+        if not creates:
+            print("no CREATE TABLE ran - see the error above")
+            return 0
+        # every logged statement from one user CREATE to the next belongs to that commit
+        per = collections.defaultdict(lambda: [0, 0])
+        user_ms = []
+        for k, start in enumerate(creates):
+            stop = creates[k + 1] if k + 1 < len(creates) else next(
+                (i for i, (_, m) in enumerate(timed) if m.startswith("DROP TABLE lake.probe_ct")), len(timed))
+            user_ms.append(sum(ms for ms, _ in timed[start:stop]))
+            for ms, m in timed[start:stop]:
+                e = per[shape(redact(m, dsn))]
+                e[0] += 1
+                e[1] += ms
+        if args.full:
+            k = min(10, len(creates) - 1)
+            start, stop = creates[k], creates[k + 1] if k + 1 < len(creates) else len(timed)
+            print(f"--- commit #{k}, in order ---")
+            for ms, m in timed[start:stop]:
+                print(f"{ms:>6}  {shape(redact(m, dsn))[:130]}")
+        print(f"{n} CREATE TABLE commits, ms each: {user_ms}")
+        print(f"mean {sum(user_ms) / n:.1f} ms, statements per commit {sum(c for c, _ in per.values()) / n:.1f}")
+        print(f"{'n/commit':>9} {'ms/commit':>10}  shape")
+        for shp, (count, ms) in sorted(per.items(), key=lambda kv: -kv[1][1])[: args.top]:
+            print(f"{count / n:>9.1f} {ms / n:>10.1f}  {shp[:150]}")
+        return 0
 
     if args.shape_ab:
         # What a given shape saves per call: the same statement through mssql_scan (which describes
