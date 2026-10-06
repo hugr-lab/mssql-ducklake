@@ -2,6 +2,7 @@
 
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/connection.hpp"
+#include "mssql_catalog_lengths.hpp"
 #include "storage/ducklake_metadata_manager.hpp"
 
 namespace duckdb {
@@ -35,6 +36,8 @@ public:
 	//! goes through the manager's cached one. Round trips per commit stop growing with its size -
 	//! 65 flat against 2065 for a thousand data files, and 1.7x faster at that size.
 	bool SupportsAppender() const override;
+	//! a new file of this commit carries a statistic longer than the catalog's stats_length (specs/018)
+	bool HasStatsPastBound() const;
 	//! SQL Server sysname is 128 characters
 	idx_t MaxIdentifierLength() const override {
 		return 128;
@@ -226,8 +229,12 @@ private:
 	//! this build's, and has this build's migration run on it (specs/015 R3).
 	struct CatalogMarkers {
 		bool present = false;
+		//! a shape stamp of any version: some build of this extension shaped the catalog
+		bool shaped = false;
 		bool shape_current = false;
 		bool migration_current = false;
+		//! the limits recorded at the catalog's creation or migration (specs/018); empty: none yet
+		string limits;
 	};
 	CatalogMarkers ReadCatalogMarkers();
 	//! The server must have the UTF-8 BIN2 collation the shaping converts the catalog's strings to.
@@ -244,7 +251,9 @@ private:
 	//! #30 - without it a commit touching two tables is refused by the server). 6 keys and collates
 	//! what format 1.1-dev1 adds, where it exists - every statement is guarded by the table's
 	//! existence, so the same version shapes a 1.0 catalog and a 1.1 one.
-	static constexpr int64_t SHAPE_VERSION = 7;
+	//! 7 sets asynchronous statistics on the database (specs/017); 8 records the catalog's limits and
+	//! declares its string columns by them (specs/018).
+	static constexpr int64_t SHAPE_VERSION = 8;
 	//! Where that version is recorded: an extended property on the catalog's own ducklake_metadata
 	//! table - per catalog, invisible to DuckLake's queries, and gone the moment the catalog's
 	//! tables are, which is what makes a recreated catalog shape itself again.
@@ -255,6 +264,24 @@ private:
 	//! adds to the format under the same name, which brings already-migrated catalogs along.
 	static constexpr const char *MIGRATION_MARKER_PROPERTY = "mssql_ducklake_migration";
 	static constexpr const char *MIGRATION_MARKER = "1.1-dev1/1";
+	//! The catalog's limits (specs/018), `name_length=256,...`: what its string columns are declared
+	//! with, chosen once - at its creation or its migration from 1.0 - and read from here after.
+	static constexpr const char *LIMITS_PROPERTY = "mssql_ducklake_limits";
+	//! The limits this shaping declares the catalog's strings by: the recorded ones; else, for a new
+	//! catalog, META_LIMITS over the defaults; else MAX throughout (a catalog older than them).
+	CatalogLengths ResolveCatalogLengths();
+	//! Narrows (or widens) the string columns META_LIMITS names, during the migration from 1.0, after
+	//! checking that nothing stored is longer; records the result.
+	void ApplyMigrationLimits();
+	//! Fails, naming them, when a stored value is longer than META_LIMITS allows - before the migration.
+	void CheckMigrationLimits();
+	//! (table, column, bytes) for the columns META_LIMITS names a length for; empty when it names none.
+	string MigrationLimitTargets();
+	//! ducklake_metadata's version as the server holds it now ('1.0', '1.1-dev1', ...).
+	string CatalogVersion();
+	//! The length statistics are bounded to in this catalog, 0 for MAX - read with the markers; a
+	//! longer min/max is written as NULL (specs/018).
+	int64_t stats_length = 0;
 	//! Run T-SQL through `mssql_exec` on a connection of the caller's choosing.
 	void RunOn(Connection &connection, const string &tsql, const string &context);
 	//! On this transaction's connection.

@@ -28,12 +28,46 @@ with.
 ### Strings and their collation
 
 DuckLake's catalog stores its strings — names, paths, and the per-file minimum and maximum values
-it prunes with — as `VARCHAR(MAX)` under **`Latin1_General_100_BIN2_UTF8`**, never `NVARCHAR`.
+it prunes with — as `VARCHAR` under **`Latin1_General_100_BIN2_UTF8`**, never `NVARCHAR`.
 Two reasons: UTF-8 is what DuckDB writes, so nothing is transcoded; and BIN2 is DuckDB's byte order,
 so a filter the server answers on a `min_value`/`max_value` column compares the way DuckDB computed
 the statistics. A linguistic collation would prune wrongly and drop rows from a result. The
 collation is explicit on every column because a database's own is usually a legacy `CI_AS` one.
 This is why the server needs the UTF-8 collations of SQL Server 2019 ([Requirements](./requirements.md)).
+
+### String lengths
+
+DuckLake declares its strings without a length, which in T-SQL means one character, so the
+catalog's are given one by what they hold. A `VARCHAR(MAX)` column travels as a large value, which
+the mssql extension reads value by value rather than in batches: reading `ducklake_column` whole —
+every catalog load reads it — costs 15–16 ms over 12,300 rows as `MAX` and 6–8 ms bounded.
+
+| `META_LIMITS` key | default | columns |
+| --- | ---: | --- |
+| `name_length` | 256 | schema, table, column, view, macro and parameter names |
+| `path_length` | 1024 | every `path` |
+| `column_type_length` | 1024 | column and parameter types (`STRUCT(...)` included) |
+| `default_length` | 1024 | default values and sort expressions |
+| `text_length` | 2048 | view and macro SQL, tag values, commit messages, extra statistics |
+| `stats_length` | 1024 | the min/max values in file and table statistics |
+
+The lengths are bytes of UTF-8, 1–8000, or `'max'`. Formats, dialects and other keywords take 64;
+`ducklake_snapshot_changes.changes_made` stays `MAX`, since it grows with the objects of one commit.
+
+- **A new catalog** takes `META_LIMITS`, over the defaults, at the `ATTACH` that creates it.
+- **A catalog migrated from format 1.0** (`AUTOMATIC_MIGRATION TRUE`) is narrowed to what
+  `META_LIMITS` names, and only that, after checking what it holds: a stored value longer than its
+  new bound fails the attach before anything changes, naming the column, the value's length and the
+  bound.
+- **Any other catalog** keeps what it has — one created before this, `MAX` throughout. A
+  `META_LIMITS` given to it is ignored with a warning.
+
+The chosen lengths are recorded on the catalog (an extended property, `mssql_ducklake_limits`) and
+shown, with every column's declared type, by `mssql_ducklake_catalog_info('lake')`
+([Settings](../reference/settings.md#functions)). A name or path longer than its bound fails the
+commit that writes it — the server refuses it, it is never truncated. A **statistic** longer than its
+bound is stored as NULL instead: DuckLake reads that as unknown and prunes nothing on it, so the
+file is read and the answer stays right. A min or max past a kilobyte prunes almost nothing anyway.
 
 ### Indexes
 

@@ -53,3 +53,4 @@ specs are the shareable distillation of that work.
 | [015](015-duckdb-2-line/spec.md) | the DuckDB 2.0 line — rework, after the prototype | draft (prototype: `recon/duckdb-2.0-pushdown`) |
 | [016](016-concurrent-bench/spec.md) | many writers and readers through one DuckDB | draft (measured) |
 | [017](017-async-statistics/spec.md) | asynchronous statistics on the catalog's database | implemented |
+| [018](018-bounded-strings/spec.md) | bounded string columns, chosen at ATTACH (`META_LIMITS`) | implemented |

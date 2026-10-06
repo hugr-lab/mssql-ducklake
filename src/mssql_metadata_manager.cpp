@@ -24,7 +24,42 @@ MSSQLMetadataManager::MSSQLMetadataManager(DuckLakeTransaction &transaction) : D
 }
 
 bool MSSQLMetadataManager::SupportsAppender() const {
-	return !AppenderDisabled();
+	// The appender writes file statistics as they are, past the commit batch that bounds them: a
+	// commit carrying a min or max longer than the catalog's stats_length takes the batch instead,
+	// the rest keep the appender (specs/018).
+	return !AppenderDisabled() && !HasStatsPastBound();
+}
+
+bool MSSQLMetadataManager::HasStatsPastBound() const {
+	if (stats_length <= 0) {
+		return false;
+	}
+	auto past = [&](const DuckLakeDataFile &file) {
+		for (auto &entry : file.column_stats) {
+			auto &stats = entry.second;
+			if ((stats.has_min && stats.min.size() > idx_t(stats_length)) ||
+			    (stats.has_max && stats.max.size() > idx_t(stats_length))) {
+				return true;
+			}
+		}
+		return false;
+	};
+	for (auto &entry : transaction.GetLocalChanges().Changes()) {
+		auto &changes = entry.GetTableChanges();
+		for (auto &file : changes.new_data_files) {
+			if (past(file)) {
+				return true;
+			}
+		}
+		for (auto &compaction : changes.compactions) {
+			for (auto &file : compaction.written_files) {
+				if (past(file)) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
 }
 
 //===--------------------------------------------------------------------===//
@@ -231,6 +266,8 @@ public:
 	optional_idx GetEstimatedCacheMemory() const override {
 		return optional_idx();
 	}
+	//! the catalog's bound on statistics strings, 0 for MAX (specs/018)
+	int64_t stats_length = 0;
 };
 
 void MSSQLMetadataManager::ProbeServerCapabilities() {
@@ -256,7 +293,8 @@ void MSSQLMetadataManager::EnsureReady() {
 	}
 	auto &cache = ObjectCache::GetObjectCache(*client_context);
 	auto key = StringUtil::Format("mssql_ducklake:ready:%llu", catalog.GetAttached().oid);
-	if (cache.Get<MSSQLCatalogReadyEntry>(key)) {
+	if (auto entry = cache.Get<MSSQLCatalogReadyEntry>(key)) {
+		stats_length = entry->stats_length;
 		ready = true;
 		return;
 	}
@@ -264,7 +302,8 @@ void MSSQLMetadataManager::EnsureReady() {
 	// shaping is idempotent, but it is two batches of DDL; one of them waits instead
 	static mutex readiness_lock;
 	lock_guard<mutex> guard(readiness_lock);
-	if (cache.Get<MSSQLCatalogReadyEntry>(key)) {
+	if (auto entry = cache.Get<MSSQLCatalogReadyEntry>(key)) {
+		stats_length = entry->stats_length;
 		ready = true;
 		return;
 	}
@@ -301,8 +340,15 @@ void MSSQLMetadataManager::EnsureReady() {
 	// says whether there is anything to do.
 	if (!markers.shape_current) {
 		EnsureCatalogShape();
+		// the shaping records the catalog's limits when it had none
+		markers = ReadCatalogMarkers();
 	}
-	cache.Put(key, make_shared_ptr<MSSQLCatalogReadyEntry>());
+	auto entry = make_shared_ptr<MSSQLCatalogReadyEntry>();
+	if (!markers.limits.empty()) {
+		entry->stats_length = LengthOf(LengthClass::STATS, CatalogLengths::Parse(markers.limits));
+	}
+	stats_length = entry->stats_length;
+	cache.Put(key, entry);
 	ready = true;
 }
 
@@ -330,13 +376,34 @@ string MSSQLMetadataManager::GetInlinedTableQueries(DuckLakeSnapshot commit_snap
 	// the same reason the catalog's own tables do. The metadata columns are named by the catalog's
 	// DuckLake format (design/005).
 	auto names = InlinedColumnNames(transaction);
+	// Created outside the transaction (below), so a commit that fails after this leaves the table
+	// behind, unregistered - and the next table to take the same id and schema version takes the
+	// same name, finds it there, and would write into another table's columns. A table of this name
+	// that no row of ducklake_inlined_data_tables names is such a leftover: asked on this
+	// transaction's connection - its own locks (the shaping's ALTERs on a new catalog among them)
+	// would block any other - and dropped by the statement that creates the table afresh.
+	const auto schema_literal =
+	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
+	const auto name_literal = DuckLakeUtil::SQLLiteralToString(table_name);
+	auto probe = transaction.GetConnection().Query(StringUtil::Format(
+	    "SELECT leftover FROM mssql_scan_unsafe(%s, %s, columns := {'leftover': 'BIGINT'})", CatalogLiteral(),
+	    DuckLakeUtil::SQLLiteralToString(StringUtil::Format(
+	        "SELECT CAST(CASE WHEN OBJECT_ID(QUOTENAME(%s) + '.' + QUOTENAME(%s)) IS NOT NULL AND NOT EXISTS "
+	        "(SELECT 1 FROM %s.ducklake_inlined_data_tables WHERE table_name = %s) THEN 1 ELSE 0 END AS BIGINT) AS "
+	        "leftover",
+	        schema_literal, name_literal, SchemaIdentifier(), name_literal))));
+	if (probe->HasError()) {
+		probe->GetErrorObject().Throw("Failed to create the inlined data table: ");
+	}
+	auto probed = probe->Fetch();
+	const bool leftover = probed && probed->size() == 1 && probed->GetValue(0, 0).GetValue<int64_t>() == 1;
 	auto statement = StringUtil::Format(
-	    "IF OBJECT_ID(QUOTENAME(%s) + '.' + QUOTENAME(%s)) IS NULL "
+	    "%sIF OBJECT_ID(QUOTENAME(%s) + '.' + QUOTENAME(%s)) IS NULL "
 	    "CREATE TABLE %s.%s(%s BIGINT NOT NULL, %s BIGINT NOT NULL, %s BIGINT%s, "
 	    "CONSTRAINT %s PRIMARY KEY (%s, %s));",
-	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName()),
-	    DuckLakeUtil::SQLLiteralToString(table_name), SchemaIdentifier(), SQLIdentifier(table_name),
-	    SQLIdentifier(names.row_id), SQLIdentifier(names.begin_snapshot), SQLIdentifier(names.end_snapshot), columns,
+	    leftover ? StringUtil::Format("DROP TABLE %s.%s; ", SchemaIdentifier(), SQLIdentifier(table_name)) : string(),
+	    schema_literal, name_literal, SchemaIdentifier(), SQLIdentifier(table_name), SQLIdentifier(names.row_id),
+	    SQLIdentifier(names.begin_snapshot), SQLIdentifier(names.end_snapshot), columns,
 	    SQLIdentifier("pk_" + table_name), SQLIdentifier(names.row_id), SQLIdentifier(names.begin_snapshot));
 	RunServerSideOutsideTransaction(statement, "Failed to create the inlined data table: ");
 	// Refresh the extension's view of THIS table now, before returning into the batch being built.

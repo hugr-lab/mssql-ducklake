@@ -28,6 +28,7 @@ catalog's database.
 | `DATA_PATH` | where DuckLake writes data files. Required for a new catalog; an existing catalog pins the path it was created with. |
 | `METADATA_SCHEMA` | the schema holding the catalog tables. Default `dbo` — a constant the mssql extension answers as the catalog's default schema, not the login's own. A login that must write elsewhere names its schema here. |
 | `META_TYPE 'mssql'` | only for the `mssql://` URI form. |
+| `META_LIMITS {…}` | the lengths the catalog's string columns are declared with — read when the catalog is created, or migrated from format 1.0, and recorded in it; [Shaping](./shaping.md#string-lengths). For example `META_LIMITS {'name_length': 256, 'path_length': 1024, 'stats_length': 'max'}`. |
 | DuckLake's own | `DATA_INLINING_ROW_LIMIT`, `ENCRYPTED`, `SNAPSHOT_VERSION`, `SNAPSHOT_TIME`, … — this is DuckLake's `ATTACH`, so its [options](https://ducklake.select/docs/stable/duckdb/usage/connecting) apply unchanged. |
 
 ### Several lakes, one server

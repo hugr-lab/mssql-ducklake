@@ -40,16 +40,17 @@ MSSQLMetadataManager::CatalogMarkers MSSQLMetadataManager::ReadCatalogMarkers() 
 	    StringUtil::Replace(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName(), "'", "''''");
 	auto anchor = StringUtil::Format("OBJECT_ID(QUOTENAME(''%s'') + ''.ducklake_metadata'')", schema_name);
 	auto property = [&](const char *name, const char *type) {
-		return StringUtil::Format("(SELECT TRY_CAST(CAST(value AS VARCHAR(64)) AS %s) FROM sys.extended_properties "
+		return StringUtil::Format("(SELECT TRY_CAST(CAST(value AS NVARCHAR(400)) AS %s) FROM sys.extended_properties "
 		                          "WHERE class = 1 AND major_id = %s AND minor_id = 0 AND name = ''%s'')",
 		                          type, anchor, name);
 	};
 	auto result = connection.Query(StringUtil::Format(
-	    "SELECT present, shape, migration FROM mssql_scan_unsafe(%s, 'SELECT "
-	    "CAST(CASE WHEN %s IS NULL THEN 0 ELSE 1 END AS BIGINT) AS present, %s AS shape, %s AS migration', "
-	    "columns := {'present': 'BIGINT', 'shape': 'BIGINT', 'migration': 'VARCHAR'})",
+	    "SELECT present, shape, migration, limits FROM mssql_scan_unsafe(%s, 'SELECT "
+	    "CAST(CASE WHEN %s IS NULL THEN 0 ELSE 1 END AS BIGINT) AS present, %s AS shape, %s AS migration, "
+	    "%s AS limits', columns := {'present': 'BIGINT', 'shape': 'BIGINT', 'migration': 'VARCHAR', 'limits': "
+	    "'VARCHAR'})",
 	    CatalogLiteral(), anchor, property(SHAPE_VERSION_PROPERTY, "BIGINT"),
-	    property(MIGRATION_MARKER_PROPERTY, "NVARCHAR(64)")));
+	    property(MIGRATION_MARKER_PROPERTY, "NVARCHAR(64)"), property(LIMITS_PROPERTY, "NVARCHAR(400)")));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to inspect the DuckLake catalog on SQL Server: ");
 	}
@@ -60,7 +61,10 @@ MSSQLMetadataManager::CatalogMarkers MSSQLMetadataManager::ReadCatalogMarkers() 
 	}
 	markers.present = chunk->GetValue(0, 0).GetValue<int64_t>() != 0;
 	auto shape = chunk->GetValue(1, 0);
+	markers.shaped = !shape.IsNull();
 	markers.shape_current = !shape.IsNull() && shape.GetValue<int64_t>() >= SHAPE_VERSION;
+	auto limits = chunk->GetValue(3, 0);
+	markers.limits = limits.IsNull() ? string() : limits.ToString();
 	auto migration = chunk->GetValue(2, 0);
 	markers.migration_current = !migration.IsNull() && migration.ToString() == MIGRATION_MARKER;
 	return markers;
@@ -108,6 +112,15 @@ void MSSQLMetadataManager::RequireUtf8Collation() {
 //! left alone: every catalog a release of this extension created is at 1.0 or later, because 1.0 was
 //! the latest format on the line it shipped on.
 void MSSQLMetadataManager::MigrateToV1_1Dev1() {
+	// META_LIMITS narrows a catalog only on its way from 1.0 (specs/018): DuckLake re-runs this for a
+	// dev format on every writable attach, and a catalog already at 1.1 lives with the limits it has.
+	// Read before anything below changes the version.
+	const bool from_v1_0 = CatalogVersion() == "1.0";
+	// and checked before it too: a META_LIMITS shorter than what is stored fails the attach while the
+	// catalog is still 1.0, so the next attach meets the same migration rather than a half-done one
+	if (from_v1_0) {
+		CheckMigrationLimits();
+	}
 	// renaming first means a collision in a user's inlined table aborts while the catalog still
 	// says 1.0, which is the order upstream picked for the same reason
 	MigrateInlinedColumnNames(true);
@@ -163,6 +176,10 @@ void MSSQLMetadataManager::MigrateToV1_1Dev1() {
 	    schema_literal, SHAPE_VERSION_PROPERTY, SHAPE_VERSION_PROPERTY, schema_literal);
 
 	RunServerSideOutsideTransaction(ddl, "Failed to migrate the DuckLake catalog to v1.1-dev1: ");
+	// the limits the ATTACH that migrates asks for (specs/018) - before the shaping, which reads them
+	if (from_v1_0) {
+		ApplyMigrationLimits();
+	}
 	// The migration runs on this manager in the attach transaction, before DuckLake swaps it for a
 	// stock one (specs/015 R1), so it shapes its own result here rather than leaving it to a later
 	// attach - and only when the run added something, which the stamp now says.
@@ -242,11 +259,179 @@ void MSSQLMetadataManager::MigrateV10Dev() {
 	MigrateToV1_1Dev1();
 }
 
+string MSSQLMetadataManager::CatalogVersion() {
+	auto result = transaction.GetConnection().Query(StringUtil::Format(
+	    "SELECT v FROM mssql_scan_unsafe(%s, 'SELECT CAST([value] AS NVARCHAR(64)) AS v FROM %s.ducklake_metadata "
+	    "WHERE [key] = N''version''', columns := {'v': 'VARCHAR'})",
+	    CatalogLiteral(), StringUtil::Replace(SchemaIdentifier(), "'", "''")));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to read the DuckLake catalog's version: ");
+	}
+	auto chunk = result->Fetch();
+	if (!chunk || chunk->size() == 0) {
+		return string();
+	}
+	return chunk->GetValue(0, 0).ToString();
+}
+
+string MSSQLMetadataManager::MigrationLimitTargets() {
+	auto requested = RequestedLengths(transaction.GetCatalog().GetAttached());
+	if (!requested.AnyGiven()) {
+		return string();
+	}
+
+	// The columns the ATTACH names a length for, as (table, column, bytes; 0 for MAX).
+	string targets;
+	for (auto &column : CatalogStringColumns()) {
+		int64_t given = CatalogLengths::NOT_GIVEN;
+		switch (column.length_class) {
+		case LengthClass::NAME:
+			given = requested.name;
+			break;
+		case LengthClass::PATH:
+			given = requested.path;
+			break;
+		case LengthClass::COLUMN_TYPE:
+			given = requested.column_type;
+			break;
+		case LengthClass::DEFAULT_VALUE:
+			given = requested.default_value;
+			break;
+		case LengthClass::TEXT:
+			given = requested.text;
+			break;
+		case LengthClass::STATS:
+			given = requested.stats;
+			break;
+		default:
+			break;
+		}
+		if (given == CatalogLengths::NOT_GIVEN) {
+			continue;
+		}
+		targets += StringUtil::Format("%s(N'%s', N'%s', %lld)", targets.empty() ? "" : ", ", column.table,
+		                              column.column, given);
+	}
+	return targets;
+}
+
+void MSSQLMetadataManager::CheckMigrationLimits() {
+	auto targets = MigrationLimitTargets();
+	if (targets.empty()) {
+		return;
+	}
+	const string schema_literal = SchemaLiteral();
+	// What is stored first: a value longer than its new bound fails the attach here, naming it,
+	// before anything is altered. Lengths in bytes of UTF-8 - what the column will hold - whatever
+	// the column is now (VARCHAR(MAX) from an older shaping, NVARCHAR from none).
+	auto check = StringUtil::Format(R"(
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql += CASE WHEN @sql = N'' THEN N'' ELSE N' UNION ALL ' END
+  + N'SELECT CAST(N''' + t.name + N''' AS NVARCHAR(128)) AS tbl, CAST(N''' + c.name + N''' AS NVARCHAR(128)) AS col, '
+  + CAST(m.bytes AS NVARCHAR(10)) + N' AS bound, CAST(ISNULL(MAX(DATALENGTH(CAST(CAST(' + QUOTENAME(c.name)
+  + N' AS NVARCHAR(MAX)) COLLATE %s AS VARCHAR(MAX)))), 0) AS BIGINT) AS longest FROM ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name)
+FROM sys.columns c JOIN sys.tables t ON t.object_id = c.object_id JOIN sys.schemas s ON s.schema_id = t.schema_id
+JOIN (VALUES %s) m(tbl, col, bytes) ON m.tbl = t.name AND m.col = c.name
+WHERE s.name = %s AND m.bytes > 0;
+IF @sql = N'' SET @sql = N'SELECT CAST(NULL AS NVARCHAR(128)) AS tbl, CAST(NULL AS NVARCHAR(128)) AS col, 0 AS bound, CAST(0 AS BIGINT) AS longest WHERE 1 = 0';
+SET @sql = N'SELECT tbl, col, bound, longest FROM (' + @sql + N') x WHERE longest > bound';
+EXEC sp_executesql @sql;)",
+	                                VARCHAR_COLLATION, targets, schema_literal);
+	auto result = transaction.GetConnection().Query(StringUtil::Format(
+	    "SELECT * FROM mssql_scan_unsafe(%s, %s, columns := {'tbl': 'VARCHAR', 'col': 'VARCHAR', 'bound': 'INTEGER', "
+	    "'longest': 'BIGINT'})",
+	    CatalogLiteral(), DuckLakeUtil::SQLLiteralToString(check)));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to check the DuckLake catalog's strings against META_LIMITS: ");
+	}
+	string too_long;
+	while (auto chunk = result->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			too_long += StringUtil::Format("\n  %s.%s: a value of %s bytes, the bound %s",
+			                               chunk->GetValue(0, row).ToString(), chunk->GetValue(1, row).ToString(),
+			                               chunk->GetValue(3, row).ToString(), chunk->GetValue(2, row).ToString());
+		}
+	}
+	if (!too_long.empty()) {
+		throw InvalidInputException("mssql_ducklake: META_LIMITS is shorter than what the catalog already holds - "
+		                            "nothing was changed:%s\nRaise those limits, or migrate without them.",
+		                            too_long);
+	}
+}
+
+void MSSQLMetadataManager::ApplyMigrationLimits() {
+	auto targets = MigrationLimitTargets();
+	if (targets.empty()) {
+		return;
+	}
+	const string schema_literal = SchemaLiteral();
+	auto markers = ReadCatalogMarkers();
+	auto recorded = markers.limits.empty() ? CatalogLengths() : CatalogLengths::Parse(markers.limits);
+	auto target = recorded.WithMaxForMissing().OverriddenBy(RequestedLengths(transaction.GetCatalog().GetAttached()));
+	// Then the columns, and the limits the catalog now lives with.
+	auto alter =
+	    StringUtil::Format(R"(
+DECLARE @alter NVARCHAR(MAX) = N'';
+SELECT @alter += N'ALTER TABLE ' + QUOTENAME(s.name) + N'.' + QUOTENAME(t.name) + N' ALTER COLUMN ' + QUOTENAME(c.name)
+  + CASE WHEN m.bytes = 0 THEN N' VARCHAR(MAX)' ELSE N' VARCHAR(' + CAST(m.bytes AS NVARCHAR(10)) + N')' END
+  + N' COLLATE %s' + CASE WHEN c.is_nullable = 0 THEN N' NOT NULL' ELSE N' NULL' END + N';'
+FROM sys.columns c JOIN sys.tables t ON t.object_id = c.object_id JOIN sys.schemas s ON s.schema_id = t.schema_id
+JOIN (VALUES %s) m(tbl, col, bytes) ON m.tbl = t.name AND m.col = c.name
+WHERE s.name = %s;
+EXEC sp_executesql @alter;
+IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 1 AND major_id = OBJECT_ID(QUOTENAME(%s) + '.ducklake_metadata') AND minor_id = 0 AND name = '%s')
+    EXEC sp_updateextendedproperty @name = N'%s', @value = N'%s', @level0type = N'SCHEMA', @level0name = %s, @level1type = N'TABLE', @level1name = N'ducklake_metadata';
+ELSE
+    EXEC sp_addextendedproperty @name = N'%s', @value = N'%s', @level0type = N'SCHEMA', @level0name = %s, @level1type = N'TABLE', @level1name = N'ducklake_metadata';
+)",
+	                       VARCHAR_COLLATION, targets, schema_literal, schema_literal, LIMITS_PROPERTY, LIMITS_PROPERTY,
+	                       target.Serialize(), schema_literal, LIMITS_PROPERTY, target.Serialize(), schema_literal);
+	RunServerSideOutsideTransaction(alter, "Failed to apply META_LIMITS to the DuckLake catalog: ");
+}
+
+CatalogLengths MSSQLMetadataManager::ResolveCatalogLengths() {
+	auto markers = ReadCatalogMarkers();
+	auto requested = RequestedLengths(transaction.GetCatalog().GetAttached());
+	if (!markers.limits.empty()) {
+		// chosen once, and the catalog lives with them: an ATTACH asking for others changes nothing
+		auto recorded = CatalogLengths::Parse(markers.limits).WithMaxForMissing();
+		if (requested.AnyGiven() && recorded.OverriddenBy(requested) != recorded) {
+			auto client_context = transaction.context.lock();
+			if (client_context) {
+				DUCKDB_LOG_WARNING(*client_context,
+				                   StringUtil::Format("mssql_ducklake: META_LIMITS ignored - the catalog was created "
+				                                      "with %s, and its limits change only when it is migrated "
+				                                      "(specs/018)",
+				                                      recorded.Serialize()));
+			}
+		}
+		return recorded;
+	}
+	if (!markers.shaped) {
+		// never shaped: a new catalog, or one a stock manager created and used - only the first may
+		// be narrowed without looking at what it holds
+		auto result = transaction.GetConnection().Query(StringUtil::Format(
+		    "SELECT s FROM mssql_scan_unsafe(%s, 'SELECT CAST(ISNULL(MAX(snapshot_id), 0) AS BIGINT) AS s FROM "
+		    "%s.ducklake_snapshot', columns := {'s': 'BIGINT'})",
+		    CatalogLiteral(), StringUtil::Replace(SchemaIdentifier(), "'", "''")));
+		if (result->HasError()) {
+			result->GetErrorObject().Throw("Failed to inspect the DuckLake catalog on SQL Server: ");
+		}
+		auto chunk = result->Fetch();
+		if (chunk && chunk->size() == 1 && chunk->GetValue(0, 0).GetValue<int64_t>() == 0) {
+			return requested.WithDefaults();
+		}
+	}
+	// a catalog older than the limits keeps MAX - the migration from 1.0 narrows it when asked
+	return CatalogLengths().WithMaxForMissing();
+}
+
 void MSSQLMetadataManager::EnsureCatalogShape() {
 	RequireUtf8Collation();
 	const string schema = SchemaIdentifier();
 	const string schema_literal =
 	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
+	const auto lengths = ResolveCatalogLengths();
 
 	// Primary keys. DuckLake declares a few itself; the rest are ours, and they are what make the
 	// catalog writable at all: the mssql extension builds a row identity out of the primary key, and
@@ -366,8 +551,9 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	};
 	for (auto &entry : stats_columns) {
 		columns_ddl += if_table_exists(
-		    entry.first, StringUtil::Format("ALTER TABLE %s.%s ALTER COLUMN %s VARCHAR(MAX) COLLATE %s;\n", schema,
-		                                    entry.first, entry.second, VARCHAR_COLLATION));
+		    entry.first,
+		    StringUtil::Format("ALTER TABLE %s.%s ALTER COLUMN %s %s COLLATE %s;\n", schema, entry.first, entry.second,
+		                       VarcharOf(LengthOf(LengthClass::STATS, lengths)), VARCHAR_COLLATION));
 	}
 
 	// A partition value is bounded so it can be an index key. DuckLake declares it an unbounded
@@ -400,19 +586,32 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	//
 	// Column-by-column because ALTER COLUMN cannot restate a whole table, and nullability has to be
 	// restated or the column silently becomes nullable.
+	//
+	// Declared by what the column holds, at the catalog's limits (specs/018): a column the list does
+	// not know - one a DuckLake bump adds - is MAX.
+	string declared_by_column;
+	for (auto &column : CatalogStringColumns()) {
+		if (column.length_class == LengthClass::STATS) {
+			continue; // the loop above
+		}
+		declared_by_column +=
+		    StringUtil::Format("%s(N'%s', N'%s', N'%s')", declared_by_column.empty() ? "" : ", ", column.table,
+		                       column.column, VarcharOf(LengthOf(column.length_class, lengths)));
+	}
 	columns_ddl += StringUtil::Format(R"(
 DECLARE @widen NVARCHAR(MAX) = N'';
 SELECT @widen += N'ALTER TABLE ' + QUOTENAME(sch.name) + N'.' + QUOTENAME(t.name)
-               + N' ALTER COLUMN ' + QUOTENAME(c.name) + N' VARCHAR(MAX) COLLATE %s'
+               + N' ALTER COLUMN ' + QUOTENAME(c.name) + N' ' + ISNULL(m.declared, N'VARCHAR(MAX)') + N' COLLATE %s'
                + CASE WHEN c.is_nullable = 0 THEN N' NOT NULL' ELSE N' NULL' END + N';'
 FROM sys.columns c
 JOIN sys.tables t ON t.object_id = c.object_id
 JOIN sys.schemas sch ON sch.schema_id = t.schema_id
 JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+LEFT JOIN (VALUES %s) m(tbl, col, declared) ON m.tbl = t.name AND m.col = c.name
 WHERE sch.name = %s AND t.name LIKE 'ducklake%%' AND ty.name IN ('nvarchar', 'nchar', 'ntext');
 EXEC sp_executesql @widen;
 )",
-	                                  VARCHAR_COLLATION, schema_literal);
+	                                  VARCHAR_COLLATION, declared_by_column, schema_literal);
 
 	// The inlined deletion tables an older build created keyless, through the base's DDL (the
 	// manager writes them keyed now - mssql_metadata_queries.cpp). DuckLake DELETEs from them on a
@@ -543,6 +742,15 @@ IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 3 AND major_id = 
 	                       schema_literal, SHAPE_VERSION_PROPERTY, SHAPE_VERSION_PROPERTY, SHAPE_VERSION,
 	                       schema_literal, SHAPE_VERSION_PROPERTY, SHAPE_VERSION, schema_literal, schema_literal,
 	                       SHAPE_VERSION_PROPERTY, SHAPE_VERSION_PROPERTY, schema_literal);
+	// and the limits the strings were declared with, for every later attach to read (specs/018)
+	constraints_ddl += StringUtil::Format(R"(
+IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 1 AND major_id = OBJECT_ID(QUOTENAME(%s) + '.ducklake_metadata') AND minor_id = 0 AND name = '%s')
+    EXEC sp_updateextendedproperty @name = N'%s', @value = N'%s', @level0type = N'SCHEMA', @level0name = %s, @level1type = N'TABLE', @level1name = N'ducklake_metadata';
+ELSE
+    EXEC sp_addextendedproperty @name = N'%s', @value = N'%s', @level0type = N'SCHEMA', @level0name = %s, @level1type = N'TABLE', @level1name = N'ducklake_metadata';
+)",
+	                                      schema_literal, LIMITS_PROPERTY, LIMITS_PROPERTY, lengths.Serialize(),
+	                                      schema_literal, LIMITS_PROPERTY, lengths.Serialize(), schema_literal);
 
 	// Two batches: inside one, a column's new NOT NULL is not yet visible to the constraint that
 	// needs it, and the server answers "cannot define PRIMARY KEY on a nullable column".

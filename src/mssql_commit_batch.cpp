@@ -325,7 +325,76 @@ const unordered_map<string, string> &CatalogColumns(bool v1_1) {
 	return v1_1 ? CatalogColumnsV1_1() : CatalogColumnsV1_0();
 }
 
-bool RewriteInsert(const string &stmt, const string &schema, bool v1_1, string &tsql) {
+//! The statistics columns of the tables that carry them, in DDL order (format 1.1): a bound longer
+//! than the catalog's stats_length is written as NULL, and so is its exactness (specs/018).
+const unordered_map<string, vector<string>> &StatsColumnOrder() {
+	static const unordered_map<string, vector<string>> order = {
+	    {"ducklake_file_column_stats",
+	     {"data_file_id", "table_id", "column_id", "column_size_bytes", "value_count", "null_count", "min_value",
+	      "max_value", "contains_nan", "extra_stats", "min_is_exact", "max_is_exact"}},
+	    {"ducklake_table_column_stats",
+	     {"table_id", "column_id", "contains_null", "contains_nan", "min_value", "max_value", "extra_stats",
+	      "min_is_exact", "max_is_exact"}},
+	    {"ducklake_file_variant_stats",
+	     {"data_file_id", "table_id", "column_id", "variant_path", "shredded_type", "column_size_bytes", "value_count",
+	      "null_count", "min_value", "max_value", "contains_nan", "extra_stats"}},
+	};
+	return order;
+}
+
+//! The bytes a string literal stands for: its text with each doubled quote counted once.
+idx_t LiteralBytes(const Literal &lit) {
+	idx_t doubled = 0;
+	for (idx_t i = 0; i + 1 < lit.text.size(); i++) {
+		if (lit.text[i] == '\'' && lit.text[i + 1] == '\'') {
+			doubled++;
+			i++;
+		}
+	}
+	return lit.text.size() - doubled;
+}
+
+//! A min or max past the bound becomes NULL - unknown, which DuckLake reads as "do not prune on it" and
+//! never resurrects in a merge (ducklake_stats.cpp) - and its exactness with it.
+void BoundStats(const string &table, const vector<string> &listed, int64_t stats_length,
+                vector<vector<Literal>> &tuples) {
+	if (stats_length <= 0) {
+		return;
+	}
+	auto entry = StatsColumnOrder().find(table);
+	if (entry == StatsColumnOrder().end()) {
+		return;
+	}
+	auto &columns = listed.empty() ? entry->second : listed;
+	auto position = [&](const char *name) -> optional_idx {
+		for (idx_t i = 0; i < columns.size(); i++) {
+			if (columns[i] == name) {
+				return i;
+			}
+		}
+		return optional_idx();
+	};
+	const pair<const char *, const char *> bounds[] = {{"min_value", "min_is_exact"}, {"max_value", "max_is_exact"}};
+	for (auto &tuple : tuples) {
+		for (auto &bound : bounds) {
+			auto value = position(bound.first);
+			if (!value.IsValid() || value.GetIndex() >= tuple.size()) {
+				continue;
+			}
+			auto &lit = tuple[value.GetIndex()];
+			if (lit.kind != LiteralKind::STRING || LiteralBytes(lit) <= idx_t(stats_length)) {
+				continue;
+			}
+			lit = Literal {LiteralKind::NULL_VALUE, string()};
+			auto exact = position(bound.second);
+			if (exact.IsValid() && exact.GetIndex() < tuple.size()) {
+				tuple[exact.GetIndex()] = Literal {LiteralKind::NULL_VALUE, string()};
+			}
+		}
+	}
+}
+
+bool RewriteInsert(const string &stmt, const string &schema, bool v1_1, int64_t stats_length, string &tsql) {
 	const string head = string("INSERT INTO ") + CATALOG_PREFIX;
 	if (!StringUtil::StartsWith(stmt, head)) {
 		return false;
@@ -349,6 +418,7 @@ bool RewriteInsert(const string &stmt, const string &schema, bool v1_1, string &
 	// carried through verbatim; the kinds stay positional, and a listed column count that does not
 	// match the table's refuses the rewrite rather than guessing (the strict guard then names it).
 	string column_list;
+	vector<string> listed_columns;
 	if (pos < stmt.size() && stmt[pos] == '(') {
 		auto close = stmt.find(')', pos);
 		if (close == string::npos) {
@@ -374,6 +444,7 @@ bool RewriteInsert(const string &stmt, const string &schema, bool v1_1, string &
 				}
 			}
 			rendered_list += (rendered_list.empty() ? "" : ", ") + QuotedIfReserved(trimmed);
+			listed_columns.push_back(trimmed);
 		}
 		column_list = " (" + rendered_list + ")";
 		pos = close + 1;
@@ -387,6 +458,7 @@ bool RewriteInsert(const string &stmt, const string &schema, bool v1_1, string &
 	if (!ReadTuples(stmt, pos, tuples) || tuples.empty()) {
 		return false;
 	}
+	BoundStats(table, listed_columns, stats_length, tuples);
 	// SQL Server takes at most 1000 rows in one VALUES list (error 10738); a commit of two hundred
 	// files writes eight thousand statistics rows in one INSERT, so the statement is emitted per
 	// thousand rows - still one round trip, since the run is one batch
@@ -756,6 +828,27 @@ bool ReadColumnStatsRefresh(const string &stmt, ColumnStatsRefresh &out) {
 	}
 	return expect(" WHERE table_id=") && number(out.table_id) && expect(" AND column_id=") && number(out.column_id) &&
 	       pos == stmt.size();
+}
+
+//! The refresh's min and max past the bound become NULL, their exactness too (specs/018).
+void BoundRefresh(ColumnStatsRefresh &refresh, int64_t stats_length) {
+	if (stats_length <= 0) {
+		return;
+	}
+	for (idx_t bound = 2; bound <= 3; bound++) {
+		auto &value = refresh.values[bound];
+		if (!StringUtil::StartsWith(value, "N'")) {
+			continue;
+		}
+		Literal lit {LiteralKind::STRING, value.substr(2, value.size() - 3)};
+		if (LiteralBytes(lit) <= idx_t(stats_length)) {
+			continue;
+		}
+		value = "NULL";
+		if (refresh.exactness) {
+			refresh.values[bound + 3] = "NULL";
+		}
+	}
 }
 
 //! A run of those for one table as ONE statement: the 1.0 shape, `UPDATE ... FROM (VALUES ...)`.
@@ -1194,6 +1287,7 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 	for (auto &stmt : SplitStatements(query)) {
 		ColumnStatsRefresh refresh;
 		if (rewrite && ReadColumnStatsRefresh(stmt, refresh)) {
+			BoundRefresh(refresh, stats_length);
 			bool joins = !refreshes.empty() && refreshes[0].table_id == refresh.table_id &&
 			             refreshes[0].exactness == refresh.exactness;
 			// a column twice is two updates in order, the later one winning: not one join
@@ -1249,7 +1343,7 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 			}
 		}
 		string tsql, dropped;
-		if (rewrite && (RewriteInsert(stmt, schema, v1_1, tsql) || RewriteUpdate(stmt, schema, tsql) ||
+		if (rewrite && (RewriteInsert(stmt, schema, v1_1, stats_length, tsql) || RewriteUpdate(stmt, schema, tsql) ||
 		                RewriteDelete(stmt, schema, tsql) || RewriteCteUpdate(stmt, schema, tsql))) {
 			append(tsql + "\n");
 			if (failed) {

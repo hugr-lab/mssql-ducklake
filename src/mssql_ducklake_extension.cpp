@@ -8,6 +8,7 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "mssql_catalog_lengths.hpp"
 #include "mssql_metadata_manager.hpp"
 #include "storage/ducklake_metadata_manager.hpp"
 
@@ -61,6 +62,9 @@ void LoadInternal(ExtensionLoader &loader) {
 	// the full ducklake surface: the `ducklake` ATTACH prefix, ducklake_* functions, secret type,
 	// settings - registered by ducklake's own init, same image
 	ducklake_duckdb_cpp_init(loader);
+	// META_LIMITS - the lengths of a catalog's string columns (specs/018) - is this extension's, not
+	// DuckLake's: read and taken out on the way into DuckLake's ATTACH
+	WatchDuckLakeAttach(DBConfig::GetConfig(db));
 
 	// the registry is process-global while Load runs per database instance; a second Register of
 	// the same key throws by design
@@ -82,6 +86,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	    "Set AUTO_UPDATE_STATISTICS_ASYNC ON on a DuckLake catalog's SQL Server database when the "
 	    "catalog is shaped; a query that finds stale statistics no longer waits for their update",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+	RegisterCatalogInfoFunction(loader);
 	loader.RegisterFunction(
 	    ScalarFunction("mssql_ducklake_version", {}, LogicalType::VARCHAR, MssqlDucklakeVersionFun));
 }

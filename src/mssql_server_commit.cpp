@@ -274,7 +274,7 @@ bool MSSQLMetadataManager::CanSkipSnapshotFetch(const TransactionChangeInformati
 	// answer for EXACTLY the commits FlushChangesServerSide applies without falling back, which is
 	// why both ask IsDataFilesOnlyCommit and neither decides anything after staging.
 	return SkipSnapshotFetchEnabled() && ServerCommitEnabled() && !transaction.GetRequiresNewInlinedTable() &&
-	       IsDataFilesOnlyCommit(changes);
+	       IsDataFilesOnlyCommit(changes) && !HasStatsPastBound();
 }
 
 //! The per-table stats of an applied commit (specs/015 R5). Under the apply's lock, the stored stats of every
@@ -330,7 +330,10 @@ void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_tra
 	// for both paths - the staging, its bulk loads, and then the whole client loop from scratch -
 	// which was the worst shape in the benchmark (specs/005 D7). This is also exactly what
 	// CanSkipSnapshotFetch answers, which is what makes skipping the fetch safe; see there.
-	if (!IsDataFilesOnlyCommit(transaction_changes) || flush_transaction.GetRequiresNewInlinedTable()) {
+	// a statistic past the catalog's bound is nulled in the commit batch, which the apply does not
+	// write (specs/018)
+	if (!IsDataFilesOnlyCommit(transaction_changes) || flush_transaction.GetRequiresNewInlinedTable() ||
+	    HasStatsPastBound()) {
 		flush_transaction.RunCommitLoop(transaction_snapshot, transaction_changes, retry_config);
 		return;
 	}
