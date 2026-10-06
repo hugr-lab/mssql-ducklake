@@ -523,6 +523,40 @@ schema's metadata of the catalog's database (DuckDB's "did you mean" enumeration
 line it does so on every such query - 27–34 s each on a 4,724-table database, 0.011 s cached on
 v0.2.5 (hugr-lab/mssql-extension#412).
 
+## Why postgres is faster on the same statements (measured 2026-10-06)
+
+DuckDB and DuckLake are the same on both sides, and so is their work on each statement (parse,
+plan, the `LIST`/`STRUCT` building). What differs is one remote scan. Per statement, inside a
+transaction, wall and client CPU over 1000 statements (mssql at #407 + #413, 4e8df71):
+
+| | wall | client CPU |
+| --- | ---: | ---: |
+| `mssql_exec('SELECT 1')` | 0.66 ms | 0.23 |
+| `postgres_execute('SELECT 1')` | 0.78 ms | 0.15 |
+| a one-row catalog scan, SQL Server | 0.96–1.01 ms | 0.36–0.39 |
+| the same, filter constants as literals | 0.73 ms | 0.30 |
+| a one-row catalog scan, postgres | 0.48–0.50 ms | 0.22 |
+
+The bare round trip is not slower on SQL Server. The difference is the mssql extension's work per
+catalog scan - +0.15 ms of client CPU and +0.3 ms of waiting, ~0.3 ms of which is the filter's
+`DECLARE ...; EXEC sp_executesql` (a new ad-hoc batch per call). A catalog load is ~15 scans, so
+~9 ms a load (`evolution_read_latest`: 154 loads, 7.3 s against 3.3; ~1 s more was pushdown
+planning the vetoed tables+columns statement: 7.3 → 6.2 s with it off).
+
+Two things tried on our side, and not kept:
+- **the load prefetched in one call** (all visible rows of its 14 tables in one wide `UNION ALL`,
+  DuckLake's six statements run locally on temp copies, identical results): 36 → 33 ms a load at
+  150 tables, 37 → 30.5 ms on a one-table catalog. Most of a small load is DuckDB's own planning of
+  six correlated statements, and the 15 temp tables ate half of what the round trips saved.
+- **literal filters on the manager's connection** (`SET SESSION mssql_scan_parameterize_filters =
+  false` when the database is FORCED): faster on a repeated statement, *slower* on the real load
+  (4.6 → 5.2 s for the 154 loads) - every snapshot id makes a new text, and the extension's describe
+  cache is keyed by text.
+
+What is left is the extension's per-scan cost (M1: the joins of a vetoed plan pushed with the
+`LIST` built locally - one statement instead of five; pushdown not planning what it will veto) and
+upstream's loads.
+
 ## Dependencies on the mssql extension
 
 Sent to the mssql session on 2026-10-06, ranked by the measurements above.
