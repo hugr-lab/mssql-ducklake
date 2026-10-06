@@ -11,9 +11,9 @@ The bump to the DuckDB 2.0 line brings three things at once: DuckLake's format `
 columns, a new table, prefixed inlined-table columns, and a migration that re-runs on every
 writable attach), the mssql extension's 2.0 line (TLS verification, the remote-pushdown rewriter of
 specs 079/080, and spec 081's given-shape scans), and a DuckLake that discards a registered
-third-party manager whenever a catalog's format is 1.1 — which is why **this bump pins the format
-to 1.0** (D9): no patch, no migration, and every catalog a release of ours created keeps working
-unchanged. The reconnaissance branch ported the manager through all
+third-party manager in the attach transaction whenever a catalog's format is 1.1 — which the manager
+sidesteps by **no longer depending on surviving the attach** (D9): both formats, no patch, and
+every catalog a release of ours created keeps working unchanged. The reconnaissance branch ported the manager through all
 three, and found and fixed four defects of ours on the way — two of them release-level (the format
 migration could not run on SQL Server at all; the server-side commit wrote wrong statistics).
 
@@ -109,9 +109,9 @@ own `reattach` phase: **0.28 s**, against 4.45 / 2.77 before.
 The commit batch's kinds table (specs/014) describes this build's format. A catalog left at 1.0
 writes tuples of other widths; the rewrite declines them by construction and the base path carries
 them — correct, just not in one round trip. `MSSQL_DUCKLAKE_STRICT_BATCH` now only errors when the
-catalog is at the build's format. On the branch that is `DUCKLAKE_LATEST_VERSION`; with D9 it has to
-be **the build's own constant (1.0)**, or pinning the format would switch the audit off. No
-dual-format batch: a catalog at any other format is one to refuse (D9), not one to optimise for.
+catalog is at `DUCKLAKE_LATEST_VERSION`. No dual-format batch: a 1.0 catalog is one to migrate, not
+one to optimise for. The side effect is the re-audit trigger the vendoring rule asks for — at the
+next ducklake bump LATEST moves ahead of the table and the suite starts naming statements.
 
 Verified the guard still fires: a kinds entry removed, `write_shapes.test` named the statement.
 
@@ -219,14 +219,14 @@ The transition, in the order the measurements impose:
 | piece | on the branch | before merge |
 | --- | --- | --- |
 | duckdb | the 2.0 line | a released tag |
-| ducklake | main, **patched** on the branch — a 60-line hook (`CreateVersionedManager`) plus a header-only `DuckLakeMetadataManagerV1_1` so a third-party manager survives `SetVersionedMetadataManager` | **no patch**: D9 pins the format to 1.0, where the swap never runs; the hook and the template are dropped |
+| ducklake | main, **patched** on the branch — a 60-line hook (`CreateVersionedManager`) plus a header-only `DuckLakeMetadataManagerV1_1` so a third-party manager survives `SetVersionedMetadataManager` | **no patch**: D9 moves the attach-time work to first use, so the swap costs nothing; the hook and the template are dropped |
 | mssql | **local** `a71c57c` (spec 081 2/n on top of 998660e, the pushdown fix) | a pushed ref; 081 becomes its own PR after #406 |
 | `MSSQL_DUCKLAKE_TEST_DSN` | `TrustServerCertificate=yes` added by the Makefile — mssql specs/074 refuses an unverifiable certificate | stays |
 | `CMakeLists.txt` | the new duckdb's `format.py` wants it at 80 columns | one reformat commit |
 | `make tidy-check` | ci-tools' pattern `src/.*/` matches nothing in a flat `src/`; the code-quality job has passed vacuously since the repository started | the pattern without the slash, validated in CI |
 | `make test-integration-fast-path` | not in CI, which is how D6's bug survived | in CI |
 
-### D9 — the format is pinned to 1.0, which makes the submodule patch unnecessary
+### D9 — both formats, no patch: the manager stops depending on surviving the attach
 
 How the 2.0-line ducklake works: a manager is created **per transaction** (`DuckLakeTransaction`'s
 constructor calls `DuckLakeMetadataManager::Create`, the registry by `MetadataType()`), and the
@@ -236,42 +236,48 @@ behaviour (the inlined-table column prefix, the exactness columns, the read quer
 exactly **seven virtuals**: the six catalog DDL statements and `GetVersionString()` (the base says
 `1.0`), used only when a catalog is created.
 
-The obstacle, and its boundary: `SetVersionedMetadataManager` runs at create (before
+The obstacle, and its exact boundary: `SetVersionedMetadataManager` runs at create (before
 `InitializeDuckLake`) and at load (after the migration), and for a class it does not know it
-**replaces the registered manager with a stock one** — but its first line is
-`if (version == V1_0) return;`. At format 1.0 a registered manager is never touched. (Discarding
-what the registry supplied is upstream's bug whether or not we exist — ducklake#1066's libSQL manager
-meets the same wall — and the fix is one line: leave a manager alone whose `GetVersionString()`
-already equals the requested version. Worth proposing, without urgency.)
+**replaces the registered manager with a stock one** — at format 1.1 only (`if (version == V1_0)
+return;` is its first line), and **only in the attach transaction**: every later transaction gets
+our manager from the registry again. And the migrations (`MigrateV10`, `MigrateV10Dev`) are called
+on our manager *before* the swap, so D1 is unaffected. What the swap costs us is precisely what our
+manager does during the attach itself — the collation probe and the shaping in `InitializeDuckLake`
+and `ProbeServerCapabilities`. (Discarding what the registry supplied is upstream's bug whether or
+not we exist — ducklake#1066's libSQL manager meets the same wall — and the fix is one line: leave a
+manager alone whose `GetVersionString()` already equals the requested version. Worth proposing,
+without urgency.)
 
-**So this bump pins the format to 1.0.** 1.1 is `1.1-dev1`: a development format that upstream
-changes under the same name and that re-migrates itself on every writable attach — not something to
-ship to users of a catalog on SQL Server, who get none of its additions (`min_is_exact`,
-`row_group_count`, `parent_schema_id`, view column tags) as a reason to come. What they get instead:
-an upgrade that is just a new version of the extension — every catalog 0.1.x created is at 1.0, and
-there is nothing to migrate.
+**So the manager stops depending on surviving the attach.** Everything it did at attach moves to the
+**first use** in a transaction that is ours, guarded by the stamp: one `mssql_scan_unsafe` of the
+shape stamp per process per catalog (today's attach reads it twice), and when the stamp is behind,
+`EnsureCatalogShape` through `RunServerSideOutsideTransaction`, exactly as now. The shaping was
+written for a catalog created by someone else's DDL — `NVARCHAR`, no keys, `key` unquoted — so a
+catalog the stock manager created is just the case it already handles. Then:
 
-What it takes, in the extension:
+- **1.0**: nothing changes; the swap never runs.
+- **1.1, create**: the stock manager creates the catalog with stock DDL through duckdb (the generic
+  manager could always create a catalog on SQL Server — specs/002, just keyless); our shaping brings
+  it to shape on first use. The collation probe moves with it.
+- **1.1, load**: the migration is ours (before the swap); the shaping, on first use.
+- the seven DDL virtuals are not needed, and **the submodule patch goes** — the hook and the
+  header-only template.
 
-1. **catalogs are created at 1.0.** The create path takes the version from
-   `ducklake_default_version` (otherwise `DUCKLAKE_LATEST_VERSION`), an option our own
-   `ducklake_duckdb_cpp_init` registers — the extension sets its default to `'1.0'` at load. A user
-   who overrides it to 1.1 explicitly gets a catalog created by the stock manager, keyless; that is
-   documented as unsupported, not defended against;
-2. **two refusals, both on our virtuals and both before the swap could run**: `MigrateV10`
-   (reached by `AUTOMATIC_MIGRATION TRUE`) throws "format 1.1 is not supported by this build", and
-   `LoadDuckLake` refuses a catalog whose version row is not `1.0`. No path reaches the swap silently;
-3. **the commit batch and its guard go back to 1.0**: the kinds table as on `main`, and
-   `MSSQL_DUCKLAKE_STRICT_BATCH` compares the catalog's version with **the build's own format
-   constant**, not `DUCKLAKE_LATEST_VERSION` — or the audit switches itself off (D4 is amended so).
+What it costs: the same work at a different moment — the first statement after an attach instead of
+the attach, which to a user reads as "the first SELECT was slow", and DDL issued from a read, which
+is unusual but no more so than from ATTACH. Races between processes are what they are today: the
+shaping is idempotent. Per-process state: a flag per catalog so the stamp is read once, not per
+transaction.
 
-What stays, unchanged by the format: the given-shape scans (D5), the typed bounds (D6), the
-attach probe and D3's stamp logic, TLS, the pushdown findings. What waits behind the constant: D1's
-migration, tested and ready for the day the constant moves to 1.1 — by which time either upstream has
-taken the one-line fix, or that line becomes the patch, then.
+What has to be verified, and it is one run: that the 2.0-line stock `InitializeDuckLake` creates a
+catalog through the 2.0-line mssql extension (its DML now goes through specs/080's writer). The
+integration suite answers that the moment the patch is dropped and the shaping moved. If it does not
+— the fallback is to pin new catalogs to 1.0 (`ducklake_default_version` defaulted by the extension,
+`MigrateV10` refusing) and keep everything else of this design.
 
-When 1.1 goes final (its version string stops being `-dev`), the per-attach re-run stops too, and
-the move is: the constant, the kinds table, and the migration test's expectations.
+The strict guard (D4) stays as on the branch: it speaks at `DUCKLAKE_LATEST_VERSION`, and a 1.0
+catalog takes the base path, correct and slower. `migrate_v11.test` stays as written — the upgrade
+path is supported, not refused.
 
 ## Enforcement & security
 
@@ -317,9 +323,9 @@ the move is: the constant, the kinds table, and the migration test's expectation
 
 ## Follow-ups
 
-- D9: the `ducklake_default_version` default, the two refusals, the kinds table and the strict
-  guard back to the build's format constant, the hook and the template dropped from the submodule,
-  `migrate_v11.test` asserting the refusal; the one-line upstream issue, without urgency.
+- D9: the shaping and the collation probe on first use behind the stamp, a per-process flag per
+  catalog, the hook and the template dropped from the submodule, the suite run on untouched ducklake
+  (the create-at-1.1 verification); the one-line upstream issue, without urgency.
 - D6's exact comparison per type, and a decision on HUGEINT's top of range.
 - D7 steps 1–4, in order; measure after each.
 - The file-column-stats CTE of specs/008 as a direct scan (D5 makes it possible).
