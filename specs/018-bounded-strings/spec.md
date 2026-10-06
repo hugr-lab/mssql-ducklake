@@ -106,6 +106,22 @@ since the catalog load reads the visible columns only (specs/015), a load moves 
 `ducklake_column`, which puts the expected saving near 1 s of 18 - inside this machine's noise
 (other workloads were running). The gain grows with the catalog: it is per row of every load.
 
+One catalog load, step by step (the DuckDB profiler's phases and operators; the remote scans the
+remainder), the same 300-table lake at the version with 200 tables, against postgres:
+
+| | postgres | mssql, bounded | mssql, `MAX` |
+| --- | ---: | ---: | ---: |
+| total | 19.7 ms | 26.6 | 30.6 |
+| parse + bind + optimizer + local operators | 14.8 | 16.0 | 15.3 |
+| remote scans (16) | 4.75 | 10.40 | 15.10 |
+| of which tables+columns (5 scans, ~8k rows) | 2.92 | 4.86 | 9.69 |
+
+Bounded strings take 4 ms off a load (13%), all of it in the tables+columns transfer - so the merge
+above saves ~1 s, which that measurement could not see. What remains against postgres is a fixed
+~0.4–0.5 ms per catalog scan, visible on the empty views and macros tables (three scans each: 1.35–
+1.93 ms against ~0.57), and ~0.6 ms of bind: the mssql extension's per-scan cost (sent there with
+these numbers, 2026-10-06).
+
 ### Found on the way: a leftover inlined table
 
 The inlined-data table is created outside the transaction (so the mssql extension can see it before
