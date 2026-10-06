@@ -170,6 +170,9 @@ def main() -> int:
                         help="read the bench table s<n%%10>.t<n> with the bench's filter, --rounds times, by statement")
     parser.add_argument("--flush-tables", type=int, default=0,
                         help="N tables with inlined rows, one flush of them, broken down by statement")
+    parser.add_argument("--merge-lake", type=int, default=0,
+                        help="one merge of adjacent files over the whole lake, broken down by statement "
+                             "(per table, for a lake of this many tables) - the bench's lake-wide merge")
     parser.add_argument("--first-inserts", type=int, default=0,
                         help="N fresh tables, then the FIRST (inlined, 1 row) insert into each - the bench's first_commits")
     parser.add_argument("--insert-commits", type=int, default=0,
@@ -248,6 +251,34 @@ def main() -> int:
         print(f"{'n/table':>8} {'ms/table':>9}  shape")
         for shp, (count, ms) in sorted(per.items(), key=lambda kv: -kv[1][1])[: args.top]:
             print(f"{count / n:>8.1f} {ms / n:>9.1f}  {shp[:140]}")
+        return 0
+
+    if args.merge_lake:
+        # The bench's partitioned_merge_adjacent phase when there are no partitioned tables: a merge
+        # over the whole lake (119 s for 1000 tables against postgres' 82). Read-mostly: on the
+        # bench's catalog after its run there is little left to merge, which is the bench's case too.
+        n = args.merge_lake
+        body = "SELECT count(*) AS merged FROM ducklake_merge_adjacent_files('lake');\n"
+        timed = run_arm(args.duckdb, build, dsn, "false", env, False, body)
+        start = next((i for i, (_, m) in enumerate(timed) if "ducklake_merge_adjacent_files" in m), None)
+        if start is None:
+            print("the merge did not run - see the error above")
+            return 0
+        per = collections.defaultdict(lambda: [0, 0])
+        for ms, m in timed[start:]:
+            e = per[shape(redact(m, dsn))]
+            e[0] += 1
+            e[1] += ms
+        if args.full:
+            print("--- the merge, in order (first 60 statements) ---")
+            for ms, m in timed[start:start + 60]:
+                print(f"{ms:>6}  {shape(redact(m, dsn))[:130]}")
+        total = sum(ms for ms, _ in timed[start:])
+        print(f"merge over the lake: {total} ms, {total / n:.1f} ms a table, "
+              f"{sum(c for c, _ in per.values()) / n:.1f} statements a table")
+        print(f"{'n/table':>8} {'ms/table':>9}  {'total ms':>9}  shape")
+        for shp, (count, ms) in sorted(per.items(), key=lambda kv: -kv[1][1])[: args.top]:
+            print(f"{count / n:>8.2f} {ms / n:>9.2f}  {ms:>9}  {shp[:140]}")
         return 0
 
     if args.first_inserts:

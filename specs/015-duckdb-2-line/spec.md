@@ -385,6 +385,7 @@ for a dev duckdb), with one call patched for our duckdb pin.
 | --- | ---: | ---: | ---: |
 | `create_tables` | 179.3 | 186.7 | 0.96 |
 | `first_commits` (inlined inserts) | 25.8 | 18.2 | **1.42** |
+| `first_commits`, after the inlined rows went into the run (mssql re-run, same bench) | 18.8 | 18.2 | 1.03 |
 | `second_commits` (file-backed) | 21.9 | 63.7 | 0.34 |
 | `flush_inlined` | 147.6 | 137.1 | 1.08 |
 | `merge_adjacent` | 9.3 | 30.1 | 0.31 |
@@ -393,6 +394,7 @@ for a dev duckdb), with one call patched for our duckdb pin.
 | `table_info` / `cleanup_files` / `deep_read_filtered` | 0.06 / 0.10 / 0.09 | 0.01 / 0.005 / 0.01 | **5–20** |
 | reattach phases | 0.4–0.7 | 0.9–1.3 | 0.35–0.72 |
 | **total** | **507.5** | **522.4** | **0.97** |
+| total, that re-run | 493.2 | 522.4 | 0.94 |
 
 **On this line the mssql backend is no longer the slower one overall.** The two largest phases,
 `create_tables` and `flush_inlined`, are at parity. Both are dominated by upstream's catalog loads,
@@ -418,7 +420,20 @@ Where postgres is still ahead:
    into a fresh table: **~21 → ~16.5 ms** steady. What is left of such a commit is DuckLake's: the
    snapshot read (3 ms), the table stats read (2–3), the inlined-table lookup (2), and the run with
    the commit itself;
-2. **a merge of adjacent files over the whole lake**, 37 s;
+2. **a merge of adjacent files over the whole lake**, 37 s — decomposed, and not ours. One merge
+   over the 1000-table lake costs 113.8 s, 9 statements a table, and **~91% of it is catalog loads**:
+   per table one full load at an old schema version (tables+columns 72 ms, the building after the
+   sort keys 17.6, views 5.8, macros 3.7, schemas 2.5, partitions 2.2 — ~104 ms of the 113.8). The
+   file list for the compaction itself is 7 ms, the schema-version lookup 1.4. The cause is in
+   DuckLake's compaction (`can_merge_into_latest`, `ducklake_compaction_functions.cpp:307-333`): a
+   file whose schema version is not the *lake's* current one has its table looked up at that
+   version, and that lookup loads the whole catalog as it was. Every table of the bench was created
+   by its own DDL commit, so every table has its own version and every table pays a load whose size
+   grows with the tables that existed then. postgres pays the same loads; the gap is the price of
+   each. A rewrite of the load cannot beat its transfer (above), and a partial catalog cannot be
+   returned (it is cached by schema version and serves time travel). The fix is upstream's: compare
+   the table's own schema version, or look up one table without the whole catalog. Filing it is the
+   owner's call;
 3. **the read path** — closed since. The postgres manager overrides `GenerateFileListQuery` and the
    file-column-stats CTE and runs the whole file-list query natively in postgres through one
    `postgres_query`; ours went through the catalog path piece by piece. Now ours does the same: the
