@@ -29,7 +29,8 @@ namespace duckdb {
 //! length), and a desynchronized connection cannot be recovered mid-commit. A batch produces no
 //! RETURNSTATUS. Revisit when that lands.
 static string CommitBatchSql(const string &schema, const string &collation, int64_t schema_version,
-                             const string &author, const string &commit_message, const string &commit_extra_info) {
+                             const string &author, const string &commit_message, const string &commit_extra_info,
+                             bool v1_1, bool merge_stats_on_server) {
 	// Named substitution, not positional formatting: this statement names the schema a dozen times,
 	// and a miscounted argument list is a runtime exception whose message is the SQL itself.
 	string sql = R"(
@@ -89,10 +90,10 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
     INSERT INTO {SCHEMA}.ducklake_data_file
         (data_file_id, table_id, begin_snapshot, end_snapshot, file_order, path, path_is_relative,
          file_format, record_count, file_size_bytes, footer_size, row_id_start, partition_id,
-         encryption_key, mapping_id, partial_max)
+         encryption_key, mapping_id, partial_max{V1_1_FILE_COLUMNS})
     SELECT f.data_file_id, s.table_id, @snapshot_id, NULL, s.file_order, s.path, s.path_is_relative,
            s.file_format, s.record_count, s.file_size_bytes, s.footer_size, r.row_id_start,
-           s.partition_id, s.encryption_key, s.mapping_id, s.partial_max
+           s.partition_id, s.encryption_key, s.mapping_id, s.partial_max{V1_1_FILE_VALUES}
     FROM #ducklake_staged_data_file s
     JOIN #ducklake_commit_files f ON f.local_id = s.data_file_id
     JOIN #ducklake_assigned_row_id r ON r.local_id = s.data_file_id;
@@ -113,16 +114,29 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
 
     INSERT INTO {SCHEMA}.ducklake_file_column_stats
         (data_file_id, table_id, column_id, column_size_bytes, value_count, null_count, min_value,
-         max_value, contains_nan, extra_stats)
+         max_value, contains_nan, extra_stats{V1_1_STATS_COLUMNS})
     SELECT f.data_file_id, s.table_id, s.column_id, s.column_size_bytes,
            CASE WHEN s.has_num_values = 1 THEN s.num_values END,
            CASE WHEN s.has_null_count = 1 THEN s.null_count END,
            CASE WHEN s.has_min = 1 THEN s.min_value END,
            CASE WHEN s.has_max = 1 THEN s.max_value END,
            CASE WHEN s.has_contains_nan = 1 THEN s.contains_nan END,
-           s.extra_stats
+           s.extra_stats{V1_1_STATS_VALUES}
     FROM #ducklake_staged_data_file_column_stats s
     JOIN #ducklake_commit_files f ON f.local_id = s.data_file_id;
+
+    -- {STATS_BEGIN}
+    -- Everything between these markers is the `server` merge (MSSQL_DUCKLAKE_STATS_MERGE=server,
+    -- specs/015 R5): the table totals and the per-column bounds, merged here in T-SQL. In the default
+    -- `client` mode it is cut, and DuckLake's own statements are sent instead.
+    --
+    -- The record counts before this commit adds to them: whether a table already had rows decides
+    -- whether a stored bound that is absent means "no values yet" (take the new one) or "unknown"
+    -- (it stays unknown) - DuckLakeColumnStats::FromGlobalStats, `bounds_unknown`.
+    DROP TABLE IF EXISTS #ducklake_pre_counts;
+    SELECT t.table_id, t.record_count INTO #ducklake_pre_counts
+    FROM {SCHEMA}.ducklake_table_stats t
+    WHERE t.table_id IN (SELECT table_id FROM #ducklake_staged_data_file);
 
     -- Table totals: a table this commit is the first to write gets a row, the rest are added to.
     -- next_row_id is monotonic - carried forward and advanced by what was inserted, never
@@ -143,84 +157,178 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
     WHEN NOT MATCHED THEN INSERT (table_id, record_count, next_row_id, file_size_bytes)
         VALUES (s.table_id, s.added_records, s.added_records, s.added_bytes);
 
-    -- Per-column totals: widen the range, and remember a null or a NaN once one appears.
-    --
-    -- The bounds are compared in the COLUMN's order, which for a numeric column is not the text
-    -- order its values are stored in: fifty partitions of 0..49 merged as text gave max '9', DuckDB
-    -- built a perfect-hash aggregate from that bound and met a value outside it. Only the numeric
-    -- families need a cast - an ISO date or timestamp, a boolean ('false' < 'true'), a string, a
-    -- blob and a uuid are already in DuckDB's order under the BIN2 collation. The type comes from
-    -- ducklake_column, whose rows a data-only commit's table already has.
-    --
-    -- A numeric value the cast cannot read - a HUGEINT past DECIMAL's range, a NaN, an infinity -
-    -- makes the bound unknown rather than a guess. DuckLake reads NULL as "no statistics" and prunes
-    -- nothing; a bound that is merely wrong prunes rows that should have been returned, which is the
-    -- one failure mode worth paying for.
+    -- Per-column totals, DuckLakeColumnStats::MergeStats in T-SQL. Its rules:
+    --   * a file whose values are all NULL (any_valid = 0) does not touch the bounds;
+    --   * a file with values but no min makes the table's min unknown, and unknown is sticky;
+    --   * a stored row with no bound at all is "no values yet" on an empty table and "unknown" on one
+    --     with rows;
+    --   * numerics and temporals compare as values, everything else as text; on a tie the bound is
+    --     exact only if both sides are.
+    -- Compared here by family, each exact for what it accepts and "unknown" for what it cannot read:
+    --   1  integers of any width and decimals: sign, then digits before the point, then the text -
+    --      exact for every value DuckDB prints, HUGEINT included, with no cast that could round;
+    --   2  float32 / float64: FLOAT (17 significant digits round-trip);
+    --   3  date, time, timestamp*: ISO text order under BIN2, for values printed as 4-digit years
+    --      (timestamptz only when it carries +00) - anything else is unknown;
+    --   4  timetz, interval: unknown;
+    --   0  strings, blobs, uuids, booleans ('false' < 'true'): the BIN2 text order, DuckDB's own.
+    DROP TABLE IF EXISTS #ducklake_bound_family;
+    SELECT DISTINCT s.table_id, s.column_id,
+           CASE WHEN c.column_type LIKE 'int%' OR c.column_type LIKE 'uint%' OR c.column_type LIKE 'decimal%' THEN 1
+                WHEN c.column_type IN ('float32', 'float64') THEN 2
+                WHEN c.column_type IN ('date', 'time', 'time_ns', 'timestamp', 'timestamp_us', 'timestamp_ms',
+                                       'timestamp_ns', 'timestamp_s', 'timestamptz', 'timestamptz_ns') THEN 3
+                WHEN c.column_type IN ('timetz', 'interval') THEN 4
+                ELSE 0 END AS family
+    INTO #ducklake_bound_family
+    FROM #ducklake_staged_data_file_column_stats s
+    LEFT JOIN {SCHEMA}.ducklake_column c
+           ON c.table_id = s.table_id AND c.column_id = s.column_id AND c.end_snapshot IS NULL;
+
+    -- every bound a merge chooses from: one per staged file that has values, and the stored one
+    DROP TABLE IF EXISTS #ducklake_bound_candidate;
+    CREATE TABLE #ducklake_bound_candidate(table_id BIGINT, column_id BIGINT, side CHAR(1), which CHAR(3),
+                                           v VARCHAR(MAX) COLLATE {COLLATION}, is_exact BIT);
+    INSERT INTO #ducklake_bound_candidate
+    SELECT s.table_id, s.column_id, 'n', 'min', s.min_value, s.min_is_exact
+    FROM #ducklake_staged_data_file_column_stats s WHERE s.any_valid = 1 AND s.has_min = 1
+    UNION ALL
+    SELECT s.table_id, s.column_id, 'n', 'max', s.max_value, s.max_is_exact
+    FROM #ducklake_staged_data_file_column_stats s WHERE s.any_valid = 1 AND s.has_max = 1
+    UNION ALL
+    SELECT t.table_id, t.column_id, 't', 'min', t.min_value, {STORED_MIN_EXACT}
+    FROM {SCHEMA}.ducklake_table_column_stats t JOIN #ducklake_bound_family f
+      ON f.table_id = t.table_id AND f.column_id = t.column_id WHERE t.min_value IS NOT NULL
+    UNION ALL
+    SELECT t.table_id, t.column_id, 't', 'max', t.max_value, {STORED_MAX_EXACT}
+    FROM {SCHEMA}.ducklake_table_column_stats t JOIN #ducklake_bound_family f
+      ON f.table_id = t.table_id AND f.column_id = t.column_id WHERE t.max_value IS NOT NULL;
+
+    -- the ordering key of each candidate, and whether its family can read it at all
+    DROP TABLE IF EXISTS #ducklake_bound_key;
+    SELECT b.table_id, b.column_id, b.side, b.which, b.v, b.is_exact, f.family,
+           CASE WHEN LEFT(b.v, 1) = '-' THEN 1 ELSE 0 END AS neg,
+           CHARINDEX('.', b.v + '.') - 1 AS ilen,
+           TRY_CAST(b.v AS FLOAT) AS fnum,
+           CASE f.family
+               WHEN 1 THEN CASE WHEN b.v NOT LIKE '%[^0-9.-]%' AND b.v LIKE '%[0-9]%' THEN 1 ELSE 0 END
+               WHEN 2 THEN CASE WHEN TRY_CAST(b.v AS FLOAT) IS NOT NULL THEN 1 ELSE 0 END
+               WHEN 3 THEN CASE WHEN (b.v LIKE '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]%'
+                                      OR b.v LIKE '[0-9][0-9]:[0-9][0-9]:[0-9][0-9]%')
+                                     AND (b.v NOT LIKE '%[+]%' OR b.v LIKE '%+00') THEN 1 ELSE 0 END
+               WHEN 4 THEN 0
+               ELSE 1 END AS readable
+    INTO #ducklake_bound_key
+    FROM #ducklake_bound_candidate b
+    JOIN #ducklake_bound_family f ON f.table_id = b.table_id AND f.column_id = b.column_id;
+
+    -- the winner per column and bound, in the column's order; its exactness is the AND over every
+    -- candidate that compares equal to it
+    DROP TABLE IF EXISTS #ducklake_bound_winner;
+    SELECT w.table_id, w.column_id, w.which, w.v, w.family, w.neg, w.ilen, w.fnum
+    INTO #ducklake_bound_winner
+    FROM (
+        SELECT k.*,
+               ROW_NUMBER() OVER (PARTITION BY k.table_id, k.column_id, k.which ORDER BY
+                   -- min: smallest first; max: the same keys reversed
+                   CASE WHEN k.family = 1 AND k.which = 'min' THEN k.neg END DESC,
+                   CASE WHEN k.family = 1 AND k.which = 'max' THEN k.neg END ASC,
+                   CASE WHEN k.family = 1 AND k.which = 'min' AND k.neg = 0 THEN k.ilen END ASC,
+                   CASE WHEN k.family = 1 AND k.which = 'min' AND k.neg = 1 THEN k.ilen END DESC,
+                   CASE WHEN k.family = 1 AND k.which = 'max' AND k.neg = 0 THEN k.ilen END DESC,
+                   CASE WHEN k.family = 1 AND k.which = 'max' AND k.neg = 1 THEN k.ilen END ASC,
+                   CASE WHEN k.family = 1 AND k.which = 'min' AND k.neg = 0 THEN k.v END ASC,
+                   CASE WHEN k.family = 1 AND k.which = 'min' AND k.neg = 1 THEN k.v END DESC,
+                   CASE WHEN k.family = 1 AND k.which = 'max' AND k.neg = 0 THEN k.v END DESC,
+                   CASE WHEN k.family = 1 AND k.which = 'max' AND k.neg = 1 THEN k.v END ASC,
+                   CASE WHEN k.family = 2 AND k.which = 'min' THEN k.fnum END ASC,
+                   CASE WHEN k.family = 2 AND k.which = 'max' THEN k.fnum END DESC,
+                   CASE WHEN k.family IN (0, 3) AND k.which = 'min' THEN k.v END ASC,
+                   CASE WHEN k.family IN (0, 3) AND k.which = 'max' THEN k.v END DESC
+               ) AS rn
+        FROM #ducklake_bound_key k
+    ) w
+    WHERE w.rn = 1;
+
+    -- per column: what the staged files say, and whether anything makes a bound unknown
+    DROP TABLE IF EXISTS #ducklake_bound_merged;
+    SELECT f.table_id, f.column_id,
+           (SELECT MAX(CASE WHEN s.has_null_count = 1 AND s.null_count > 0 THEN 1 ELSE 0 END)
+            FROM #ducklake_staged_data_file_column_stats s
+            WHERE s.table_id = f.table_id AND s.column_id = f.column_id) AS any_null,
+           (SELECT MAX(CASE WHEN s.has_contains_nan = 1 AND s.contains_nan = 1 THEN 1 ELSE 0 END)
+            FROM #ducklake_staged_data_file_column_stats s
+            WHERE s.table_id = f.table_id AND s.column_id = f.column_id) AS any_nan,
+           (SELECT COUNT(*) FROM #ducklake_staged_data_file_column_stats s
+            WHERE s.table_id = f.table_id AND s.column_id = f.column_id AND s.any_valid = 1) AS valid_files,
+           (SELECT MAX(CASE WHEN s.has_null_count = 1 THEN 0 ELSE 1 END)
+            FROM #ducklake_staged_data_file_column_stats s
+            WHERE s.table_id = f.table_id AND s.column_id = f.column_id) AS null_unknown,
+           (SELECT MAX(CASE WHEN s.has_contains_nan = 1 THEN 0 ELSE 1 END)
+            FROM #ducklake_staged_data_file_column_stats s
+            WHERE s.table_id = f.table_id AND s.column_id = f.column_id) AS nan_unknown,
+           -- unknown: a file with values but no bound, or a candidate its family cannot read
+           CASE WHEN EXISTS (SELECT 1 FROM #ducklake_staged_data_file_column_stats s
+                             WHERE s.table_id = f.table_id AND s.column_id = f.column_id
+                               AND s.any_valid = 1 AND s.has_min = 0)
+                  OR EXISTS (SELECT 1 FROM #ducklake_bound_key k WHERE k.table_id = f.table_id
+                               AND k.column_id = f.column_id AND k.which = 'min' AND k.readable = 0)
+                THEN 1 ELSE 0 END AS min_unknown,
+           CASE WHEN EXISTS (SELECT 1 FROM #ducklake_staged_data_file_column_stats s
+                             WHERE s.table_id = f.table_id AND s.column_id = f.column_id
+                               AND s.any_valid = 1 AND s.has_max = 0)
+                  OR EXISTS (SELECT 1 FROM #ducklake_bound_key k WHERE k.table_id = f.table_id
+                               AND k.column_id = f.column_id AND k.which = 'max' AND k.readable = 0)
+                THEN 1 ELSE 0 END AS max_unknown,
+           wmin.v AS min_value, wmax.v AS max_value,
+           (SELECT MIN(CAST(k.is_exact AS INT)) FROM #ducklake_bound_key k
+            WHERE k.table_id = f.table_id AND k.column_id = f.column_id AND k.which = 'min'
+              AND (CASE WHEN f.family = 2 THEN CASE WHEN k.fnum = wmin.fnum THEN 1 ELSE 0 END
+                        ELSE CASE WHEN k.v = wmin.v THEN 1 ELSE 0 END END) = 1) AS min_exact,
+           (SELECT MIN(CAST(k.is_exact AS INT)) FROM #ducklake_bound_key k
+            WHERE k.table_id = f.table_id AND k.column_id = f.column_id AND k.which = 'max'
+              AND (CASE WHEN f.family = 2 THEN CASE WHEN k.fnum = wmax.fnum THEN 1 ELSE 0 END
+                        ELSE CASE WHEN k.v = wmax.v THEN 1 ELSE 0 END END) = 1) AS max_exact
+    INTO #ducklake_bound_merged
+    FROM #ducklake_bound_family f
+    LEFT JOIN #ducklake_bound_winner wmin
+           ON wmin.table_id = f.table_id AND wmin.column_id = f.column_id AND wmin.which = 'min'
+    LEFT JOIN #ducklake_bound_winner wmax
+           ON wmax.table_id = f.table_id AND wmax.column_id = f.column_id AND wmax.which = 'max';
+
     MERGE {SCHEMA}.ducklake_table_column_stats AS t
     USING (
-        SELECT g.table_id, g.column_id, g.any_null, g.any_nan, g.is_numeric,
-               CASE WHEN g.unreadable = 0 THEN
-                   (SELECT TOP 1 m.min_value
-                    FROM #ducklake_staged_data_file_column_stats m
-                    WHERE m.table_id = g.table_id AND m.column_id = g.column_id AND m.has_min = 1
-                    ORDER BY CASE WHEN g.is_numeric = 1 THEN TRY_CAST(m.min_value AS DECIMAL(38, 10)) END ASC,
-                             CASE WHEN g.is_numeric = 0 THEN m.min_value COLLATE {COLLATION} END ASC)
-               END AS min_value,
-               CASE WHEN g.unreadable = 0 THEN
-                   (SELECT TOP 1 m.max_value
-                    FROM #ducklake_staged_data_file_column_stats m
-                    WHERE m.table_id = g.table_id AND m.column_id = g.column_id AND m.has_max = 1
-                    ORDER BY CASE WHEN g.is_numeric = 1 THEN TRY_CAST(m.max_value AS DECIMAL(38, 10)) END DESC,
-                             CASE WHEN g.is_numeric = 0 THEN m.max_value COLLATE {COLLATION} END DESC)
-               END AS max_value,
-               g.unreadable
-        FROM (
-            SELECT s.table_id, s.column_id,
-                   MAX(CASE WHEN s.has_null_count = 1 AND s.null_count > 0 THEN 1 ELSE 0 END) AS any_null,
-                   MAX(CASE WHEN s.has_contains_nan = 1 AND s.contains_nan = 1 THEN 1 ELSE 0 END) AS any_nan,
-                   MAX(CASE WHEN c.column_type LIKE 'int%' OR c.column_type LIKE 'uint%'
-                                 OR c.column_type LIKE 'decimal%' OR c.column_type LIKE 'numeric%'
-                                 OR c.column_type IN ('hugeint', 'uhugeint', 'float', 'double', 'real')
-                            THEN 1 ELSE 0 END) AS is_numeric,
-                   MAX(CASE WHEN (c.column_type LIKE 'int%' OR c.column_type LIKE 'uint%'
-                                  OR c.column_type LIKE 'decimal%' OR c.column_type LIKE 'numeric%'
-                                  OR c.column_type IN ('hugeint', 'uhugeint', 'float', 'double', 'real'))
-                                 AND ((s.has_min = 1 AND TRY_CAST(s.min_value AS DECIMAL(38, 10)) IS NULL)
-                                      OR (s.has_max = 1 AND TRY_CAST(s.max_value AS DECIMAL(38, 10)) IS NULL))
-                            THEN 1 ELSE 0 END) AS unreadable
-            FROM #ducklake_staged_data_file_column_stats s
-            LEFT JOIN {SCHEMA}.ducklake_column c
-                   ON c.table_id = s.table_id AND c.column_id = s.column_id AND c.end_snapshot IS NULL
-            GROUP BY s.table_id, s.column_id
-        ) g
+        SELECT m.*, CASE WHEN ISNULL(pc.record_count, 0) > 0 THEN 1 ELSE 0 END AS had_rows
+        FROM #ducklake_bound_merged m
+        LEFT JOIN #ducklake_pre_counts pc ON pc.table_id = m.table_id
     ) AS s ON t.table_id = s.table_id AND t.column_id = s.column_id
     WHEN MATCHED THEN UPDATE SET
-        contains_null = CASE WHEN t.contains_null = 1 OR s.any_null = 1 THEN 1 ELSE t.contains_null END,
-        contains_nan = CASE WHEN t.contains_nan = 1 OR s.any_nan = 1 THEN 1 ELSE t.contains_nan END,
+        -- a file without a null count or a NaN flag makes it unknown, and a stored NULL stays NULL
+        contains_null = CASE WHEN t.contains_null IS NULL OR s.null_unknown = 1 THEN NULL
+                             WHEN t.contains_null = 1 OR s.any_null = 1 THEN 1 ELSE 0 END,
+        contains_nan = CASE WHEN t.contains_nan IS NULL OR s.nan_unknown = 1 THEN NULL
+                            WHEN t.contains_nan = 1 OR s.any_nan = 1 THEN 1 ELSE 0 END,
+        -- the stored row is "valid" when it has a bound or extra stats; an invalid one on a table
+        -- with rows is unknown and stays so; otherwise the candidates above already include it
         min_value = CASE
-            WHEN s.unreadable = 1 THEN NULL
-            WHEN s.min_value IS NULL THEN t.min_value
-            WHEN t.min_value IS NULL THEN s.min_value
-            WHEN s.is_numeric = 0 THEN
-                CASE WHEN s.min_value COLLATE {COLLATION} < t.min_value COLLATE {COLLATION}
-                     THEN s.min_value ELSE t.min_value END
-            WHEN TRY_CAST(t.min_value AS DECIMAL(38, 10)) IS NULL THEN NULL
-            WHEN TRY_CAST(s.min_value AS DECIMAL(38, 10)) < TRY_CAST(t.min_value AS DECIMAL(38, 10))
-                 THEN s.min_value
-            ELSE t.min_value END,
+            WHEN s.valid_files = 0 THEN t.min_value
+            WHEN t.min_value IS NULL AND t.max_value IS NULL AND t.extra_stats IS NULL AND s.had_rows = 1 THEN NULL
+            WHEN t.min_value IS NULL AND (t.max_value IS NOT NULL OR t.extra_stats IS NOT NULL) THEN NULL
+            WHEN s.min_unknown = 1 THEN NULL
+            ELSE s.min_value END,
         max_value = CASE
-            WHEN s.unreadable = 1 THEN NULL
-            WHEN s.max_value IS NULL THEN t.max_value
-            WHEN t.max_value IS NULL THEN s.max_value
-            WHEN s.is_numeric = 0 THEN
-                CASE WHEN s.max_value COLLATE {COLLATION} > t.max_value COLLATE {COLLATION}
-                     THEN s.max_value ELSE t.max_value END
-            WHEN TRY_CAST(t.max_value AS DECIMAL(38, 10)) IS NULL THEN NULL
-            WHEN TRY_CAST(s.max_value AS DECIMAL(38, 10)) > TRY_CAST(t.max_value AS DECIMAL(38, 10))
-                 THEN s.max_value
-            ELSE t.max_value END
-    WHEN NOT MATCHED THEN INSERT (table_id, column_id, contains_null, contains_nan, min_value, max_value, extra_stats)
-        VALUES (s.table_id, s.column_id, s.any_null, s.any_nan, s.min_value, s.max_value, NULL);
+            WHEN s.valid_files = 0 THEN t.max_value
+            WHEN t.min_value IS NULL AND t.max_value IS NULL AND t.extra_stats IS NULL AND s.had_rows = 1 THEN NULL
+            WHEN t.max_value IS NULL AND (t.min_value IS NOT NULL OR t.extra_stats IS NOT NULL) THEN NULL
+            WHEN s.max_unknown = 1 THEN NULL
+            ELSE s.max_value END{STATS_EXACT_SET}
+    WHEN NOT MATCHED THEN INSERT (table_id, column_id, contains_null, contains_nan, min_value, max_value,
+                                  extra_stats{V1_1_STATS_COLUMNS_TABLE})
+        VALUES (s.table_id, s.column_id, CASE WHEN s.null_unknown = 1 THEN NULL ELSE s.any_null END,
+                CASE WHEN s.nan_unknown = 1 THEN NULL ELSE s.any_nan END,
+                CASE WHEN s.min_unknown = 1 THEN NULL ELSE s.min_value END,
+                CASE WHEN s.max_unknown = 1 THEN NULL ELSE s.max_value END, NULL{STATS_EXACT_INSERT});
+    -- {STATS_END}
 
     DECLARE @added_files BIGINT = (SELECT COUNT(*) FROM #ducklake_staged_data_file);
     INSERT INTO {SCHEMA}.ducklake_snapshot (snapshot_id, snapshot_time, schema_version, next_catalog_id, next_file_id)
@@ -237,6 +345,44 @@ static string CommitBatchSql(const string &schema, const string &collation, int6
     INSERT INTO #ducklake_commit_result (snapshot_id, schema_version, had_flushes)
     VALUES (@snapshot_id, @schema_ver, 0);
 )";
+	// The columns format 1.1 adds to what the apply writes. Without them a 1.1 catalog got NULL where
+	// the client loop writes values - row_group_count on the file, exactness on its stats - and the
+	// two paths stopped producing the same catalog.
+	sql = StringUtil::Replace(sql, "{V1_1_FILE_COLUMNS}", v1_1 ? ", row_group_count" : "");
+	sql = StringUtil::Replace(sql, "{V1_1_FILE_VALUES}", v1_1 ? ", s.row_group_count" : "");
+	sql = StringUtil::Replace(sql, "{V1_1_STATS_COLUMNS}", v1_1 ? ", min_is_exact, max_is_exact" : "");
+	sql = StringUtil::Replace(sql, "{V1_1_STATS_VALUES}",
+	                          v1_1 ? ",\n           CASE WHEN s.has_min = 1 THEN s.min_is_exact END,"
+	                                 "\n           CASE WHEN s.has_max = 1 THEN s.max_is_exact END"
+	                               : "");
+	sql = StringUtil::Replace(sql, "{V1_1_STATS_COLUMNS_TABLE}", v1_1 ? ", min_is_exact, max_is_exact" : "");
+	sql = StringUtil::Replace(sql, "{STORED_MIN_EXACT}", v1_1 ? "t.min_is_exact" : "CAST(NULL AS BIT)");
+	sql = StringUtil::Replace(sql, "{STORED_MAX_EXACT}", v1_1 ? "t.max_is_exact" : "CAST(NULL AS BIT)");
+	sql = StringUtil::Replace(
+	    sql, "{STATS_EXACT_SET}",
+	    v1_1 ? ",\n        min_is_exact = CASE WHEN s.valid_files = 0 THEN t.min_is_exact "
+	           "WHEN s.min_unknown = 1 OR s.min_value IS NULL "
+	           "OR (t.min_value IS NULL AND (t.max_value IS NOT NULL OR t.extra_stats IS NOT NULL)) "
+	           "OR (t.min_value IS NULL AND t.max_value IS NULL AND t.extra_stats IS NULL "
+	           "AND s.had_rows = 1) THEN NULL ELSE s.min_exact END,"
+	           "\n        max_is_exact = CASE WHEN s.valid_files = 0 THEN t.max_is_exact "
+	           "WHEN s.max_unknown = 1 OR s.max_value IS NULL "
+	           "OR (t.max_value IS NULL AND (t.min_value IS NOT NULL OR t.extra_stats IS NOT NULL)) "
+	           "OR (t.min_value IS NULL AND t.max_value IS NULL AND t.extra_stats IS NULL "
+	           "AND s.had_rows = 1) THEN NULL ELSE s.max_exact END"
+	         : "");
+	sql =
+	    StringUtil::Replace(sql, "{STATS_EXACT_INSERT}",
+	                        v1_1 ? ", CASE WHEN s.min_unknown = 1 OR s.min_value IS NULL THEN NULL ELSE s.min_exact END"
+	                               ", CASE WHEN s.max_unknown = 1 OR s.max_value IS NULL THEN NULL ELSE s.max_exact END"
+	                             : "");
+	if (!merge_stats_on_server) {
+		// the client merge: DuckLake's own statements are sent after this batch instead
+		auto begin = sql.find("    -- {STATS_BEGIN}");
+		auto end = sql.find("    -- {STATS_END}\n");
+		D_ASSERT(begin != string::npos && end != string::npos);
+		sql.erase(begin, end + string("    -- {STATS_END}\n").size() - begin);
+	}
 	sql = StringUtil::Replace(sql, "{SCHEMA}", schema);
 	sql = StringUtil::Replace(sql, "{COLLATION}", collation);
 	sql = StringUtil::Replace(sql, "{SCHEMA_VERSION}", to_string(schema_version));
@@ -360,6 +506,51 @@ bool MSSQLMetadataManager::CanSkipSnapshotFetch(const TransactionChangeInformati
 	       IsDataFilesOnlyCommit(changes);
 }
 
+//! The client merge (specs/015 R5, the default). Under the apply's lock, the stored stats of every
+//! table this commit writes are read through DuckLake's own path, merged with DuckLake's own
+//! MergeFileStats, and turned into DuckLake's own statements - exactly what the client loop writes
+//! for the same commit, because it is the same code. One round trip for the lock (it also yields the
+//! latest snapshot the stats are read at), and the stats reads DuckLake would make anyway.
+string MSSQLMetadataManager::ClientMergedStatsSql(DuckLakeTransaction &flush_transaction, DuckLakeSnapshot &locked) {
+	auto &connection = flush_transaction.GetConnection();
+	auto lock = connection.Query(StringUtil::Format(
+	    "SELECT snapshot_id, schema_version, next_catalog_id, next_file_id FROM mssql_scan_unsafe(%s, "
+	    "'SELECT TOP 1 snapshot_id, schema_version, next_catalog_id, next_file_id FROM %s.ducklake_snapshot "
+	    "WITH (UPDLOCK, HOLDLOCK) ORDER BY snapshot_id DESC', columns := {'snapshot_id': 'BIGINT', "
+	    "'schema_version': 'BIGINT', 'next_catalog_id': 'BIGINT', 'next_file_id': 'BIGINT'})",
+	    CatalogLiteral(), StringUtil::Replace(SchemaIdentifier(), "'", "''")));
+	if (lock->HasError()) {
+		lock->GetErrorObject().Throw("The server-side DuckLake commit could not lock the catalog: ");
+	}
+	auto row = lock->Fetch();
+	if (!row || row->size() == 0) {
+		throw IOException("The server-side DuckLake commit found no snapshot to build on");
+	}
+	locked = DuckLakeSnapshot(row->GetValue(0, 0).GetValue<idx_t>(), row->GetValue(1, 0).GetValue<idx_t>(),
+	                          row->GetValue(2, 0).GetValue<idx_t>(), row->GetValue(3, 0).GetValue<idx_t>());
+	auto &catalog = flush_transaction.GetCatalog();
+	string sql;
+	for (auto &entry : flush_transaction.GetLocalChanges().Changes()) {
+		auto &changes = entry.GetTableChanges();
+		if (changes.new_data_files.empty()) {
+			continue;
+		}
+		auto table_id = entry.GetTableIndex();
+		DuckLakeNewGlobalStats new_globals;
+		auto current = catalog.GetTableStats(flush_transaction, locked, table_id);
+		if (current) {
+			new_globals.stats = *current;
+			new_globals.initialized = true;
+		}
+		for (auto &file : changes.new_data_files) {
+			new_globals.stats.MergeFileStats(file);
+		}
+		sql += DuckLakeMetadataManager::UpdateGlobalTableStatsSql(
+		    DuckLakeTransaction::ConvertNewGlobalStats(table_id, new_globals), catalog.SupportsV1_1Metadata());
+	}
+	return sql;
+}
+
 void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_transaction,
                                                   DuckLakeSnapshot transaction_snapshot,
                                                   const TransactionChangeInformation &transaction_changes,
@@ -390,6 +581,15 @@ void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_tra
 
 	auto &commit_info = flush_transaction.GetCommitInfo();
 	auto &connection = flush_transaction.GetConnection();
+	const bool merge_on_server = StatsMergeOnServer();
+	// The client merge reads the stored stats and merges them here, so it has to read them as the
+	// apply will find them: the apply's own lock, taken first, on the same pinned connection, holds
+	// every other commit off until this transaction ends.
+	string client_stats_sql;
+	DuckLakeSnapshot locked_snapshot;
+	if (!merge_on_server) {
+		client_stats_sql = ClientMergedStatsSql(flush_transaction, locked_snapshot);
+	}
 	const int64_t schema_version = transaction_snapshot.snapshot_id != DConstants::INVALID_INDEX
 	                                   ? static_cast<int64_t>(transaction_snapshot.schema_version)
 	                                   : -1;
@@ -397,16 +597,24 @@ void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_tra
 	// rather than a result set, and the values are read back from that table afterwards.
 	auto call = StringUtil::Format(
 	    "SELECT mssql_exec(%s, %s)", CatalogLiteral(),
-	    SQLString(
-	        CommitBatchSql(SchemaIdentifier(), VARCHAR_COLLATION, schema_version,
-	                       commit_info.author.IsNull() ? "" : commit_info.author.ToString(),
-	                       commit_info.commit_message.IsNull() ? "" : commit_info.commit_message.ToString(),
-	                       commit_info.commit_extra_info.IsNull() ? "" : commit_info.commit_extra_info.ToString())));
+	    SQLString(CommitBatchSql(SchemaIdentifier(), VARCHAR_COLLATION, schema_version,
+	                             commit_info.author.IsNull() ? "" : commit_info.author.ToString(),
+	                             commit_info.commit_message.IsNull() ? "" : commit_info.commit_message.ToString(),
+	                             commit_info.commit_extra_info.IsNull() ? "" : commit_info.commit_extra_info.ToString(),
+	                             flush_transaction.GetCatalog().SupportsV1_1Metadata(), merge_on_server)));
 	auto applied = connection.Query(call);
 	// No fallback from here on: the procedure writes inside this transaction, so the client loop
 	// cannot start over in it. Everything that chooses between the two paths happens before the call.
 	if (applied->HasError()) {
 		applied->GetErrorObject().Throw("The server-side DuckLake commit failed: ");
+	}
+	// After the apply, not before: the apply hands out row ids from the stored next_row_id, and
+	// these statements move it.
+	if (!client_stats_sql.empty()) {
+		auto written = Execute(locked_snapshot, client_stats_sql);
+		if (written->HasError()) {
+			written->GetErrorObject().Throw("The server-side DuckLake commit could not write its statistics: ");
+		}
 	}
 	auto result = connection.Query(
 	    StringUtil::Format("SELECT snapshot_id, schema_version, had_flushes FROM mssql_scan_unsafe(%s, "

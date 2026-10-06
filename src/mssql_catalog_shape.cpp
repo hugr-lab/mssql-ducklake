@@ -122,19 +122,21 @@ void MSSQLMetadataManager::MigrateToV1_1Dev1() {
 	    {"ducklake_table_column_stats", "min_is_exact BIT"}, {"ducklake_table_column_stats", "max_is_exact BIT"},
 	    {"ducklake_schema", "parent_schema_id BIGINT"},
 	};
-	string ddl;
+	// @changed records whether this run added anything. A catalog created at 1.1 already has it all,
+	// and its first attach would otherwise pay a whole re-shaping for nothing (specs/015 R3).
+	string ddl = "DECLARE @changed BIT = 0;\n";
 	for (auto &entry : added_columns) {
 		auto column = StringUtil::Split(entry.second, ' ')[0];
 		ddl += StringUtil::Format("IF COL_LENGTH(QUOTENAME(%s) + '.%s', '%s') IS NULL "
-		                          "ALTER TABLE %s.%s ADD %s;\n",
+		                          "BEGIN ALTER TABLE %s.%s ADD %s; SET @changed = 1; END;\n",
 		                          schema_literal, entry.first, column, schema, entry.first, entry.second);
 	}
 	// the table 1.1 adds - with our VARCHAR collation, like every other string column in the catalog,
 	// and `key` quoted because it is a T-SQL keyword
 	ddl += StringUtil::Format("IF OBJECT_ID(QUOTENAME(%s) + '.ducklake_view_column_tag') IS NULL "
-	                          "CREATE TABLE %s.ducklake_view_column_tag(view_id BIGINT, "
+	                          "BEGIN CREATE TABLE %s.ducklake_view_column_tag(view_id BIGINT, "
 	                          "column_name VARCHAR(MAX) COLLATE %s, begin_snapshot BIGINT, end_snapshot BIGINT, "
-	                          "[key] VARCHAR(MAX) COLLATE %s, value VARCHAR(MAX) COLLATE %s);\n",
+	                          "[key] VARCHAR(MAX) COLLATE %s, value VARCHAR(MAX) COLLATE %s); SET @changed = 1; END;\n",
 	                          schema_literal, schema, VARCHAR_COLLATION, VARCHAR_COLLATION, VARCHAR_COLLATION);
 	// the value is named as well as the key: this runs on a 1.0 or an already-migrated catalog and
 	// nothing else, so a stray call cannot relabel a catalog of some later format as this one
@@ -151,13 +153,21 @@ void MSSQLMetadataManager::MigrateToV1_1Dev1() {
 	    "@level1type = N'TABLE', @level1name = N'ducklake_metadata';\n",
 	    schema_literal, MIGRATION_MARKER_PROPERTY, MIGRATION_MARKER_PROPERTY, MIGRATION_MARKER, schema_literal,
 	    MIGRATION_MARKER_PROPERTY, MIGRATION_MARKER, schema_literal);
+	// what this run added has not been keyed or collated yet: the stamp goes, only then
+	ddl += StringUtil::Format(
+	    "IF @changed = 1 AND EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 1 AND major_id = "
+	    "OBJECT_ID(QUOTENAME(%s) + '.ducklake_metadata') AND minor_id = 0 AND name = '%s') "
+	    "EXEC sp_dropextendedproperty @name = N'%s', @level0type = N'SCHEMA', @level0name = %s, "
+	    "@level1type = N'TABLE', @level1name = N'ducklake_metadata';\n",
+	    schema_literal, SHAPE_VERSION_PROPERTY, SHAPE_VERSION_PROPERTY, schema_literal);
 
 	RunServerSideOutsideTransaction(ddl, "Failed to migrate the DuckLake catalog to v1.1-dev1: ");
-	// The catalog now holds a table and columns no shaping has keyed. The migration runs on this
-	// manager in the attach transaction, before DuckLake swaps it for a stock one (specs/015 R1), so
-	// it shapes its own result here rather than leaving it to a later attach - a stamp that was
-	// already current would otherwise never send the shaping back.
-	EnsureCatalogShape();
+	// The migration runs on this manager in the attach transaction, before DuckLake swaps it for a
+	// stock one (specs/015 R1), so it shapes its own result here rather than leaving it to a later
+	// attach - and only when the run added something, which the stamp now says.
+	if (!ReadCatalogMarkers().shape_current) {
+		EnsureCatalogShape();
+	}
 }
 
 //! Format 1.1 prefixes the metadata columns of the inlined DATA tables with `_ducklake_` - those

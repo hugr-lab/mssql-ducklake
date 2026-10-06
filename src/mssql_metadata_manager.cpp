@@ -1,5 +1,6 @@
 #include "mssql_metadata_manager.hpp"
 #include "mssql_metadata_internal.hpp"
+#include "duckdb/storage/object_cache.hpp"
 
 #include "common/ducklake_types.hpp"
 #include "common/ducklake_util.hpp"

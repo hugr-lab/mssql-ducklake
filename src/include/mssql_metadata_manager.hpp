@@ -106,6 +106,8 @@ public:
 	unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string &query) override;
 
 	bool CanSkipSnapshotFetch(const TransactionChangeInformation &changes) const override;
+	//! The client merge's statistics for the commit being applied, read under the apply's lock.
+	string ClientMergedStatsSql(DuckLakeTransaction &flush_transaction, DuckLakeSnapshot &locked);
 	void FlushChangesServerSide(DuckLakeTransaction &transaction, DuckLakeSnapshot transaction_snapshot,
 	                            const TransactionChangeInformation &transaction_changes,
 	                            const DuckLakeRetryConfig &retry_config) override;
