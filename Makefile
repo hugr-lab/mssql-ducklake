@@ -151,6 +151,16 @@ test-concurrent:
 	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
 	python3 scripts/bench/concurrent_writers.py $(CONCURRENT_ARGS)
 
+.PHONY: bench-concurrent
+# Many writers and readers through ONE DuckDB, a connection per thread (specs/016): the shape the
+# serial scale bench cannot show. Needs both servers, like bench-scale.
+#   make bench-concurrent CONC_ARGS='--backends mssql --threads 1,4,16'
+bench-concurrent: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
+bench-concurrent: export MSSQL_DUCKLAKE_PG_DSN := $(MSSQL_DUCKLAKE_PG_DSN)
+bench-concurrent:
+	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
+	python3 scripts/bench/concurrent_bench.py $(CONC_ARGS)
+
 .PHONY: test-integration-fast-path
 # The same suite with phase 2's server-side apply armed (specs/005). It is off by default, so
 # nothing else reaches it - and the row-id bug that cost spec 005 a session was invisible to the
