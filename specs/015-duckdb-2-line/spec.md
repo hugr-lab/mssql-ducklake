@@ -10,8 +10,10 @@
 The bump to the DuckDB 2.0 line brings three things at once: DuckLake's format `1.1-dev1` (new
 columns, a new table, prefixed inlined-table columns, and a migration that re-runs on every
 writable attach), the mssql extension's 2.0 line (TLS verification, the remote-pushdown rewriter of
-specs 079/080, and spec 081's given-shape scans), and a DuckLake that no longer lets a third-party
-manager be registered without a patch. The reconnaissance branch ported the manager through all
+specs 079/080, and spec 081's given-shape scans), and a DuckLake that discards a registered
+third-party manager whenever a catalog's format is 1.1 — which is why **this bump pins the format
+to 1.0** (D9): no patch, no migration, and every catalog a release of ours created keeps working
+unchanged. The reconnaissance branch ported the manager through all
 three, and found and fixed four defects of ours on the way — two of them release-level (the format
 migration could not run on SQL Server at all; the server-side commit wrote wrong statistics).
 
@@ -107,9 +109,9 @@ own `reattach` phase: **0.28 s**, against 4.45 / 2.77 before.
 The commit batch's kinds table (specs/014) describes this build's format. A catalog left at 1.0
 writes tuples of other widths; the rewrite declines them by construction and the base path carries
 them — correct, just not in one round trip. `MSSQL_DUCKLAKE_STRICT_BATCH` now only errors when the
-catalog is at `DUCKLAKE_LATEST_VERSION`. No dual-format batch: a 1.0 catalog is one to migrate, not
-one to optimise for. The side effect is the re-audit trigger the vendoring rule asks for — at the
-next ducklake bump LATEST moves ahead of the table and the suite starts naming statements.
+catalog is at the build's format. On the branch that is `DUCKLAKE_LATEST_VERSION`; with D9 it has to
+be **the build's own constant (1.0)**, or pinning the format would switch the audit off. No
+dual-format batch: a catalog at any other format is one to refuse (D9), not one to optimise for.
 
 Verified the guard still fires: a kinds entry removed, `write_shapes.test` named the statement.
 
@@ -217,16 +219,14 @@ The transition, in the order the measurements impose:
 | piece | on the branch | before merge |
 | --- | --- | --- |
 | duckdb | the 2.0 line | a released tag |
-| ducklake | main, **patched** — today a 60-line hook (`CreateVersionedManager`) plus a header-only `DuckLakeMetadataManagerV1_1` so a third-party manager survives `SetVersionedMetadataManager` | D9: the manager is natively 1.1 and the patch shrinks to one line, which is upstream's bug to fix |
+| ducklake | main, **patched** on the branch — a 60-line hook (`CreateVersionedManager`) plus a header-only `DuckLakeMetadataManagerV1_1` so a third-party manager survives `SetVersionedMetadataManager` | **no patch**: D9 pins the format to 1.0, where the swap never runs; the hook and the template are dropped |
 | mssql | **local** `a71c57c` (spec 081 2/n on top of 998660e, the pushdown fix) | a pushed ref; 081 becomes its own PR after #406 |
 | `MSSQL_DUCKLAKE_TEST_DSN` | `TrustServerCertificate=yes` added by the Makefile — mssql specs/074 refuses an unverifiable certificate | stays |
 | `CMakeLists.txt` | the new duckdb's `format.py` wants it at 80 columns | one reformat commit |
 | `make tidy-check` | ci-tools' pattern `src/.*/` matches nothing in a flat `src/`; the code-quality job has passed vacuously since the repository started | the pattern without the slash, validated in CI |
 | `make test-integration-fast-path` | not in CI, which is how D6's bug survived | in CI |
 
-### D9 — the manager is natively 1.1, and registration needs nothing from upstream but one line
-
-Format 1.0 is not supported by the new version. That decides the registration question.
+### D9 — the format is pinned to 1.0, which makes the submodule patch unnecessary
 
 How the 2.0-line ducklake works: a manager is created **per transaction** (`DuckLakeTransaction`'s
 constructor calls `DuckLakeMetadataManager::Create`, the registry by `MetadataType()`), and the
@@ -234,34 +234,44 @@ factory does not take a version — rightly, the version belongs to the catalog.
 behaviour (the inlined-table column prefix, the exactness columns, the read queries) is driven from
 `catalog.SupportsV1_1Metadata()` at 28 sites, never from the manager's class. The class matters for
 exactly **seven virtuals**: the six catalog DDL statements and `GetVersionString()` (the base says
-`1.0`), used only when a catalog is created. `DuckLakeMetadataManagerV1_1<Base>` exists so the three
-built-ins get those seven without being edited.
+`1.0`), used only when a catalog is created.
 
-The obstacle is one function. `SetVersionedMetadataManager` runs at create (before
+The obstacle, and its boundary: `SetVersionedMetadataManager` runs at create (before
 `InitializeDuckLake`) and at load (after the migration), and for a class it does not know it
-**replaces the registered manager with a stock one** — so our `InitializeDuckLake` (collation probe,
-shaping) never runs at create, and `ProbeServerCapabilities` (our shaping) runs on the stock manager
-at load. Upstream's own comment ("re-fetch the metadata manager here — … may have swapped it out",
-`ducklake_initializer.cpp:126`) says the swap is known. Discarding what the registry supplied is a
-bug whether or not we exist, and ducklake#1066's libSQL manager meets the same wall.
+**replaces the registered manager with a stock one** — but its first line is
+`if (version == V1_0) return;`. At format 1.0 a registered manager is never touched. (Discarding
+what the registry supplied is upstream's bug whether or not we exist — ducklake#1066's libSQL manager
+meets the same wall — and the fix is one line: leave a manager alone whose `GetVersionString()`
+already equals the requested version. Worth proposing, without urgency.)
 
-So:
+**So this bump pins the format to 1.0.** 1.1 is `1.1-dev1`: a development format that upstream
+changes under the same name and that re-migrates itself on every writable attach — not something to
+ship to users of a catalog on SQL Server, who get none of its additions (`min_is_exact`,
+`row_group_count`, `parent_schema_id`, view column tags) as a reason to come. What they get instead:
+an upgrade that is just a new version of the extension — every catalog 0.1.x created is at 1.0, and
+there is nothing to migrate.
 
-1. **registration is unchanged**: `DuckLakeMetadataManager::Register("mssql", create)`;
-2. **`MSSQLMetadataManager` overrides the seven itself** and answers `1.1-dev1`. No template, no
-   hook; the implementation is entirely in the extension, upstream contributes the header. And
-   `InitializeDuckLake` can emit our own DDL — keys, BIN2 `VARCHAR`s, `[key]` — rather than stock DDL
-   followed by `ALTER COLUMN`, which removes the first-attach rewrite specs/006 D4 measured;
-3. **a 1.0 catalog is refused** at attach with the message to use `AUTOMATIC_MIGRATION TRUE`.
-   DuckLake's dispatch would otherwise let it run as 1.0 (the target resolves to the catalog's own
-   version), and "not supported" has to mean a clear refusal, not a path that works by accident;
-4. **upstream needs one line**: `SetVersionedMetadataManager` leaves a manager alone whose
-   `GetVersionString()` already equals the requested version — symmetrical with its existing
-   `if (version == V1_0) return;` — and never replaces an unknown class with a stock one. Until it
-   lands that line is the whole submodule patch; the hook and the header-only template go.
+What it takes, in the extension:
 
-Filing (4) upstream is a decision for the owner (third-party repository); the issue is one diff line
-and the same need as #1066.
+1. **catalogs are created at 1.0.** The create path takes the version from
+   `ducklake_default_version` (otherwise `DUCKLAKE_LATEST_VERSION`), an option our own
+   `ducklake_duckdb_cpp_init` registers — the extension sets its default to `'1.0'` at load. A user
+   who overrides it to 1.1 explicitly gets a catalog created by the stock manager, keyless; that is
+   documented as unsupported, not defended against;
+2. **two refusals, both on our virtuals and both before the swap could run**: `MigrateV10`
+   (reached by `AUTOMATIC_MIGRATION TRUE`) throws "format 1.1 is not supported by this build", and
+   `LoadDuckLake` refuses a catalog whose version row is not `1.0`. No path reaches the swap silently;
+3. **the commit batch and its guard go back to 1.0**: the kinds table as on `main`, and
+   `MSSQL_DUCKLAKE_STRICT_BATCH` compares the catalog's version with **the build's own format
+   constant**, not `DUCKLAKE_LATEST_VERSION` — or the audit switches itself off (D4 is amended so).
+
+What stays, unchanged by the format: the given-shape scans (D5), the typed bounds (D6), the
+attach probe and D3's stamp logic, TLS, the pushdown findings. What waits behind the constant: D1's
+migration, tested and ready for the day the constant moves to 1.1 — by which time either upstream has
+taken the one-line fix, or that line becomes the patch, then.
+
+When 1.1 goes final (its version string stops being `-dev`), the per-attach re-run stops too, and
+the move is: the constant, the kinds table, and the migration test's expectations.
 
 ## Enforcement & security
 
@@ -307,8 +317,9 @@ and the same need as #1066.
 
 ## Follow-ups
 
-- D9: the seven overrides, the 1.0 refusal, the one-line upstream issue (needs the go-ahead), and
-  dropping the hook and the header-only template from the submodule patch.
+- D9: the `ducklake_default_version` default, the two refusals, the kinds table and the strict
+  guard back to the build's format constant, the hook and the template dropped from the submodule,
+  `migrate_v11.test` asserting the refusal; the one-line upstream issue, without urgency.
 - D6's exact comparison per type, and a decision on HUGEINT's top of range.
 - D7 steps 1–4, in order; measure after each.
 - The file-column-stats CTE of specs/008 as a direct scan (D5 makes it possible).
