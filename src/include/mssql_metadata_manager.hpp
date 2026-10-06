@@ -218,6 +218,11 @@ private:
 	//! instead of dropping the whole schema's metadata. Empty means "we do not know", and the clear
 	//! falls back to the schema.
 	vector<string> tables_pending_cache_refresh;
+	//! Of those, the ones already refreshed right after we created them (both creation sites must,
+	//! for a commit that creates a table and writes into it). The clear at the end of the commit names
+	//! them only so it does not fall back to the whole schema; refreshing them again is a wasted round
+	//! trip per DDL commit, so it skips them.
+	unordered_set<string> tables_already_refreshed;
 	//! Tables whose inlined-deletion table THIS transaction created. The catalog-level "exists"
 	//! cache is permanent, and a create can still roll back - so the read-path probe never records
 	//! "exists" for one of these. See GetInlinedDeletionTableName.

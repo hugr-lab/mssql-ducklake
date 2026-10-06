@@ -186,11 +186,15 @@ void MSSQLMetadataManager::ClearCache() {
 		calls.push_back(StringUtil::Format("SELECT mssql_invalidate_cache(%s, %s)", CatalogLiteral(), schema));
 	} else {
 		for (auto &table_name : tables_pending_cache_refresh) {
+			if (tables_already_refreshed.count(table_name)) {
+				continue;
+			}
 			calls.push_back(StringUtil::Format("SELECT mssql_invalidate_cache(%s, %s, %s)", CatalogLiteral(), schema,
 			                                   DuckLakeUtil::SQLLiteralToString(table_name)));
 		}
 	}
 	tables_pending_cache_refresh.clear();
+	tables_already_refreshed.clear();
 	for (auto &call : calls) {
 		auto result = connection.Query(call);
 		if (result->HasError()) {
@@ -347,9 +351,11 @@ string MSSQLMetadataManager::GetInlinedTableQueries(DuckLakeSnapshot commit_snap
 	// transaction (see RunServerSideOutsideTransaction), so it is committed and holds no lock that
 	// the extension's metadata read - which takes its own connection - could wait on.
 	InvalidateTableCache(table_name);
-	// Recorded as well, so DuckLake's own clear after the batch stays the cheap targeted one rather
-	// than falling back to re-reading the whole schema. The repeat costs a single round trip.
+	// Recorded as well, so DuckLake's own clear after the batch stays the targeted one rather than
+	// falling back to re-reading the whole schema - and marked refreshed, so that clear does not do
+	// this one again.
 	tables_pending_cache_refresh.push_back(table_name);
+	tables_already_refreshed.insert(table_name);
 	return table_name;
 }
 

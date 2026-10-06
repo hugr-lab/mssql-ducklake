@@ -447,7 +447,18 @@ Each step lands with its tests and its before/after numbers.
    - the reload after every DDL commit because the cache is not filled from the committed state;
    - the registered manager discarded in the attach transaction at 1.1 (a one-line fix; we no longer
      depend on it).
-7. **Ours, still open**: the sort-keys statement costs ~30 ms whenever it reads a new snapshot, on
-   two empty tables (twice per DDL commit, once per flushed table); the inlined-table creation
-   (5–14 ms) and the two cache invalidations (~6 ms) in a DDL commit.
+7. ~~Ours~~ — done or explained:
+   - **the sort-keys statement is not slow.** It costs 1–3 ms at any snapshot, inside or outside a
+     transaction, with pushdown on or off; the first touch in a process is ~170 ms (the
+     extension's metadata of the two tables). The "~30 ms" in the breakdowns was the attribution:
+     a statement's time is the gap to the next log entry, the sort keys are the last statement of a
+     load, and what follows them is DuckLake building the catalog's objects in memory from ~41k
+     column rows (~28 ms). That is DuckLake's, not the server's and not ours;
+   - **the inlined-table creation stays where it is** (5–14 ms): on a connection of its own, outside
+     the transaction, because a commit that creates a table and inlines rows into it (any small
+     `CREATE TABLE … AS`) needs the extension to see the table before the batch, and a table created
+     inside the transaction holds a lock the extension's metadata read waits on;
+   - **the second cache refresh is gone.** The table was refreshed right after we created it; the
+     clear after the commit named it again only so as not to fall back to the whole schema. It now
+     skips tables already refreshed: one round trip less per DDL commit.
 8. **R6** — before merge.

@@ -160,6 +160,7 @@ void MSSQLMetadataManager::CreateInlinedDeletionTable(const string &table_name) 
 	RunServerSideOutsideTransaction(statement, "Failed to create the inlined deletion table: ");
 	InvalidateTableCache(table_name);
 	tables_pending_cache_refresh.push_back(table_name);
+	tables_already_refreshed.insert(table_name);
 }
 
 unique_ptr<QueryResult> MSSQLMetadataManager::Query(DuckLakeSnapshot snapshot, string &query) {
