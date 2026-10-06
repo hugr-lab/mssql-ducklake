@@ -1,6 +1,6 @@
 # Spec 016: many writers and readers through one DuckDB
 
-- **Status**: draft (measured; causes not yet investigated)
+- **Status**: draft (measured; the read scaling traced to mssql-extension#409)
 - **Date**: 2026-10-06
 - **Author**: vgsml, with Claude
 
@@ -100,11 +100,19 @@ operation, and with 20 operations p95 is close to the maximum.
 
 ## What it shows
 
-1. **Reads do not scale on SQL Server.** postgres goes from ~100 to ~620 reads a second as readers
-   go from 1 to 16, its p95 staying under 75 ms. SQL Server: 85 → 188 on 1.5.6, and on 2.0 it does
-   not scale at all (46 → 70) while p95 grows to 2.7 s. Readers alone have nothing to wait for on
-   the server's side, so something serialises them: a lock or a pool in the mssql extension, the
-   pinned connection per transaction, or our per-read work. **Not investigated yet.**
+1. **Reads do not scale on SQL Server — found: the mssql extension's catalog-wide lock.** postgres
+   goes from ~100 to ~620 reads a second as readers go from 1 to 16, its p95 under 75 ms. SQL
+   Server: 85 → 188 on 1.5.6, and on 2.0 no scaling at all (46 → 70, p95 2.7 s). During 16 readers
+   the server is idle (0–1 running requests on 17 sessions, sampled every 0.5 s) and the DuckDB
+   process uses ~1.5 cores; `sample` of the worker threads: **85.5% parked in `std::mutex::lock`
+   under `MSSQLScanInitGlobal`**, 6.4% in the one thread holding it, reading the socket. The
+   mutex is `MSSQLCatalog::materialize_mutex_`, one per attached catalog: a materialized scan holds
+   it from its batch through its drain, and since spec 081 every raw scan inside a transaction is
+   one. Its comment assumes the contenders share one pinned connection — true for one DuckDB
+   connection, false for N, each with its own. On 1.5.6 (mssql v0.2.5) only catalog scans took it,
+   hence the regression: our metadata reads moved to raw scans on 2.0. Filed as
+   hugr-lab/mssql-extension#409 (the lock per pinned connection); the fix is the extension's.
+   Writers pay it too: every commit's metadata reads are in-transaction scans.
 2. **Mixed: writers drag readers down on SQL Server, not on postgres.** postgres readers keep p95
    ~70 ms beside 8 writers; SQL Server readers go to 1.5–4.5 s. A candidate: under `READ
    COMMITTED` without row versioning, a reader of `ducklake_snapshot` waits on a writer's
@@ -119,8 +127,9 @@ operation, and with 20 operations p95 is close to the maximum.
 
 ## Follow-ups
 
-- Find what serialises SQL Server readers (wait stats and blocking during the `read` scenario;
-  the mssql extension's pool; the per-transaction pinning).
+- ~~Find what serialises SQL Server readers~~ — mssql-extension#409; re-measure with its fix.
+- At the first touch all 16 sessions wait on `RESOURCE_SEMAPHORE_QUERY_COMPILE` (the cold tail
+  of ~4 s): 16 compiles at once of the same statements.
 - Measure `READ_COMMITTED_SNAPSHOT` on the catalog's database for the mixed and writer scenarios.
 - The retry exhaustion at 16 writers: how long a failed attempt holds the snapshot, and whether
   `ducklake_max_retry_count` or the backoff is what differs from postgres.
