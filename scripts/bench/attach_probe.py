@@ -170,6 +170,8 @@ def main() -> int:
                         help="read the bench table s<n%%10>.t<n> with the bench's filter, --rounds times, by statement")
     parser.add_argument("--flush-tables", type=int, default=0,
                         help="N tables with inlined rows, one flush of them, broken down by statement")
+    parser.add_argument("--first-inserts", type=int, default=0,
+                        help="N fresh tables, then the FIRST (inlined, 1 row) insert into each - the bench's first_commits")
     parser.add_argument("--insert-commits", type=int, default=0,
                         help="N inlined and N file-backed insert commits, broken down by statement")
     parser.add_argument("--create-tables", type=int, default=0,
@@ -246,6 +248,40 @@ def main() -> int:
         print(f"{'n/table':>8} {'ms/table':>9}  shape")
         for shp, (count, ms) in sorted(per.items(), key=lambda kv: -kv[1][1])[: args.top]:
             print(f"{count / n:>8.1f} {ms / n:>9.1f}  {shp[:140]}")
+        return 0
+
+    if args.first_inserts:
+        # The bench's first_commits phase: one 1-row insert into a table that has never had data, so
+        # the commit also creates the table's inlined-data table. N tables of the bench's width.
+        n = args.first_inserts
+        kinds = ("BIGINT", "VARCHAR", "DECIMAL(18, 4)", "DATE", "DOUBLE")
+        exprs = ("{s}", "'v' || ({s})::VARCHAR", "({s} * 1.5)::DECIMAL(18, 4)",
+                 "DATE '2020-01-01' + ({s})::INTEGER", "({s} * 0.25)::DOUBLE")
+        cols = ", ".join(f"c{c} {kinds[c % 5]}" for c in range(40))
+        vals = ", ".join(exprs[c % 5].format(s=str(7)) for c in range(40))
+        body = "CREATE SCHEMA IF NOT EXISTS lake.probe_fi;\n" + "".join(
+            f"CREATE TABLE lake.probe_fi.t{i}(id BIGINT, {cols});\n" for i in range(n))
+        body += "".join(f"INSERT INTO lake.probe_fi.t{i} SELECT {i}, {vals};\n" for i in range(n))
+        body += "".join(f"DROP TABLE lake.probe_fi.t{i};\n" for i in range(n))
+        timed = run_arm(args.duckdb, build, dsn, "false", env, False, body)
+        starts = [i for i, (_, m) in enumerate(timed) if m.startswith("INSERT INTO lake.probe_fi")]
+        end = next((i for i, (_, m) in enumerate(timed) if m.startswith("DROP TABLE lake.probe_fi")), len(timed))
+        per, user_ms = collections.defaultdict(lambda: [0, 0]), []
+        for k, start in enumerate(starts):
+            stop = starts[k + 1] if k + 1 < len(starts) else end
+            user_ms.append(sum(ms for ms, _ in timed[start:stop]))
+            for ms, m in timed[start:stop]:
+                e = per[shape(redact(m, dsn))]
+                e[0] += 1
+                e[1] += ms
+        if len(starts) > 5:
+            print("\n--- the timeline of commit #5 (ms to the next entry):")
+            for ms, m in timed[starts[5]:starts[6] if len(starts) > 6 else end]:
+                print(f"{ms:>7.1f}  {redact(m, dsn)[:150]!r}")
+        print(f"\n=== first inserts: {len(starts)} commits, mean {sum(user_ms) / max(len(starts), 1):.1f} ms, each {[round(x, 1) for x in user_ms]}")
+        print(f"{'n/commit':>9} {'ms/commit':>10}  shape")
+        for shp, (count, ms) in sorted(per.items(), key=lambda kv: -kv[1][1])[: args.top]:
+            print(f"{count / max(len(starts), 1):>9.1f} {ms / max(len(starts), 1):>10.1f}  {shp[:160]}")
         return 0
 
     if args.insert_commits:

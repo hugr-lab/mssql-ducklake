@@ -166,6 +166,32 @@ private:
 	//! error the way the base's Execute does, so the commit loop's retry and rollback see the same
 	//! thing (specs/014 D3).
 	unique_ptr<QueryResult> RunCommitBatch(const string &tsql);
+
+	//! The user's inlined rows as T-SQL (specs/015), so they join the run instead of taking DuckDB's
+	//! DML path, a round trip of their own. A row set with a value we do not render goes to the base
+	//! as before.
+	string WriteNewInlinedData(DuckLakeSnapshot &commit_snapshot, const vector<DuckLakeInlinedDataInfo> &new_data,
+	                           const vector<DuckLakeTableInfo> &new_tables,
+	                           const vector<DuckLakeTableInfo> &new_inlined_data_tables_result,
+	                           vector<unique_ptr<SQLStatement>> &inlined_inserts) override;
+	//! One INSERT of inlined rows, held here while the batch carries only its marker
+	//! (`INLINED_ROWS_MARKER <index>`): the head, and per row its id and its values in T-SQL. The
+	//! commit's snapshot id goes in when Execute assembles it - never by replacing a placeholder in
+	//! the text, which would reach into the user's strings.
+	struct InlinedRowsStatement {
+		string head;
+		vector<pair<int64_t, string>> rows;
+	};
+	vector<InlinedRowsStatement> inlined_rows_statements;
+	//! The inlined table each lake table writes to, as this commit attempt has named or created it -
+	//! the base keeps the same thing in a private cache that its retry clears. Ours is keyed by the
+	//! attempt's commit snapshot instead: an entry from an earlier attempt is never reused.
+	struct InlinedTableName {
+		idx_t commit_snapshot_id;
+		string name;
+	};
+	unordered_map<idx_t, InlinedTableName> inlined_table_names;
+	static constexpr const char *INLINED_ROWS_MARKER = "MSSQL_DUCKLAKE_INLINED_ROWS ";
 	//! A write DuckLake sends through Query rather than Execute - the expiry's and cleanup's DELETEs,
 	//! the flush's - recognised by the same families as the batch and run as T-SQL; nullptr when it
 	//! is not one (specs/014 D3c).

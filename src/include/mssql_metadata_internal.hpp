@@ -57,15 +57,38 @@ inline bool ConflictRewriteEnabled() {
 	return !disabled;
 }
 
-//! specs/014: an unrecognised catalog statement in the commit batch is an error rather than a
-//! fallback to the base. On in the integration suite, so that a ducklake bump that adds a shape
-//! fails the suite naming the statement; off for a user, whose catalog keeps working, slower.
+//! DuckDB prints a TIMESTAMPTZ with a bare hour offset (`+00`); SQL Server reads `+00:00`.
+inline string WithMinuteOffset(const string &text) {
+	auto n = text.size();
+	if (n > 3 && (text[n - 3] == '+' || text[n - 3] == '-') && StringUtil::CharacterIsDigit(text[n - 2]) &&
+	    StringUtil::CharacterIsDigit(text[n - 1])) {
+		return text + ":00";
+	}
+	return text;
+}
+
+inline bool HasFourDigitYear(const string &text) {
+	return text.size() >= 10 && StringUtil::CharacterIsDigit(text[0]) && StringUtil::CharacterIsDigit(text[1]) &&
+	       StringUtil::CharacterIsDigit(text[2]) && StringUtil::CharacterIsDigit(text[3]) && text[4] == '-' &&
+	       text[7] == '-';
+}
+
 //! Off switch for the server-side file list (specs/015), so its absence can be measured.
 inline bool ServerFileListDisabled() {
 	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_SERVER_FILE_LIST") != nullptr;
 	return disabled;
 }
 
+//! Off switch for the user's inlined rows in the T-SQL run (specs/015): they take DuckDB's DML path
+//! again, one round trip of their own. For measuring, and for running the two against each other.
+inline bool InlinedRowsInRunDisabled() {
+	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_INLINED_TSQL") != nullptr;
+	return disabled;
+}
+
+//! specs/014: an unrecognised catalog statement in the commit batch is an error rather than a
+//! fallback to the base. On in the integration suite, so that a ducklake bump that adds a shape
+//! fails the suite naming the statement; off for a user, whose catalog keeps working, slower.
 inline bool StrictBatchEnabled() {
 	static const bool enabled = getenv("MSSQL_DUCKLAKE_STRICT_BATCH") != nullptr;
 	return enabled;

@@ -400,7 +400,24 @@ and the postgres manager pays those loads exactly as we do: its reads go through
 
 Where postgres is still ahead:
 
-1. **inlined inserts**, ~7.6 ms a commit;
+1. **inlined inserts**, ~7.6 ms a commit — narrowed since. The user's rows took DuckDB's DML path
+   through the attached catalog: their own round trip (~7 ms), which also split the T-SQL run around
+   them. `WriteNewInlinedData` is now ours: the rows are rendered as T-SQL literals and joined to the
+   run, so the whole commit batch is one `mssql_exec`. A row set with a value we do not render (an
+   alias type, a nested one, `ENUM`, `BIT`, `VARIANT`, `GEOMETRY`, a date past four-digit years, a
+   string with a NUL) goes to the base as before; `MSSQL_DUCKLAKE_NO_INLINED_TSQL=1` sends them all
+   there. What the server holds was compared against the DML path row by row over every scalar
+   type and its extremes: identical, an interval in DuckLake's own `months/days/microseconds` form
+   included — except where the DML path is wrong: it substitutes the commit's snapshot id into a
+   user string that contains `{SNAPSHOT_ID}` (the base's placeholder replacement runs over the user's
+   values too; ours never puts the values through it). `inlined_rows.test` pins both.
+   `mssql_exec_params` was measured first and lost: inside `sp_executesql` forced parameterization
+   does not apply, so the run compiled on every commit — 14 ms a commit, against 4 for the same run
+   as literals in a plain batch, and 7–8 for the variants that keep the run's text constant
+   (`EXEC(@rest)` plus parameters, or two calls). Measured on the 1000-table lake, the first insert
+   into a fresh table: **~21 → ~16.5 ms** steady. What is left of such a commit is DuckLake's: the
+   snapshot read (3 ms), the table stats read (2–3), the inlined-table lookup (2), and the run with
+   the commit itself;
 2. **a merge of adjacent files over the whole lake**, 37 s;
 3. **the read path** — closed since. The postgres manager overrides `GenerateFileListQuery` and the
    file-column-stats CTE and runs the whole file-list query natively in postgres through one

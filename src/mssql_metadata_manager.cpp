@@ -316,6 +316,7 @@ string MSSQLMetadataManager::GetInlinedTableQueries(DuckLakeSnapshot commit_snap
 	// the DDL ourselves, because the column types are T-SQL and could not travel in the duckdb batch.
 	string base_ddl;
 	auto table_name = DuckLakeMetadataManager::GetInlinedTableQueries(commit_snapshot, table, inlined_tables, base_ddl);
+	inlined_table_names[table.id.index] = {commit_snapshot.snapshot_id, table_name};
 	if (base_ddl.empty()) {
 		return table_name;
 	}

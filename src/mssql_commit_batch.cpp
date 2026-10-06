@@ -5,6 +5,8 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/database.hpp"
 #include "storage/ducklake_catalog.hpp"
+#include "storage/ducklake_inlined_data.hpp"
+#include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 
 namespace duckdb {
@@ -705,6 +707,240 @@ unique_ptr<QueryResult> MSSQLMetadataManager::RunCommitBatch(const string &tsql)
 	return connection.Query(StringUtil::Format("SELECT mssql_exec(%s, %s)", CatalogLiteral(), SQLString(tsql)));
 }
 
+//===--------------------------------------------------------------------===//
+// The user's inlined rows in the run (specs/015)
+//===--------------------------------------------------------------------===//
+
+namespace {
+
+//! T-SQL's limit on the rows of one VALUES
+constexpr idx_t MAX_STATEMENT_ROWS = 1000;
+
+//! One value of an inlined row as a T-SQL literal for its column (TSQLColumnType), or false when it
+//! is not ours to render - the row set then goes to the base, DuckDB's DML path. A type the column
+//! holds as text is the text DuckDB's own cast gives, the cast an INSERT through the attached
+//! catalog does (an interval excepted, written in DuckLake's own form); strings are N literals, so they reach the UTF-8
+//! column without the database's code page. The literals are what a FORCED-parameterized batch turns into parameters,
+//! so the run's plan is reused across commits (specs/012) - measured against mssql_exec_params, which puts the whole
+//! run inside sp_executesql, where forced parameterization does not apply and every commit compiled its run: 14 ms a
+//! commit against 4.
+bool RenderInlinedValue(DuckLakeMetadataManager &manager, ClientContext &context, const Value &value, string &out) {
+	if (value.IsNull()) {
+		out = "NULL";
+		return true;
+	}
+	auto &type = value.type();
+	if (type.HasAlias() || type.IsNested() || DuckLakeUtil::GetInlinedStorageType(manager, type) != type) {
+		return false;
+	}
+	auto n_literal = [&](const string &text) {
+		if (text.find('\0') != string::npos) {
+			return false;
+		}
+		out = "N'" + StringUtil::Replace(text, "'", "''") + "'";
+		return true;
+	};
+	if (!manager.TypeIsNativelySupported(type)) {
+		switch (type.id()) {
+		case LogicalTypeId::VARIANT:
+		case LogicalTypeId::GEOMETRY:
+		case LogicalTypeId::BIT:
+		case LogicalTypeId::ENUM:
+			return false;
+		case LogicalTypeId::INTERVAL: {
+			// DuckLake's canonical text for an interval, not DuckDB's (ToSQLString in ducklake_util)
+			auto interval = IntervalValue::Get(value);
+			return n_literal(StringUtil::Format("%d months %d days %lld microseconds", interval.months, interval.days,
+			                                    interval.micros));
+		}
+		default:
+			return n_literal(value.CastAs(context, LogicalType::VARCHAR).GetValue<string>());
+		}
+	}
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN:
+		out = value.GetValue<bool>() ? "1" : "0";
+		return true;
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::DECIMAL:
+		out = value.ToString();
+		return true;
+	case LogicalTypeId::VARCHAR:
+	case LogicalTypeId::UUID:
+		return n_literal(value.ToString());
+	case LogicalTypeId::BLOB: {
+		auto &bytes = StringValue::Get(value);
+		static constexpr const char *HEX = "0123456789ABCDEF";
+		out = "0x";
+		out.reserve(2 + bytes.size() * 2);
+		for (auto c : bytes) {
+			auto byte = static_cast<uint8_t>(c);
+			out += HEX[byte >> 4];
+			out += HEX[byte & 0x0F];
+		}
+		return true;
+	}
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_SEC: {
+		// ISO text, which date and datetime2 read whatever the session's language; a year past four
+		// digits, a BC date and infinity are not theirs
+		auto text = value.ToString();
+		if (!HasFourDigitYear(text) || text.find('(') != string::npos) {
+			return false;
+		}
+		return n_literal(text);
+	}
+	case LogicalTypeId::TIMESTAMP_TZ: {
+		// the instant in UTC, whatever the session's time zone, as DuckDB prints it without one
+		auto text = Timestamp::ToString(value.GetValue<timestamp_t>());
+		if (!HasFourDigitYear(text) || text.find('(') != string::npos) {
+			return false;
+		}
+		return n_literal(text + "+00:00");
+	}
+	case LogicalTypeId::TIME: {
+		auto text = value.ToString();
+		if (StringUtil::StartsWith(text, "24")) {
+			return false;
+		}
+		return n_literal(text);
+	}
+	default:
+		return false;
+	}
+}
+
+} // namespace
+
+string MSSQLMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_snapshot,
+                                                 const vector<DuckLakeInlinedDataInfo> &new_data,
+                                                 const vector<DuckLakeTableInfo> &new_tables,
+                                                 const vector<DuckLakeTableInfo> &new_inlined_data_tables_result,
+                                                 vector<unique_ptr<SQLStatement>> &inlined_inserts) {
+	// a batch is built afresh on every attempt of the commit loop, and only the last one runs
+	inlined_rows_statements.clear();
+	if (InlinedRowsInRunDisabled() || !BatchRewriteEnabled()) {
+		return DuckLakeMetadataManager::WriteNewInlinedData(commit_snapshot, new_data, new_tables,
+		                                                    new_inlined_data_tables_result, inlined_inserts);
+	}
+	auto context = transaction.context.lock();
+	string batch;
+	for (auto &entry : new_data) {
+		// The rows first: rendered whole, or the row set is the base's
+		vector<pair<int64_t, string>> rows;
+		bool rendered = entry.data && entry.data->data;
+		if (rendered) {
+			auto &data = *entry.data;
+			const bool preserved = data.HasPreservedRowIds();
+			idx_t next_row_id = entry.row_id_start;
+			idx_t position = 0;
+			for (auto &chunk : data.data->Chunks()) {
+				for (idx_t r = 0; rendered && r < chunk.size(); r++, position++) {
+					int64_t row_id;
+					if (preserved && !DuckLakeConstants::IsTransactionLocalRowId(data.row_ids[position])) {
+						row_id = data.row_ids[position];
+					} else {
+						row_id = NumericCast<int64_t>(next_row_id++);
+					}
+					string values, literal;
+					for (idx_t c = 0; rendered && c < chunk.ColumnCount(); c++) {
+						rendered = RenderInlinedValue(*this, *context, chunk.GetValue(c, r), literal);
+						values += ", " + literal;
+					}
+					rows.emplace_back(row_id, std::move(values));
+				}
+				if (!rendered) {
+					break;
+				}
+			}
+		}
+		if (!rendered) {
+			// the base's own statement for this row set, which takes DuckDB's DML path in Execute
+			vector<DuckLakeInlinedDataInfo> one {entry};
+			batch += DuckLakeMetadataManager::WriteNewInlinedData(commit_snapshot, one, new_tables,
+			                                                      new_inlined_data_tables_result, inlined_inserts);
+			continue;
+		}
+
+		// The inlined table: the latest one of the lake table, or a new one - the base's
+		// WriteNewInlinedData step for step (re-audit at a ducklake bump), its name cache ours.
+		optional_ptr<const DuckLakeTableInfo> new_inlined_table;
+		for (auto &inlined_table : new_inlined_data_tables_result) {
+			if (inlined_table.id == entry.table_id) {
+				new_inlined_table = &inlined_table;
+				break;
+			}
+		}
+		string inlined_table_name;
+		auto known = inlined_table_names.find(entry.table_id.index);
+		if (known != inlined_table_names.end() && known->second.commit_snapshot_id == commit_snapshot.snapshot_id) {
+			inlined_table_name = known->second.name;
+		}
+		if (inlined_table_name.empty() && !new_inlined_table) {
+			auto lookup = LatestInlinedTableQuery(entry.table_id.index) + ";";
+			auto result = Query(commit_snapshot, lookup);
+			for (auto &row : *result) {
+				inlined_table_name = row.GetValue<string>(0);
+				inlined_table_names[entry.table_id.index] = {commit_snapshot.snapshot_id, inlined_table_name};
+			}
+		}
+		if (inlined_table_name.empty()) {
+			DuckLakeTableInfo table_info;
+			if (new_inlined_table) {
+				table_info = *new_inlined_table;
+			} else {
+				auto table_entry =
+				    transaction.GetCatalog().GetEntryById(transaction, transaction.GetSnapshot(), entry.table_id);
+				if (table_entry) {
+					auto &table = table_entry->Cast<DuckLakeTableEntry>();
+					table_info = table.GetTableInfo();
+					table_info.columns = table.GetTableColumns();
+				} else {
+					bool found = false;
+					for (auto &new_table : new_tables) {
+						if (new_table.id == entry.table_id) {
+							table_info = new_table;
+							found = true;
+						}
+					}
+					if (!found) {
+						throw InternalException("Writing inlined data for a table that cannot be found in the catalog");
+					}
+				}
+				commit_snapshot.schema_version++;
+			}
+			string inlined_tables, inlined_table_queries;
+			inlined_table_name =
+			    GetInlinedTableQueries(commit_snapshot, table_info, inlined_tables, inlined_table_queries);
+			batch += "INSERT INTO {METADATA_CATALOG}.ducklake_inlined_data_tables VALUES " + inlined_tables + ";";
+			batch += inlined_table_queries;
+		}
+
+		// The rows' statement, held here; the batch carries its marker
+		const auto head =
+		    StringUtil::Format("INSERT INTO %s.%s VALUES ", SchemaIdentifier(), SQLIdentifier(inlined_table_name));
+		for (idx_t start = 0; start < rows.size(); start += MAX_STATEMENT_ROWS) {
+			InlinedRowsStatement statement;
+			statement.head = head;
+			auto end = MinValue<idx_t>(start + MAX_STATEMENT_ROWS, rows.size());
+			for (idx_t i = start; i < end; i++) {
+				statement.rows.push_back(std::move(rows[i]));
+			}
+			batch += INLINED_ROWS_MARKER + to_string(inlined_rows_statements.size()) + ";";
+			inlined_rows_statements.push_back(std::move(statement));
+		}
+	}
+	return batch;
+}
+
 unique_ptr<QueryResult> MSSQLMetadataManager::TryRewriteWrite(DuckLakeSnapshot snapshot, const string &query) {
 	if (!BatchRewriteEnabled()) {
 		return nullptr;
@@ -814,6 +1050,21 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 	};
 
 	for (auto &stmt : SplitStatements(query)) {
+		// the user's inlined rows, rendered by our WriteNewInlinedData
+		if (StringUtil::StartsWith(stmt, INLINED_ROWS_MARKER)) {
+			auto index = std::stoull(stmt.substr(strlen(INLINED_ROWS_MARKER)));
+			if (index >= inlined_rows_statements.size()) {
+				throw InternalException("mssql_ducklake: inlined rows %llu written by no WriteNewInlinedData", index);
+			}
+			auto &statement = inlined_rows_statements[index];
+			run += statement.head;
+			for (idx_t i = 0; i < statement.rows.size(); i++) {
+				run += StringUtil::Format("%s(%lld, %llu, NULL%s)", i == 0 ? "" : ", ", statement.rows[i].first,
+				                          snapshot.snapshot_id, statement.rows[i].second);
+			}
+			run += ";\n";
+			continue;
+		}
 		// the one DDL in the batch: the inlined deletion table, created keyed and outside the
 		// transaction instead (specs/006 D5b); the loop writes it into every batch that deletes
 		// inline from the table, so the catalog-level cache says whether there is anything to do

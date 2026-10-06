@@ -1,0 +1,178 @@
+# name: test/sql/integration/inlined_rows.test
+# description: The user's inlined rows written as T-SQL in the commit's run, type by type (specs/015)
+# group: [integration]
+
+# An inlined insert's rows are T-SQL literals in the same round trip as the rest of the commit,
+# rendered by the manager rather than sent through DuckDB's DML path. Every row below goes in through
+# the lake and is compared with the same row kept in DuckDB, both ways, so a value rendered
+# differently from what the DML path writes shows up as a difference.
+require-env MSSQL_DUCKLAKE_TEST_DSN
+
+require parquet
+
+statement ok
+SET autoload_known_extensions = false;
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
+
+statement ok
+ATTACH '${MSSQL_DUCKLAKE_TEST_DSN}' AS srv (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''inlined_rows'';
+EXEC sp_executesql @sql;
+IF SCHEMA_ID(''inlined_rows'') IS NULL EXEC(''CREATE SCHEMA inlined_rows'');');
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/inlined_rows', METADATA_SCHEMA 'inlined_rows', DATA_INLINING_ROW_LIMIT 200);
+
+statement ok
+CREATE TABLE expected(id INTEGER, b BOOLEAN, i1 TINYINT, i2 SMALLINT, i4 INTEGER, i8 BIGINT, u1 UTINYINT,
+                      u2 USMALLINT, u4 UINTEGER, u8 UBIGINT, h HUGEINT, uh UHUGEINT, d1 DECIMAL(4,1),
+                      d2 DECIMAL(18,4), d3 DECIMAL(38,10), f FLOAT, g DOUBLE, dt DATE, tm TIME, ts TIMESTAMP,
+                      tms TIMESTAMP_MS, tss TIMESTAMP_S, tns TIMESTAMP_NS, tz TIMESTAMPTZ, iv INTERVAL, ttz TIMETZ,
+                      u UUID, v VARCHAR, bl BLOB);
+
+# the extremes, the floats SQL Server has no value for, text that is quotes, Unicode and a
+# DuckLake placeholder, values past 4000 and 8000 bytes, and a row of NULLs
+statement ok
+INSERT INTO expected VALUES
+(0, true, -128, -32768, -2147483648, -9223372036854775808, 0, 0, 0, 0, -170141183460469231731687303715884105728, 0,
+ -999.9, -99999999999999.9999, -9999999999999999999999999999.9999999999, 'nan'::FLOAT, '-inf'::DOUBLE,
+ DATE '0001-01-01', TIME '00:00:00', TIMESTAMP '0001-01-01 00:00:00', TIMESTAMP_MS '0001-01-01 00:00:00.001',
+ TIMESTAMP_S '0001-01-01 00:00:00', TIMESTAMP_NS '1970-01-01 00:00:00.123456789', '2020-01-01 10:00:00+00'::TIMESTAMPTZ,
+ INTERVAL '1 year 2 months 3 days 04:05:06.789', '10:00:00+05:30'::TIMETZ,
+ '00000000-0000-0000-0000-000000000000', '', ''::BLOB),
+(1, false, 127, 32767, 2147483647, 9223372036854775807, 255, 65535, 4294967295, 18446744073709551615,
+ 170141183460469231731687303715884105727, 340282366920938463463374607431768211455,
+ 999.9, 99999999999999.9999, 9999999999999999999999999999.9999999999, 3.4e38, 1.7976931348623157e308,
+ DATE '9999-12-31', TIME '23:59:59.999999', TIMESTAMP '9999-12-31 23:59:59.999999', TIMESTAMP_MS '9999-12-31 23:59:59.999',
+ TIMESTAMP_S '9999-12-31 23:59:59', TIMESTAMP_NS '2262-04-11 23:47:16.854775', '9999-12-31 23:59:59.999999+00'::TIMESTAMPTZ,
+ INTERVAL '-5 days', '23:59:59-12:00'::TIMETZ, 'ffffffff-ffff-ffff-ffff-ffffffffffff',
+ 'it''s "q" ключ 日本 🦆 {SNAPSHOT_ID} ; -- x', '\x00\xFF\x27abc'::BLOB),
+(2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+ NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+(3, true, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0.0, 0.0001, 0.0000000001, -0.0::FLOAT, 1.0e-300, DATE '2024-02-29',
+ TIME '12:34:56.000001', TIMESTAMP '2024-02-29 12:34:56.000001', TIMESTAMP_MS '2024-02-29 12:34:56.123',
+ TIMESTAMP_S '2024-02-29 12:34:56', TIMESTAMP_NS '2024-02-29 12:34:56.000000001', '2024-02-29 20:34:56.5+00'::TIMESTAMPTZ,
+ INTERVAL '0 seconds', '00:00:00+00'::TIMETZ, '12345678-1234-5678-1234-567812345678',
+ repeat('x', 5000) || 'ж', repeat('\xAB', 9000)::BLOB);
+
+statement ok
+CREATE TABLE lake.t AS SELECT * FROM expected LIMIT 0;
+
+# one commit a row, then all four in one commit
+statement ok
+INSERT INTO lake.t SELECT * FROM expected WHERE id = 0;
+
+statement ok
+INSERT INTO lake.t SELECT * FROM expected WHERE id = 1;
+
+statement ok
+INSERT INTO lake.t SELECT * FROM expected WHERE id = 2;
+
+statement ok
+INSERT INTO lake.t SELECT * FROM expected WHERE id = 3;
+
+statement ok
+INSERT INTO lake.t SELECT id + 10, * EXCLUDE (id) FROM expected;
+
+statement ok
+INSERT INTO expected SELECT id + 10, * EXCLUDE (id) FROM expected;
+
+# still inlined, not a file
+query I
+SELECT count(*) FROM lake.t;
+----
+8
+
+query I
+SELECT count(*) FROM ducklake_list_files('lake', 't');
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM lake.t EXCEPT SELECT * FROM expected);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM expected EXCEPT SELECT * FROM lake.t);
+----
+0
+
+# what the server holds is what DuckDB's DML path writes: a type held as text keeps DuckLake's own
+# form - an interval as months, days and microseconds, not as DuckDB prints it
+query T
+SELECT iv FROM mssql_scan('srv', 'DECLARE @t sysname = (SELECT TOP 1 table_name FROM inlined_rows.ducklake_inlined_data_tables ORDER BY table_id);
+DECLARE @s NVARCHAR(MAX) = N''SELECT CAST(iv AS NVARCHAR(100)) AS iv FROM inlined_rows.'' + QUOTENAME(@t) + N'' WHERE id = 0'';
+EXEC sp_executesql @s');
+----
+14 months 3 days 14706789000 microseconds
+
+# The placeholder text is the user's: DuckDB's DML path substitutes the commit's snapshot id into it,
+# the manager's T-SQL does not - which is also what says the rows took the T-SQL path
+query T
+SELECT v FROM lake.t WHERE id = 1;
+----
+it's "q" ключ 日本 🦆 {SNAPSHOT_ID} ; -- x
+
+# A table created and written in one commit
+statement ok
+CREATE TABLE lake.c AS SELECT 'é' || r AS s, r AS n FROM range(4) t(r);
+
+query TI
+SELECT s, n FROM lake.c ORDER BY n;
+----
+é0	0
+é1	1
+é2	2
+é3	3
+
+# 180 rows of 29 values in one commit, every one of them a literal of the same run
+statement ok
+INSERT INTO lake.t SELECT 100 + k, e.* EXCLUDE (id) FROM expected e, range(45) r(k) WHERE e.id < 10;
+
+query II
+SELECT count(*), count(DISTINCT id) FROM lake.t WHERE id >= 100;
+----
+180	45
+
+query I
+SELECT count(*) FROM ducklake_list_files('lake', 't');
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * EXCLUDE (id) FROM lake.t WHERE id >= 100 EXCEPT SELECT * EXCLUDE (id) FROM expected);
+----
+0
+
+# a delete and an update of inlined rows still find them
+statement ok
+DELETE FROM lake.t WHERE id = 0;
+
+statement ok
+UPDATE lake.t SET v = 'updated' WHERE id = 3;
+
+query IT
+SELECT count(*), max(v) FILTER (WHERE id = 3) FROM lake.t WHERE id < 100;
+----
+7	updated
+
+statement ok
+DETACH lake;
+
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''inlined_rows'';
+EXEC sp_executesql @sql; DROP SCHEMA inlined_rows;');

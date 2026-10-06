@@ -352,22 +352,6 @@ TSQLStatsType StatsTypeFor(const LogicalType &type) {
 	}
 }
 
-//! DuckDB prints a TIMESTAMPTZ with a bare hour offset (`+00`); SQL Server reads `+00:00`.
-string WithMinuteOffset(const string &text) {
-	auto n = text.size();
-	if (n > 3 && (text[n - 3] == '+' || text[n - 3] == '-') && StringUtil::CharacterIsDigit(text[n - 2]) &&
-	    StringUtil::CharacterIsDigit(text[n - 1])) {
-		return text + ":00";
-	}
-	return text;
-}
-
-bool HasFourDigitYear(const string &text) {
-	return text.size() >= 10 && StringUtil::CharacterIsDigit(text[0]) && StringUtil::CharacterIsDigit(text[1]) &&
-	       StringUtil::CharacterIsDigit(text[2]) && StringUtil::CharacterIsDigit(text[3]) && text[4] == '-' &&
-	       text[7] == '-';
-}
-
 bool IsAscii(const string &text) {
 	for (auto c : text) {
 		if (static_cast<unsigned char>(c) >= 0x80) {

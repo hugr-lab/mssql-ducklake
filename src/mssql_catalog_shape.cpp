@@ -33,7 +33,8 @@ MSSQLMetadataManager::CatalogMarkers MSSQLMetadataManager::ReadCatalogMarkers() 
 	//
 	// The inner statement travels inside a duckdb string literal, so each of its own quotes is
 	// doubled once; `mssql_scan_unsafe`, so bind sends nothing (mssql specs/081), and every column is
-	// cast to what it declares so the two cannot drift.
+	// cast to what it declares so the two cannot drift. The marker as NVARCHAR: a VARCHAR result
+	// takes the database's collation, and the extension warns about every non-UTF-8 one it reads.
 	auto &connection = transaction.GetConnection();
 	auto schema_name =
 	    StringUtil::Replace(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName(), "'", "''''");
@@ -48,7 +49,7 @@ MSSQLMetadataManager::CatalogMarkers MSSQLMetadataManager::ReadCatalogMarkers() 
 	    "CAST(CASE WHEN %s IS NULL THEN 0 ELSE 1 END AS BIGINT) AS present, %s AS shape, %s AS migration', "
 	    "columns := {'present': 'BIGINT', 'shape': 'BIGINT', 'migration': 'VARCHAR'})",
 	    CatalogLiteral(), anchor, property(SHAPE_VERSION_PROPERTY, "BIGINT"),
-	    property(MIGRATION_MARKER_PROPERTY, "VARCHAR(64)")));
+	    property(MIGRATION_MARKER_PROPERTY, "NVARCHAR(64)")));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to inspect the DuckLake catalog on SQL Server: ");
 	}
