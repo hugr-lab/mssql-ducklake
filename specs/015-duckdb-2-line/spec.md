@@ -452,6 +452,30 @@ Where postgres is still ahead:
 The errors in both runs' logs are the reduced configuration's (queries for partitioned and deep
 tables it was told not to make), identical across every run of the day and on both backends.
 
+## A file-backed commit, 1.5.6 against 2.0 (measured 2026-10-06)
+
+The same 20 commits (200 rows, the bench's width) on both lines, interleaved three times on one
+machine, every step timed from the query log: **15.5 ms a commit on 1.5.6, 23.2 on 2.0.** The
+round trips are the same five on both - the snapshot read, the table stats read, the two appenders,
+the batch - so the difference is in what each costs:
+
+- **the batch, +4 ms.** DuckLake's v1.5 head writes the per-column statistics refresh as one
+  `UPDATE` per column (41 here) instead of one `UPDATE ... FROM (VALUES ...)`, to sidestep a
+  DuckDB-catalog bug with long strings beside NULLs in a multi-row VALUES; the batch grew from 4
+  statements and 2.6 KB to 44 and 11 KB. `UpdateGlobalTableStatsSql` is static, so `Execute`
+  gathers a run of those statements for one table (exactly that shape, the column ids distinct)
+  and sends them as one statement again, its booleans bare 1/0 rather than a cast each - the text is
+  parsed on every commit. Equal to the base path row for row; `write_shapes.test` pins the shape.
+  **23.2 → 19.5 ms.**
+- **the rest, ~4 ms, is not ours**: DuckDB 2.0's parquet write (+1.3 ms around the COPY), its
+  parser (+0.3–0.5 ms per statement), and the appenders (+1.4, the column-stats rows two columns
+  wider at format 1.1). The manager's own reads are at parity: `mssql_scan_unsafe` in a
+  transaction costs 2.14 ms against 1.5.6's `mssql_scan` at 2.09.
+- **`mssql_scan` itself regressed** on the mssql line we pin: 0.62 → 3.47 ms in autocommit, 2.09 →
+  4.70 in a transaction, for `SELECT TOP 1` of two columns. The manager no longer uses it, but users
+  do; for the extension.
+- **`AUTO_UPDATE_STATISTICS_ASYNC`** (specs/017) costs the commit nothing: 20.1–20.9 ms either way.
+
 ## Dependencies on the mssql extension
 
 Sent to the mssql session on 2026-10-06, ranked by the measurements above.

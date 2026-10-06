@@ -309,6 +309,41 @@ SELECT dropped FROM mssql_scan('srv', 'SELECT CAST(COUNT(*) AS BIGINT) AS droppe
 ----
 8
 
+# A file-backed commit into a table whose statistics exist refreshes them column by column: DuckLake
+# writes an UPDATE per column, and the batch sends them as ONE statement (specs/015) - with the
+# values each column got, which the count and the bounds below check
+statement ok
+CREATE TABLE lake.stats_refresh(a BIGINT, b VARCHAR, c DOUBLE);
+
+statement ok
+INSERT INTO lake.stats_refresh SELECT r, 'v' || r, r * 0.5 FROM range(0, 100) t(r);
+
+statement ok
+CALL enable_logging('QueryLog');
+
+statement ok
+INSERT INTO lake.stats_refresh SELECT r, NULL, r * 0.5 FROM range(100, 300) t(r);
+
+statement ok
+CALL disable_logging();
+
+query I
+SELECT count(*) FROM duckdb_logs() WHERE type = 'QueryLog' AND message LIKE '%mssql_exec(%UPDATE s SET contains_null = v.contains_null%';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_logs() WHERE type = 'QueryLog' AND message LIKE '%mssql_exec(%ducklake_table_column_stats SET contains_null%';
+----
+0
+
+query IIT
+SELECT column_id, contains_null, max_value FROM mssql_scan('srv', 'SELECT CAST(s.column_id AS BIGINT) AS column_id, s.contains_null, CAST(s.max_value AS NVARCHAR(100)) AS max_value FROM write_shapes.ducklake_table_column_stats s JOIN write_shapes.ducklake_table t ON t.table_id = s.table_id AND t.end_snapshot IS NULL WHERE t.table_name = ''stats_refresh'' ORDER BY 1') ORDER BY 1;
+----
+1	false	299
+2	true	v99
+3	false	149.5
+
 statement ok
 DETACH lake;
 

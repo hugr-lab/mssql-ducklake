@@ -677,6 +677,119 @@ vector<string> SplitStatements(const string &batch) {
 	return out;
 }
 
+//! One per-column refresh of `ducklake_table_column_stats`, as UpdateGlobalTableStatsSql writes it
+//! since ducklake's v1.5 head: `UPDATE {METADATA_CATALOG}.ducklake_table_column_stats SET
+//! contains_null=CAST(<b> AS BOOLEAN), contains_nan=CAST(<b> AS BOOLEAN), min_value=<s>,
+//! max_value=<s>, extra_stats=<s>[, min_is_exact=CAST(<b> AS BOOLEAN), max_is_exact=CAST(<b> AS
+//! BOOLEAN)] WHERE table_id=<n> AND column_id=<n>`, values already T-SQL.
+struct ColumnStatsRefresh {
+	string table_id;
+	string column_id;
+	bool exactness = false;
+	//! contains_null, contains_nan, min, max, extra[, min_is_exact, max_is_exact]
+	vector<string> values;
+};
+
+bool ReadColumnStatsRefresh(const string &stmt, ColumnStatsRefresh &out) {
+	idx_t pos = 0;
+	auto expect = [&](const char *text) {
+		auto n = strlen(text);
+		if (stmt.compare(pos, n, text) != 0) {
+			return false;
+		}
+		pos += n;
+		return true;
+	};
+	auto boolean = [&](string &value) {
+		Literal lit;
+		if (!expect("CAST(") || !ReadLiteral(stmt, pos, lit) || !expect(" AS BOOLEAN)")) {
+			return false;
+		}
+		// a bare 1/0/NULL: the BIT column converts it on assignment, and the batch is a third shorter
+		// than with a CAST per value - its text is parsed on every commit
+		if (lit.kind == LiteralKind::BOOLEAN) {
+			value = lit.text;
+		} else if (lit.kind == LiteralKind::NULL_VALUE) {
+			value = "NULL";
+		} else {
+			return false;
+		}
+		return true;
+	};
+	auto text = [&](string &value) {
+		Literal lit;
+		if (!ReadLiteral(stmt, pos, lit)) {
+			return false;
+		}
+		if (lit.kind == LiteralKind::STRING) {
+			// N'...': UTF-16 into the UTF-8 column, not through the database's code page
+			value = "N'" + lit.text + "'";
+		} else if (lit.kind == LiteralKind::NULL_VALUE) {
+			value = "NULL";
+		} else {
+			return false;
+		}
+		return true;
+	};
+	auto number = [&](string &value) {
+		Literal lit;
+		if (!ReadLiteral(stmt, pos, lit) || lit.kind != LiteralKind::NUMBER) {
+			return false;
+		}
+		value = lit.text;
+		return true;
+	};
+	out.values.assign(5, string());
+	if (!expect("UPDATE ") || !expect(CATALOG_PREFIX) || !expect("ducklake_table_column_stats SET contains_null=") ||
+	    !boolean(out.values[0]) || !expect(", contains_nan=") || !boolean(out.values[1]) || !expect(", min_value=") ||
+	    !text(out.values[2]) || !expect(", max_value=") || !text(out.values[3]) || !expect(", extra_stats=") ||
+	    !text(out.values[4])) {
+		return false;
+	}
+	out.exactness = stmt.compare(pos, 15, ", min_is_exact=") == 0;
+	if (out.exactness) {
+		out.values.resize(7);
+		if (!expect(", min_is_exact=") || !boolean(out.values[5]) || !expect(", max_is_exact=") ||
+		    !boolean(out.values[6])) {
+			return false;
+		}
+	}
+	return expect(" WHERE table_id=") && number(out.table_id) && expect(" AND column_id=") && number(out.column_id) &&
+	       pos == stmt.size();
+}
+
+//! A run of those for one table as ONE statement: the 1.0 shape, `UPDATE ... FROM (VALUES ...)`.
+//! DuckLake split it into a statement per column for a DuckDB-backed catalog, whose multi-row VALUES
+//! corrupted long strings beside NULLs; SQL Server has no such bug, and 41 statements cost ~4 ms of
+//! a commit's ~23 against one (specs/015).
+string CoalescedColumnStatsRefresh(const string &schema, const vector<ColumnStatsRefresh> &rows) {
+	static constexpr idx_t ROWS_PER_STATEMENT = 1000;
+	auto exactness = rows[0].exactness;
+	string set = "contains_null = v.contains_null, contains_nan = v.contains_nan, min_value = v.min_value, "
+	             "max_value = v.max_value, extra_stats = v.extra_stats";
+	string names = "column_id, contains_null, contains_nan, min_value, max_value, extra_stats";
+	if (exactness) {
+		set += ", min_is_exact = v.min_is_exact, max_is_exact = v.max_is_exact";
+		names += ", min_is_exact, max_is_exact";
+	}
+	string out;
+	for (idx_t start = 0; start < rows.size(); start += ROWS_PER_STATEMENT) {
+		auto end = MinValue<idx_t>(start + ROWS_PER_STATEMENT, rows.size());
+		string values;
+		for (idx_t i = start; i < end; i++) {
+			values += (i == start ? "(" : ", (") + rows[i].column_id;
+			for (auto &value : rows[i].values) {
+				values += ", " + value;
+			}
+			values += ")";
+		}
+		out += StringUtil::Format("UPDATE s SET %s FROM %s.ducklake_table_column_stats s JOIN (VALUES %s) v(%s) "
+		                          "ON s.table_id = %s AND s.column_id = v.column_id;\n",
+		                          set, schema, values, names, rows[0].table_id);
+	}
+	return out;
+}
+
 bool IsInlinedRowsInsert(const string &stmt) {
 	const string head = string("INSERT INTO ") + CATALOG_PREFIX + INLINED_DATA_PREFIX;
 	return StringUtil::StartsWith(stmt, head) && !StringUtil::StartsWith(stmt, head + "tables");
@@ -1049,7 +1162,30 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 		return true;
 	};
 
+	// the per-column stats refreshes of one table, gathered while they come one after another
+	vector<ColumnStatsRefresh> refreshes;
+	auto close_refreshes = [&]() {
+		if (!refreshes.empty()) {
+			run += CoalescedColumnStatsRefresh(schema, refreshes);
+			refreshes.clear();
+		}
+	};
 	for (auto &stmt : SplitStatements(query)) {
+		ColumnStatsRefresh refresh;
+		if (rewrite && ReadColumnStatsRefresh(stmt, refresh)) {
+			bool joins = !refreshes.empty() && refreshes[0].table_id == refresh.table_id &&
+			             refreshes[0].exactness == refresh.exactness;
+			// a column twice is two updates in order, the later one winning: not one join
+			for (auto &earlier : refreshes) {
+				joins = joins && earlier.column_id != refresh.column_id;
+			}
+			if (!joins) {
+				close_refreshes();
+			}
+			refreshes.push_back(std::move(refresh));
+			continue;
+		}
+		close_refreshes();
 		// the user's inlined rows, rendered by our WriteNewInlinedData
 		if (StringUtil::StartsWith(stmt, INLINED_ROWS_MARKER)) {
 			auto index = std::stoull(stmt.substr(strlen(INLINED_ROWS_MARKER)));
@@ -1109,6 +1245,7 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 			return last;
 		}
 	}
+	close_refreshes();
 	if (!flush()) {
 		return last;
 	}
