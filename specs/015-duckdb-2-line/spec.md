@@ -217,9 +217,26 @@ The load is DuckLake's eight statements over the catalog path. Its tables+column
 85 ms on 41k column rows. DuckDB pulls those rows and builds the nested lists locally, because the
 rewriter vetoes nested-type constructors. A DDL commit runs the load twice.
 
-1. **Why twice.** Determine it from DuckLake's source before anything else. If the second load is
-   a schema-cache miss that should have been a hit, the fix is upstream's, and it halves
-   `create_tables` with no code of ours.
+1. **Why twice — answered, and both halves are upstream's.** Traced on the 1000-table catalog by
+   DuckDB connection and query id (`attach_probe.py`, `duckdb_logs.connection_id` /
+   `query_id`). Each `CREATE TABLE`'s metadata transaction runs:
+   - **the load at its start snapshot N.** The previous commit created schema version N, and
+     DuckLake's cache, keyed by schema version, holds only the previous one, so it misses. That
+     cache is not filled from the committed state after a commit; filling it is upstream work,
+     close to incremental loading;
+   - **a full build at the commit snapshot N+1, before N+1 is written.** `ducklake_transaction_state.cpp:1788`:
+     a commit that creates tables calls the static
+     `DuckLakeMetadataManager::BuildCatalogForSnapshot` — every table, column, view, macro and sort
+     — and uses **only `existing_catalog.partitions`** from it, for `WriteNewPartitionKeys`. About
+     105 ms of the ~245 ms. Because the function is static, it bypasses the `GetCatalogForSnapshot`
+     virtual: a prototype that reused the previous load through that virtual never fired, which is
+     how this was found (eight virtual calls, twelve executed loads).
+
+   **Nothing safe to do here.** Its statements reach our `Query` exactly like a real load. Answering
+   them "empty except partitions" would make correctness depend on upstream reading nothing else
+   from that object. The upstream fix is small and measured: query the partitions, not the
+   catalog. Filing it is the owner's decision (it is a third-party repository). A `DROP TABLE`
+   commit makes no such call: one load per commit.
 2. **The tables+columns load as our T-SQL.** Override the read through `Query`, the same seam
    specs/008 uses:
    - the joins and snapshot filters run on the server;
@@ -354,7 +371,7 @@ Sent to the mssql session on 2026-10-06, ranked by the measurements above.
 
 Each step lands with its tests and its before/after numbers.
 
-1. **R4.1** — why the catalog loads twice. A diagnosis, possibly an upstream issue.
+1. ~~R4.1~~ — answered: both loads are upstream's (above); an issue is the owner's call.
 2. **R1** — first-use shaping, the patch dropped, both kinds tables, the per-format strict guard,
    and the create-at-1.1 verification.
 3. **R5, bounds** — the exact comparison, once the HUGEINT question is decided.

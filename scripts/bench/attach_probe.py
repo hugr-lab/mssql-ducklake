@@ -251,7 +251,11 @@ def main() -> int:
             start, stop = creates[k], creates[k + 1] if k + 1 < len(creates) else len(timed)
             print(f"--- commit #{k}, in order ---")
             for ms, m in timed[start:stop]:
-                print(f"{ms:>6}  {shape(redact(m, dsn))[:130]}")
+                # the snapshot a catalog-load statement reads at, and the id a commit writes
+                snap = re.search(r"WHERE (\d+) >= (?:tbl\.)?begin_snapshot", m) or re.search(
+                    r"ducklake_snapshot VALUES \((\d+),", m)
+                tag = f"  [snapshot {snap.group(1)}]" if snap else ""
+                print(f"{ms:>6}  {shape(redact(m, dsn))[:110]}{tag}")
         print(f"{n} CREATE TABLE commits, ms each: {user_ms}")
         print(f"mean {sum(user_ms) / n:.1f} ms, statements per commit {sum(c for c, _ in per.values()) / n:.1f}")
         print(f"{'n/commit':>9} {'ms/commit':>10}  shape")
