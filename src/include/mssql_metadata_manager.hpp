@@ -40,10 +40,9 @@ public:
 		return 128;
 	}
 
-	//! Our own initialization: DuckLake's DDL, then the T-SQL it cannot express - primary keys, the
-	//! filtered indexes every versioned read wants, and a binary UTF-8 collation on the statistics
-	//! columns the server compares (specs/004 D3). The keys are what let every UPDATE and DELETE in
-	//! a commit run through duckdb, which is why this manager needs no SQL rewriting at all.
+	//! DuckLake's DDL, then the shaping at once (specs/004 D3). Only at format 1.0: at 1.1 DuckLake
+	//! swaps a registered manager for a stock one for the attach transaction (specs/015 R1), so a
+	//! 1.1 catalog is created by stock DDL and shaped on first use instead (EnsureReady).
 	void InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) override;
 
 	//! Drop the mssql extension's catalog cache, which DuckLake asks for after creating an inlined
@@ -82,10 +81,12 @@ public:
 	//! one call; until that call exists these hand back to the client-side loop, so the fast path is
 	//! opt-in and every refusal is a fallback rather than a failure.
 	void ProbeServerCapabilities() override;
-	//! Our own versioned variant, so DuckLake's format wrapper composes with this manager instead of
-	//! replacing it (design/005: without the hook a registered manager is dropped on format 1.1).
-	unique_ptr<DuckLakeMetadataManager> CreateVersionedManager(DuckLakeTransaction &transaction,
-	                                                           DuckLakeVersion version) override;
+	//! Everything this manager used to do at attach, done instead on the first metadata query of a
+	//! transaction of ours, once per attach (specs/015 R1): the guards on DuckLake's texts, the
+	//! server-commit flag, the two markers read in one statement and the shaping when the stamp is
+	//! behind. At format 1.1 the attach transaction runs on a stock manager, so nothing this manager
+	//! needs may depend on running there. A catalog not created yet is left alone, unmarked.
+	void EnsureReady();
 	//! Read the latest snapshot through `mssql_scan` rather than through the attached catalog - the
 	//! postgres manager's trick. Worth about a tenth of a repeat read, this being one of roughly four
 	//! catalog queries a read makes (specs/005 D13).
@@ -164,9 +165,18 @@ private:
 	//! `PARAMETERIZATION FORCED` on the catalog's database (specs/012). Skipped when the
 	//! `mssql_ducklake_forced_parameterization` setting is false.
 	void ApplyForcedParameterization();
-	//! Is that shaping already applied? Asked on every attach, so it is one query rather than the
-	//! whole idempotent batch.
-	bool CatalogShapeIsCurrent();
+	//! What the server says about this catalog, in one statement: does it exist yet, is its shape
+	//! this build's, and has this build's migration run on it (specs/015 R3).
+	struct CatalogMarkers {
+		bool present = false;
+		bool shape_current = false;
+		bool migration_current = false;
+	};
+	CatalogMarkers ReadCatalogMarkers();
+	//! The server must have the UTF-8 BIN2 collation the shaping converts the catalog's strings to.
+	void RequireUtf8Collation();
+	//! This manager has already found the attach ready - one check per transaction at most.
+	bool ready = false;
 	//! The shape this build of the extension wants. Bumped whenever EnsureCatalogShape changes what
 	//! it produces - a column type, a key, an index, a database option - so that a catalog shaped by
 	//! an older build is brought up to it on the next attach instead of being left as it was. Starts
@@ -174,15 +184,20 @@ private:
 	//! property at all, read as older, and are converted once. 3 added forced parameterization of
 	//! the catalog's database (specs/012); 4 keys the inlined deletion tables an older build left
 	//! keyless (specs/014); 5 rebuilds ducklake_schema_versions' key over table_id as well (issue
-	//! #30 - without it a commit touching two tables is refused by the server). 6 is format
-	//! 1.1-dev1: the catalog tables it adds, keyed and collated - and the stamp doubles as the
-	//! answer to "has this build's migration run", which is what keeps DuckLake's per-attach re-run
-	//! of a dev format from re-shaping the catalog every time (MigrateV10Dev).
+	//! #30 - without it a commit touching two tables is refused by the server). 6 keys and collates
+	//! what format 1.1-dev1 adds, where it exists - every statement is guarded by the table's
+	//! existence, so the same version shapes a 1.0 catalog and a 1.1 one.
 	static constexpr int64_t SHAPE_VERSION = 6;
 	//! Where that version is recorded: an extended property on the catalog's own ducklake_metadata
 	//! table - per catalog, invisible to DuckLake's queries, and gone the moment the catalog's
 	//! tables are, which is what makes a recreated catalog shape itself again.
 	static constexpr const char *SHAPE_VERSION_PROPERTY = "mssql_ducklake_shape";
+	//! The migration's own marker, beside the stamp and independent of it (specs/015 R3): the format
+	//! and the revision of our migration to it. DuckLake re-runs the migration of a dev format on
+	//! every writable attach; an equal marker makes that a no-op. The revision moves when upstream
+	//! adds to the format under the same name, which brings already-migrated catalogs along.
+	static constexpr const char *MIGRATION_MARKER_PROPERTY = "mssql_ducklake_migration";
+	static constexpr const char *MIGRATION_MARKER = "1.1-dev1/1";
 	//! Run T-SQL through `mssql_exec` on a connection of the caller's choosing.
 	void RunOn(Connection &connection, const string &tsql, const string &context);
 	//! On this transaction's connection.

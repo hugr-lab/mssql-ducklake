@@ -19,45 +19,73 @@ namespace duckdb {
 // Initialization (specs/004 D3)
 //===--------------------------------------------------------------------===//
 
-bool MSSQLMetadataManager::CatalogShapeIsCurrent() {
-	// One cheap question instead of two batches of DDL. Attaching an existing catalog is on the hot
-	// path - every transaction pays for whatever happens here - and the shaping is only ever needed
-	// once per catalog per version of this extension.
+MSSQLMetadataManager::CatalogMarkers MSSQLMetadataManager::ReadCatalogMarkers() {
+	// One statement for the three questions an attach asks - is there a catalog yet, is its shape
+	// this build's, has this build's migration run - so readiness costs one round trip.
 	//
-	// A version rather than the presence of one constraint. The marker used to be the last key the
-	// shaping adds, which answered "some build of this extension shaped this catalog" - so a catalog
-	// shaped by an older one, whose column types and indexes are not what the current build wants,
-	// read as current and was left alone. The stamp is written last, after the DDL that earns it.
+	// Both markers sit on ducklake_metadata - the catalog's own anchor table, the one DuckLake probes
+	// to decide whether a catalog exists - and not on the schema. The shape stamp was on the schema
+	// for one day, and that was a regression: a catalog whose tables were dropped and recreated kept
+	// the schema's stamp, every later attach trusted it, and the catalog stayed without keys until
+	// the first UPDATE failed. A marker on the table dies with the table, so a recreated catalog is
+	// shaped (and migrated) again. Extended properties rather than rows in ducklake_metadata: DuckLake
+	// reads every row of that table on every attach, and never reads these.
+	//
+	// The inner statement travels inside a duckdb string literal, so each of its own quotes is
+	// doubled once; `mssql_scan_unsafe`, so bind sends nothing (mssql specs/081), and every column is
+	// cast to what it declares so the two cannot drift.
 	auto &connection = transaction.GetConnection();
-	// the inner statement travels inside a duckdb string literal, so each of its own quotes is
-	// doubled once - the same shape the collation probe above uses
 	auto schema_name =
 	    StringUtil::Replace(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName(), "'", "''''");
-	// The stamp sits on ducklake_metadata - the catalog's own anchor table, the one DuckLake probes to
-	// decide whether a catalog exists - and not on the schema. It was on the schema for one day, and
-	// that was a regression: a catalog whose tables were dropped and recreated (with our shaping
-	// failing partway, as it did behind a dying session's locks) kept the schema's stamp, every later
-	// attach trusted it, and the catalog stayed without keys until the first UPDATE failed. A stamp on
-	// the table dies with the table, so a recreated catalog is shaped again - the self-healing the
-	// old constraint marker had by construction.
-	// `mssql_scan_unsafe` rather than `mssql_scan`: the shape is ours to state, so bind sends
-	// nothing to the server - no `sp_describe_first_result_set` and no connection taken at bind at
-	// all (mssql specs/081). The declared type has to be what the stream brings, exactly, and the
-	// statement casts to it so the two cannot drift.
+	auto anchor = StringUtil::Format("OBJECT_ID(QUOTENAME(''%s'') + ''.ducklake_metadata'')", schema_name);
+	auto property = [&](const char *name, const char *type) {
+		return StringUtil::Format("(SELECT TRY_CAST(CAST(value AS VARCHAR(64)) AS %s) FROM sys.extended_properties "
+		                          "WHERE class = 1 AND major_id = %s AND minor_id = 0 AND name = ''%s'')",
+		                          type, anchor, name);
+	};
 	auto result = connection.Query(StringUtil::Format(
-	    "SELECT shape FROM mssql_scan_unsafe(%s, 'SELECT TRY_CAST(CAST(value AS VARCHAR(32)) AS BIGINT) AS shape "
-	    "FROM sys.extended_properties WHERE class = 1 "
-	    "AND major_id = OBJECT_ID(QUOTENAME(''%s'') + ''.ducklake_metadata'') AND minor_id = 0 AND name = ''%s''', "
-	    "columns := {'shape': 'BIGINT'})",
-	    CatalogLiteral(), schema_name, SHAPE_VERSION_PROPERTY));
+	    "SELECT present, shape, migration FROM mssql_scan_unsafe(%s, 'SELECT "
+	    "CAST(CASE WHEN %s IS NULL THEN 0 ELSE 1 END AS BIGINT) AS present, %s AS shape, %s AS migration', "
+	    "columns := {'present': 'BIGINT', 'shape': 'BIGINT', 'migration': 'VARCHAR'})",
+	    CatalogLiteral(), anchor, property(SHAPE_VERSION_PROPERTY, "BIGINT"),
+	    property(MIGRATION_MARKER_PROPERTY, "VARCHAR(64)")));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to inspect the DuckLake catalog on SQL Server: ");
 	}
-	auto row = result->Fetch();
-	if (!row || row->size() == 0 || row->GetValue(0, 0).IsNull()) {
-		return false;
+	CatalogMarkers markers;
+	auto chunk = result->Fetch();
+	if (!chunk || chunk->size() == 0) {
+		return markers;
 	}
-	return row->GetValue(0, 0).GetValue<int64_t>() >= SHAPE_VERSION;
+	markers.present = chunk->GetValue(0, 0).GetValue<int64_t>() != 0;
+	auto shape = chunk->GetValue(1, 0);
+	markers.shape_current = !shape.IsNull() && shape.GetValue<int64_t>() >= SHAPE_VERSION;
+	auto migration = chunk->GetValue(2, 0);
+	markers.migration_current = !migration.IsNull() && migration.ToString() == MIGRATION_MARKER;
+	return markers;
+}
+
+void MSSQLMetadataManager::RequireUtf8Collation() {
+	// The catalog's string columns are stored with a UTF-8 collation, so the server has to have one.
+	// Asking for the collation itself rather than the version: Azure SQL Database reports major
+	// version 12 while supporting it, and the version was only ever a proxy for this question.
+	// COUNT_BIG rather than COUNT: `COUNT(*)` is an `int` on the server and a given shape is checked
+	// strictly, so declaring BIGINT over COUNT would fail at execution.
+	auto &connection = transaction.GetConnection();
+	auto probe = connection.Query(
+	    StringUtil::Format("SELECT collations FROM mssql_scan_unsafe(%s, 'SELECT COUNT_BIG(*) AS collations "
+	                       "FROM sys.fn_helpcollations() WHERE name = ''%s''', columns := {'collations': 'BIGINT'})",
+	                       CatalogLiteral(), VARCHAR_COLLATION));
+	if (probe->HasError()) {
+		probe->GetErrorObject().Throw("Failed to ask SQL Server for its collations: ");
+	}
+	auto row = probe->Fetch();
+	if (!row || row->size() == 0 || row->GetValue(0, 0).IsNull() || row->GetValue(0, 0).GetValue<int64_t>() == 0) {
+		throw NotImplementedException(
+		    "This SQL Server has no %s collation, which a DuckLake catalog needs to store its strings without loss. "
+		    "UTF-8 collations arrived in SQL Server 2019.",
+		    VARCHAR_COLLATION);
+	}
 }
 
 //===--------------------------------------------------------------------===//
@@ -113,16 +141,23 @@ void MSSQLMetadataManager::MigrateToV1_1Dev1() {
 	ddl += StringUtil::Format("UPDATE %s.ducklake_metadata SET value = N'1.1-dev1' "
 	                          "WHERE [key] = N'version' AND value IN (N'1.0', N'1.1-dev1');\n",
 	                          schema);
-	// the catalog now holds a table and columns the shaping has never seen, and the shaping only runs
-	// when its stamp is behind - so the stamp goes, and the EnsureCatalogShape of this same attach
-	// keys, collates and indexes what just appeared
-	ddl += StringUtil::Format("IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 1 AND major_id = "
-	                          "OBJECT_ID(QUOTENAME(%s) + '.ducklake_metadata') AND minor_id = 0 AND name = '%s') "
-	                          "EXEC sp_dropextendedproperty @name = N'%s', @level0type = N'SCHEMA', @level0name = %s, "
-	                          "@level1type = N'TABLE', @level1name = N'ducklake_metadata';\n",
-	                          schema_literal, SHAPE_VERSION_PROPERTY, SHAPE_VERSION_PROPERTY, schema_literal);
+	// the marker, last: this build's migration has run on this catalog (specs/015 R3)
+	ddl += StringUtil::Format(
+	    "IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 1 AND major_id = "
+	    "OBJECT_ID(QUOTENAME(%s) + '.ducklake_metadata') AND minor_id = 0 AND name = '%s') "
+	    "EXEC sp_updateextendedproperty @name = N'%s', @value = N'%s', @level0type = N'SCHEMA', @level0name = %s, "
+	    "@level1type = N'TABLE', @level1name = N'ducklake_metadata' "
+	    "ELSE EXEC sp_addextendedproperty @name = N'%s', @value = N'%s', @level0type = N'SCHEMA', @level0name = %s, "
+	    "@level1type = N'TABLE', @level1name = N'ducklake_metadata';\n",
+	    schema_literal, MIGRATION_MARKER_PROPERTY, MIGRATION_MARKER_PROPERTY, MIGRATION_MARKER, schema_literal,
+	    MIGRATION_MARKER_PROPERTY, MIGRATION_MARKER, schema_literal);
 
 	RunServerSideOutsideTransaction(ddl, "Failed to migrate the DuckLake catalog to v1.1-dev1: ");
+	// The catalog now holds a table and columns no shaping has keyed. The migration runs on this
+	// manager in the attach transaction, before DuckLake swaps it for a stock one (specs/015 R1), so
+	// it shapes its own result here rather than leaving it to a later attach - a stamp that was
+	// already current would otherwise never send the shaping back.
+	EnsureCatalogShape();
 }
 
 //! Format 1.1 prefixes the metadata columns of the inlined DATA tables with `_ducklake_` - those
@@ -184,20 +219,20 @@ void MSSQLMetadataManager::MigrateV10(bool allow_failures) {
 //! version is 1.1-dev1 here by construction - that is the branch DuckLake took to get here - and a
 //! 1.0 catalog arrives at MigrateV10, which always runs.
 //!
-//! This is why SHAPE_VERSION has to move when the MIGRATION changes and not only when the shaping
-//! does: the stamp now stands for both.
+//! The marker answers that, not the shape stamp (specs/015 R3): they move independently.
 //!
 //! Upstream also splits the re-run in two halves and logs a warning for each, because either can
 //! fail on a catalog it has already half-migrated; ours cannot, so there is nothing to swallow and
 //! the error is the answer here too.
 void MSSQLMetadataManager::MigrateV10Dev() {
-	if (CatalogShapeIsCurrent()) {
+	if (ReadCatalogMarkers().migration_current) {
 		return;
 	}
 	MigrateToV1_1Dev1();
 }
 
 void MSSQLMetadataManager::EnsureCatalogShape() {
+	RequireUtf8Collation();
 	const string schema = SchemaIdentifier();
 	const string schema_literal =
 	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
@@ -479,7 +514,7 @@ EXEC sp_executesql @key;
 	                       "%s.ducklake_file_partition_value(table_id, partition_key_index, partition_value);\n",
 	                       index_exists(partition_lookup), partition_lookup, schema));
 
-	// Last, and only if everything above succeeded: the version stamp CatalogShapeIsCurrent reads.
+	// Last, and only if everything above succeeded: the version stamp ReadCatalogMarkers reads.
 	// It is what lets a catalog shaped by an older build of this extension be brought up to the
 	// current shape - the DDL is all idempotent, so the stamp is the only thing that decides whether
 	// it is worth running at all.
@@ -545,30 +580,8 @@ void MSSQLMetadataManager::ApplyForcedParameterization() {
 }
 
 void MSSQLMetadataManager::InitializeDuckLake(bool has_explicit_schema, DuckLakeEncryption encryption) {
-	auto &connection = transaction.GetConnection();
-	// The catalog's string columns are stored with a UTF-8 collation, so the server has to have one.
-	// Asking for the collation itself rather than the version: Azure SQL Database reports major
-	// version 12 while supporting it, and the version was only ever a proxy for this question.
-	// COUNT_BIG rather than COUNT: `COUNT(*)` is an `int` on the server and a given shape is checked
-	// strictly, so declaring BIGINT over COUNT would fail at execution - and BIGINT is what this is
-	// read back as.
-	auto probe = connection.Query(
-	    StringUtil::Format("SELECT collations FROM mssql_scan_unsafe(%s, 'SELECT COUNT_BIG(*) AS collations "
-	                       "FROM sys.fn_helpcollations() WHERE name = ''%s''', columns := {'collations': 'BIGINT'})",
-	                       CatalogLiteral(), VARCHAR_COLLATION));
-	if (probe->HasError()) {
-		probe->GetErrorObject().Throw("Failed to ask SQL Server for its collations: ");
-	}
-	auto row = probe->Fetch();
-	if (!row || row->size() == 0 || row->GetValue(0, 0).IsNull() || row->GetValue(0, 0).GetValue<int64_t>() == 0) {
-		throw NotImplementedException(
-		    "This SQL Server has no %s collation, which a DuckLake catalog needs to store its strings without loss. "
-		    "UTF-8 collations arrived in SQL Server 2019.",
-		    VARCHAR_COLLATION);
-	}
-
 	// DuckLake's own DDL first, through duckdb - it owns the shape of its catalog, and reproducing
-	// it here would be a copy to re-audit on every submodule bump.
+	// it here would be a copy to re-audit on every submodule bump. Then ours, at once.
 	DuckLakeMetadataManager::InitializeDuckLake(has_explicit_schema, encryption);
 	EnsureCatalogShape();
 }

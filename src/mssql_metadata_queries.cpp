@@ -163,6 +163,7 @@ void MSSQLMetadataManager::CreateInlinedDeletionTable(const string &table_name) 
 }
 
 unique_ptr<QueryResult> MSSQLMetadataManager::Query(DuckLakeSnapshot snapshot, string &query) {
+	EnsureReady();
 	// Recognised by comparing with DuckLake's own template, before any placeholder is substituted -
 	// which is why this overload and not Query(string &): here the text is still the raw template,
 	// and {SNAPSHOT_ID} has not yet been replaced with a number that would defeat the comparison.
@@ -273,6 +274,7 @@ string MSSQLMetadataManager::GetInlinedDeletionTableName(TableIndex table_id, Du
 }
 
 unique_ptr<QueryResult> MSSQLMetadataManager::Query(string &query) {
+	EnsureReady();
 	// the snapshot-less path: what the expiry, the cleanup and the flush DELETE through (specs/014
 	// D3c) - a recognised write goes as T-SQL, everything else to the base
 	if (auto written = TryRewriteWrite(query)) {

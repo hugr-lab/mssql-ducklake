@@ -1,5 +1,4 @@
 #include "mssql_metadata_manager.hpp"
-#include "metadata_manager/ducklake_metadata_manager_v1_1.hpp"
 #include "mssql_metadata_internal.hpp"
 
 #include "common/ducklake_types.hpp"
@@ -210,42 +209,64 @@ void MSSQLMetadataManager::InvalidateTableCache(const string &table_name) {
 	}
 }
 
-//! DuckLake wraps its metadata manager in a per-format subclass (DuckLakeMetadataManagerV1_1<Base>)
-//! and, without the hook this overrides, picks the base by dynamic_cast over its three built-ins -
-//! so a registered manager is replaced by the generic DuckDB-SQL one on any format past 1.0, and
-//! everything this class does (the shaping, the T-SQL batch, the rewrites) silently stops applying.
-//! The wrapper is a template over the base manager, so the composition is the one the built-ins get:
-//! the format's DDL comes from the wrapper's seven overrides, and ours keys and collates the result.
-unique_ptr<DuckLakeMetadataManager> MSSQLMetadataManager::CreateVersionedManager(DuckLakeTransaction &transaction,
-                                                                                 DuckLakeVersion version) {
-	if (version == DuckLakeVersion::V1_1_DEV_1) {
-		return make_uniq<DuckLakeMetadataManagerV1_1<MSSQLMetadataManager>>(transaction);
+//! "This attach of this catalog is ready": one entry per attached database, in the database
+//! instance's object cache. The key is the AttachedDatabase's oid, which DuckDB hands out once per
+//! ATTACH and never reuses within an instance - so a DETACH and re-ATTACH asks the server again, and
+//! the entry dies with the instance (the test runner makes many in one process, and a static would
+//! carry a flag from one into the next). Non-evictable; were it evicted, the cost would be one more
+//! read of the markers, which are the truth.
+class MSSQLCatalogReadyEntry : public ObjectCacheEntry {
+public:
+	static string ObjectType() {
+		return "mssql_ducklake_ready";
 	}
-	return nullptr;
-}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx();
+	}
+};
 
 void MSSQLMetadataManager::ProbeServerCapabilities() {
-	// Runs once per attach, including for a catalog this manager did not create - one made by an
-	// older build, or by a run that failed between DuckLake's DDL and ours. Without the keys such a
-	// catalog is readable but not writable, and the failure would surface much later as "requires a
-	// table with a primary key". Applying the DDL unconditionally cost two seconds on every attach
-	// (measured against the postgres backend), so ask first: one round trip when the catalog is
-	// already in shape, which is every attach after the first.
-	if (!CatalogShapeIsCurrent()) {
-		EnsureCatalogShape();
+	// At format 1.0 this runs on our manager once per attach; at 1.1 the attach runs on a stock one
+	// and this never reaches us. EnsureReady is the same work for both, on first use.
+	EnsureReady();
+}
+
+void MSSQLMetadataManager::EnsureReady() {
+	if (ready) {
+		return;
 	}
-	// Phase 2 is off by default because it is incomplete, not because it is wrong: the apply is
-	// correct for the commits it accepts - it produces a catalog identical to the client loop's -
-	// but it accepts only data files (specs/005 D4), and below a threshold the staging costs more
-	// than the loop it would replace (D5). MSSQL_DUCKLAKE_SERVER_COMMIT=1 turns it on for that work.
-	if (ServerCommitEnabled()) {
-		transaction.GetCatalog().SetRetrialsServerSide(true);
+	auto client_context = transaction.context.lock();
+	if (!client_context) {
+		throw InternalException("MSSQLMetadataManager: the client context is gone");
 	}
-	// The conflict-check rewrite (specs/007 D1) recognises DuckLake's query by an exact match. If a
-	// ducklake bump edits that query the match simply stops happening, the base query runs, and the
-	// concurrent-commit crash comes back - silently, in a path only concurrent writers reach. So the
-	// mismatch is made loud here instead: one string comparison per attach, and a bump that touches
-	// the query fails the integration suite rather than shipping a correctness regression.
+	auto &catalog = transaction.GetCatalog();
+	// The attach's own first queries run before the catalog knows its metadata schema. Asked then,
+	// the markers resolve an empty schema to the login's default one, and a shaping would write
+	// `"".ducklake_...` (error 1038). Nothing to decide yet - and not marked, so a later query asks.
+	if (catalog.MetadataSchemaName().GetIdentifierName().empty()) {
+		return;
+	}
+	auto &cache = ObjectCache::GetObjectCache(*client_context);
+	auto key = StringUtil::Format("mssql_ducklake:ready:%llu", catalog.GetAttached().oid);
+	if (cache.Get<MSSQLCatalogReadyEntry>(key)) {
+		ready = true;
+		return;
+	}
+	// two transactions of one attach finding it unready together would both shape - harmless, the
+	// shaping is idempotent, but it is two batches of DDL; one of them waits instead
+	static mutex readiness_lock;
+	lock_guard<mutex> guard(readiness_lock);
+	if (cache.Get<MSSQLCatalogReadyEntry>(key)) {
+		ready = true;
+		return;
+	}
+	// The conflict-check rewrite (specs/007 D1) and the inlined-deletion DDL (specs/006 D5b) are
+	// recognised by exact match. A ducklake bump that edits either would silently stop matching and
+	// bring back what they fix, in paths only concurrent writers or flushes reach - so the mismatch
+	// is made loud, once per attach.
 	if (!InlinedDeletionDdlIsDuckLakes(*this)) {
 		throw InvalidInputException(
 		    "mssql_ducklake: DuckLake's DDL for a new inlined deletion table has changed in this ducklake "
@@ -259,6 +280,25 @@ void MSSQLMetadataManager::ProbeServerCapabilities() {
 		    "(specs/007); re-audit the rewrite against the new text and update "
 		    "DUCKLAKE_CONFLICT_CHECK_QUERY.");
 	}
+	auto markers = ReadCatalogMarkers();
+	if (!markers.present) {
+		// being created: DuckLake's DDL is still to come, and InitializeDuckLake (1.0) or the next
+		// transaction's first query (1.1) shapes it. Not marked ready, so that one asks again.
+		return;
+	}
+	// Phase 2 is off by default because it is incomplete, not because it is wrong (specs/005 D4, D5).
+	if (ServerCommitEnabled()) {
+		catalog.SetRetrialsServerSide(true);
+	}
+	// A catalog this build did not shape - an older build's, one a stock manager created at format
+	// 1.1, or one whose shaping failed partway - is readable but not writable without the keys, and
+	// the failure would surface much later as "requires a table with a primary key". One round trip
+	// says whether there is anything to do.
+	if (!markers.shape_current) {
+		EnsureCatalogShape();
+	}
+	cache.Put(key, make_shared_ptr<MSSQLCatalogReadyEntry>());
+	ready = true;
 }
 
 //===--------------------------------------------------------------------===//

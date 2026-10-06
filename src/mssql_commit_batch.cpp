@@ -2,7 +2,6 @@
 #include "mssql_metadata_internal.hpp"
 
 #include "common/ducklake_util.hpp"
-#include "common/ducklake_version.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/database.hpp"
 #include "storage/ducklake_catalog.hpp"
@@ -40,7 +39,13 @@ struct Literal {
 //! and the columns its migrations added): n BIGINT, s VARCHAR, b BOOLEAN, t TIMESTAMPTZ, u UUID.
 //! A tuple is rendered column by column against this, and a table that is not here - or a tuple
 //! of another width - is not rewritten.
-const unordered_map<string, string> &CatalogColumns() {
+//!
+//! Both formats are supported (specs/015 R1), and they differ only at the end of five tables: format
+//! 1.1 appends `row_group_count` to the data and delete files, `min_is_exact`/`max_is_exact` to both
+//! stats tables and `parent_schema_id` to schemas, and adds `ducklake_view_column_tag`. A migrated
+//! catalog gets those columns by `ALTER … ADD`, which appends - so the 1.0 layout is the 1.1 one with
+//! the tail cut, and that is how it is derived rather than written out twice.
+const unordered_map<string, string> &CatalogColumnsV1_1() {
 	static const unordered_map<string, string> columns = {
 	    {"ducklake_metadata", "sssn"},
 	    {"ducklake_snapshot", "ntnnn"},
@@ -297,7 +302,28 @@ string ChunkedStatements(const string &head, const vector<string> &rows, const s
 
 //! `INSERT INTO {METADATA_CATALOG}.<table> VALUES (...)[, (...)]` for a table on the list. The
 //! macros' generator writes `values(` in lower case with no space; both forms are the same statement.
-bool RewriteInsert(const string &stmt, const string &schema, string &tsql) {
+const unordered_map<string, string> &CatalogColumnsV1_0() {
+	static const unordered_map<string, string> columns = [] {
+		auto result = CatalogColumnsV1_1();
+		const vector<pair<string, idx_t>> added_by_v1_1 = {
+		    {"ducklake_data_file", 1},          {"ducklake_delete_file", 1}, {"ducklake_file_column_stats", 2},
+		    {"ducklake_table_column_stats", 2}, {"ducklake_schema", 1},
+		};
+		for (auto &entry : added_by_v1_1) {
+			auto &kinds = result.at(entry.first);
+			kinds.resize(kinds.size() - entry.second);
+		}
+		result.erase("ducklake_view_column_tag");
+		return result;
+	}();
+	return columns;
+}
+
+const unordered_map<string, string> &CatalogColumns(bool v1_1) {
+	return v1_1 ? CatalogColumnsV1_1() : CatalogColumnsV1_0();
+}
+
+bool RewriteInsert(const string &stmt, const string &schema, bool v1_1, string &tsql) {
 	const string head = string("INSERT INTO ") + CATALOG_PREFIX;
 	if (!StringUtil::StartsWith(stmt, head)) {
 		return false;
@@ -308,8 +334,9 @@ bool RewriteInsert(const string &stmt, const string &schema, string &tsql) {
 	if (StringUtil::StartsWith(table, INLINED_DELETE_PREFIX)) {
 		kinds = "nnn";
 	} else {
-		auto entry = CatalogColumns().find(table);
-		if (entry == CatalogColumns().end()) {
+		auto &columns = CatalogColumns(v1_1);
+		auto entry = columns.find(table);
+		if (entry == columns.end()) {
 			return false;
 		}
 		kinds = entry->second;
@@ -753,19 +780,18 @@ unique_ptr<QueryResult> MSSQLMetadataManager::RewriteWriteStatement(string query
 }
 
 unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot, string &query) {
+	EnsureReady();
 	// The snapshot's numbers first, so that a literal is a literal; {METADATA_CATALOG} stays until
 	// each family decides what to do with it. The base substitutes again on what it is handed and
 	// finds nothing left to replace.
 	SubstituteSnapshotPlaceholders(snapshot, query);
 	const auto schema = SchemaIdentifier();
-	// The kinds table above describes THIS build's format. A catalog left at an older one writes
-	// tuples of other widths, the rewrite declines them by construction and the base path carries
-	// them - correct, just not in one round trip. So the strict switch, which asks "is there a shape
-	// this build should have recognised", only speaks at the format the table was written for; at the
-	// next ducklake bump LATEST moves ahead of the table and the suite starts naming statements
-	// again, which is how the bump's re-audit is triggered.
-	const bool strict =
-	    StrictBatchEnabled() && transaction.GetCatalog().GetDuckLakeVersion() == DUCKLAKE_LATEST_VERSION;
+	// The kinds come from the catalog's own format, so a 1.0 catalog keeps the T-SQL batch it has
+	// today and the strict guard holds at both formats. A future format that reports v1.1 metadata
+	// but writes wider tuples is declined by width - and named by the guard, which is the re-audit
+	// a ducklake bump asks for.
+	const bool v1_1 = transaction.GetCatalog().SupportsV1_1Metadata();
+	const bool strict = StrictBatchEnabled();
 	const bool rewrite = BatchRewriteEnabled();
 
 	string run;
@@ -806,7 +832,7 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 			}
 		}
 		string tsql, dropped;
-		if (rewrite && (RewriteInsert(stmt, schema, tsql) || RewriteUpdate(stmt, schema, tsql) ||
+		if (rewrite && (RewriteInsert(stmt, schema, v1_1, tsql) || RewriteUpdate(stmt, schema, tsql) ||
 		                RewriteDelete(stmt, schema, tsql) || RewriteCteUpdate(stmt, schema, tsql))) {
 			run += tsql + "\n";
 			continue;
