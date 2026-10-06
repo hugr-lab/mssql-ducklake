@@ -100,6 +100,7 @@ bench-scale:
 # A one-off probe that needs the connection string without printing it (design/005 scratch).
 #   make bench-script SCRIPT=/path/to/probe.py
 bench-script: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
+bench-script: export MSSQL_DUCKLAKE_PG_DSN := $(MSSQL_DUCKLAKE_PG_DSN)
 bench-script:
 	python3 $(SCRIPT)
 

@@ -166,6 +166,8 @@ def main() -> int:
     parser.add_argument("--refill-inlined", type=int, default=0,
                         help="first put an inlined table back under this many lake tables (s<i %% schemas>.t<i>)")
     parser.add_argument("--refill-schemas", type=int, default=10, help="schemas those tables are spread over")
+    parser.add_argument("--read-table", type=int, default=0,
+                        help="read the bench table s<n%%10>.t<n> with the bench's filter, --rounds times, by statement")
     parser.add_argument("--flush-tables", type=int, default=0,
                         help="N tables with inlined rows, one flush of them, broken down by statement")
     parser.add_argument("--insert-commits", type=int, default=0,
@@ -189,6 +191,21 @@ def main() -> int:
         return "MSSQL_DUCKLAKE_TEST_DSN is needed (make bench-attach-probe sets it)"
     dsn, env = args.mssql_dsn, dict(os.environ)
     build = os.path.abspath(args.build)
+
+    if args.read_table:
+        # What a read of one table is made of: the bench's filtered_read, repeated, on the bench
+        # catalog's table s<i%10>.t<i> (the probe table of scale_catalog.py is t500).
+        t = args.read_table
+        q = f"SELECT count(*), sum(c0) FROM lake.s{t % 10}.t{t} WHERE id BETWEEN 10 AND 40;"
+        timed = run_arm(args.duckdb, build, dsn, "true", env, False, "\n".join([q] * args.rounds))
+        starts = [i for i, (_, m) in enumerate(timed) if m.startswith("SELECT count(*), sum(c0) FROM lake.")]
+        for k, start in enumerate(starts):
+            stop = starts[k + 1] if k + 1 < len(starts) else len(timed) - 1
+            print(f"--- read #{k}: {sum(ms for ms, _ in timed[start:stop])} ms, {stop - start} statements")
+            if k in (0, len(starts) - 1):
+                for ms, m in timed[start:stop]:
+                    print(f"{ms:>6}  {shape(redact(m, dsn))[:150]}")
+        return 0
 
     if args.flush_tables:
         # What the bench's flush_inlined phase is made of - 135-144 s for 1000 tables. N tables of the

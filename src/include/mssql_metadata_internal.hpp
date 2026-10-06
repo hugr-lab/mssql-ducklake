@@ -60,6 +60,12 @@ inline bool ConflictRewriteEnabled() {
 //! specs/014: an unrecognised catalog statement in the commit batch is an error rather than a
 //! fallback to the base. On in the integration suite, so that a ducklake bump that adds a shape
 //! fails the suite naming the statement; off for a user, whose catalog keeps working, slower.
+//! Off switch for the server-side file list (specs/015), so its absence can be measured.
+inline bool ServerFileListDisabled() {
+	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_SERVER_FILE_LIST") != nullptr;
+	return disabled;
+}
+
 inline bool StrictBatchEnabled() {
 	static const bool enabled = getenv("MSSQL_DUCKLAKE_STRICT_BATCH") != nullptr;
 	return enabled;

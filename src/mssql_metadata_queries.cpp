@@ -1,4 +1,6 @@
 #include "mssql_metadata_manager.hpp"
+
+#include <regex>
 #include "mssql_metadata_internal.hpp"
 
 #include "common/ducklake_types.hpp"
@@ -8,6 +10,7 @@
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/main/database.hpp"
 #include "storage/ducklake_catalog.hpp"
+#include "storage/ducklake_stats.hpp"
 #include "storage/ducklake_metadata_info.hpp"
 #include "storage/ducklake_staged_commit.hpp"
 #include "storage/ducklake_transaction_changes.hpp"
@@ -282,6 +285,265 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Query(string &query) {
 		return written;
 	}
 	return DuckLakeMetadataManager::Query(query);
+}
+
+//===--------------------------------------------------------------------===//
+// The file list on the server (specs/015)
+//===--------------------------------------------------------------------===//
+
+namespace {
+
+//! The T-SQL type a stats string is compared as, and the bounds that stand in for one the server
+//! cannot read. Empty means "no pruning on this column" - DuckLake's own convention for a cast a
+//! backend cannot express, which the postgres manager uses the same way.
+struct TSQLStatsType {
+	string type;
+	string lowest;
+	string highest;
+};
+
+TSQLStatsType StatsTypeFor(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+		return {"BIGINT", "CAST(-9223372036854775808 AS BIGINT)", "CAST(9223372036854775807 AS BIGINT)"};
+	case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::HUGEINT:
+	case LogicalTypeId::UHUGEINT:
+		// DECIMAL(38,0) holds every UBIGINT and HUGEINT up to 10^38; a stats string past that does not
+		// cast, and its unknown bound then excludes nothing
+		return {"DECIMAL(38, 0)", "CAST(-99999999999999999999999999999999999999 AS DECIMAL(38, 0))",
+		        "CAST(99999999999999999999999999999999999999 AS DECIMAL(38, 0))"};
+	case LogicalTypeId::DECIMAL: {
+		auto width = DecimalType::GetWidth(type);
+		auto scale = DecimalType::GetScale(type);
+		auto nines = string(width - scale, '9') + (scale > 0 ? "." + string(scale, '9') : "");
+		if (width == scale) {
+			nines = "0." + string(scale, '9');
+		}
+		auto t = StringUtil::Format("DECIMAL(%d, %d)", width, scale);
+		return {t, StringUtil::Format("CAST(-%s AS %s)", nines, t), StringUtil::Format("CAST(%s AS %s)", nines, t)};
+	}
+	case LogicalTypeId::FLOAT:
+	case LogicalTypeId::DOUBLE:
+		return {"FLOAT", "CAST(-1.79E+308 AS FLOAT)", "CAST(1.79E+308 AS FLOAT)"};
+	case LogicalTypeId::DATE:
+		return {"DATE", "CAST('0001-01-01' AS DATE)", "CAST('9999-12-31' AS DATE)"};
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_SEC:
+	case LogicalTypeId::TIMESTAMP_MS:
+		return {"DATETIME2(6)", "CAST('0001-01-01 00:00:00' AS DATETIME2(6))",
+		        "CAST('9999-12-31 23:59:59.999999' AS DATETIME2(6))"};
+	case LogicalTypeId::TIMESTAMP_TZ:
+		return {"DATETIMEOFFSET(6)", "CAST('0001-01-01 00:00:00 +14:00' AS DATETIMEOFFSET(6))",
+		        "CAST('9999-12-31 23:59:59.999999 -14:00' AS DATETIMEOFFSET(6))"};
+	case LogicalTypeId::BOOLEAN:
+		return {"BIT", "CAST(0 AS BIT)", "CAST(1 AS BIT)"};
+	default:
+		// TIMESTAMP_NS and TIME_NS lose digits in DATETIME2/TIME(7); TIME, TIME_TZ, INTERVAL and the
+		// rest are not compared - no pruning on them, which is always correct
+		return {};
+	}
+}
+
+//! DuckDB prints a TIMESTAMPTZ with a bare hour offset (`+00`); SQL Server reads `+00:00`.
+string WithMinuteOffset(const string &text) {
+	auto n = text.size();
+	if (n > 3 && (text[n - 3] == '+' || text[n - 3] == '-') && StringUtil::CharacterIsDigit(text[n - 2]) &&
+	    StringUtil::CharacterIsDigit(text[n - 1])) {
+		return text + ":00";
+	}
+	return text;
+}
+
+bool HasFourDigitYear(const string &text) {
+	return text.size() >= 10 && StringUtil::CharacterIsDigit(text[0]) && StringUtil::CharacterIsDigit(text[1]) &&
+	       StringUtil::CharacterIsDigit(text[2]) && StringUtil::CharacterIsDigit(text[3]) && text[4] == '-' &&
+	       text[7] == '-';
+}
+
+bool IsAscii(const string &text) {
+	for (auto c : text) {
+		if (static_cast<unsigned char>(c) >= 0x80) {
+			return false;
+		}
+	}
+	return true;
+}
+
+//! What FileListToTSQL made of a query: T-SQL; a known limit, which keeps the catalog path quietly;
+//! or something it does not know, which is the strict guard's business.
+enum class FileListOutcome { TSQL, KNOWN_LIMIT, UNKNOWN };
+
+//! The closed list of rewrites that turn DuckLake's file-list query into T-SQL, and the check that
+//! nothing else is left.
+FileListOutcome FileListToTSQL(string &query) {
+	// `col_N_stats.contains_nan` stands alone as a predicate in DuckDB SQL; a BIT is not one in T-SQL
+	query = std::regex_replace(query, std::regex(R"((\bcol_\d+_stats\.contains_nan)\b(?!\s*(=|<>|IS\b)))"), "($1 = 1)");
+	// the bucket-partition clause's `IS DISTINCT FROM n` (SQL Server has it only from 2022)
+	query = std::regex_replace(query, std::regex(R"((\bdata\.partition_id) IS DISTINCT FROM (\d+))"),
+	                           "($1 IS NULL OR $1 <> $2)");
+	// Top-N's `ORDER BY e ASC|DESC NULLS LAST`, the last line DuckLake may add
+	query = std::regex_replace(query, std::regex(R"(\nORDER BY (.+) (ASC|DESC) NULLS LAST$)"),
+	                           "\nORDER BY CASE WHEN $1 IS NULL THEN 1 ELSE 0 END, $1 $2");
+	// whatever DuckDB syntax a future ducklake adds, and text a VARCHAR literal could not carry, is not
+	// ours to translate by guessing
+	static const vector<string> foreign = {"::",     " NULLS ", " DISTINCT FROM ", "LIST(",   "list_", "struct_",
+	                                       "regexp", "->",      "TRY_CAST(",       " ILIKE ", "{'"};
+	for (auto &token : foreign) {
+		if (query.find(token) != string::npos) {
+			// our casts are written as TRY_CONVERT, so a TRY_CAST left over is DuckLake's and DuckDB-typed
+			return FileListOutcome::UNKNOWN;
+		}
+	}
+	// non-ASCII text outside our own N literals - a partition value DuckLake wrote as a plain literal -
+	// would lose characters in a database of another code page
+	auto outside_n_literals = std::regex_replace(query, std::regex(R"(N'(?:[^']|'')*')"), "N''");
+	return IsAscii(outside_n_literals) ? FileListOutcome::TSQL : FileListOutcome::KNOWN_LIMIT;
+}
+
+} // namespace
+
+string MSSQLMetadataManager::CastValueToTarget(const Value &value, const LogicalType &type) {
+	if (!building_tsql_file_list) {
+		// DuckLake's own, for the catalog path - repeated rather than called, because the base keeps
+		// it private. Re-audit at a ducklake bump (DuckLakeMetadataManager::CastValueToTarget).
+		auto finite = (value.type().id() != LogicalTypeId::FLOAT && value.type().id() != LogicalTypeId::DOUBLE) ||
+		              Value::IsFinite(value.GetValue<double>());
+		if (type.IsNumeric() && finite) {
+			return value.ToString();
+		}
+		return DuckLakeUtil::SQLLiteralToString(value.ToString());
+	}
+	if (value.IsNull()) {
+		return string();
+	}
+	auto text = value.ToString();
+	if (text.find('\0') != string::npos) {
+		return string();
+	}
+	if (RequiresValueComparison(type)) {
+		auto target = StatsTypeFor(type);
+		if (target.type.empty()) {
+			return string();
+		}
+		if (type.IsNumeric()) {
+			if ((value.type().id() == LogicalTypeId::FLOAT || value.type().id() == LogicalTypeId::DOUBLE) &&
+			    !Value::IsFinite(value.GetValue<double>())) {
+				return string();
+			}
+			return StringUtil::Format("CAST(%s AS %s)", DuckLakeUtil::SQLLiteralToString(text), target.type);
+		}
+		if (type.id() == LogicalTypeId::BOOLEAN) {
+			return value.GetValue<bool>() ? "CAST(1 AS BIT)" : "CAST(0 AS BIT)";
+		}
+		if (!HasFourDigitYear(text)) {
+			return string();
+		}
+		if (type.id() == LogicalTypeId::TIMESTAMP_TZ) {
+			text = WithMinuteOffset(text);
+		}
+		return StringUtil::Format("CAST(%s AS %s)", DuckLakeUtil::SQLLiteralToString(text), target.type);
+	}
+	if (type.id() == LogicalTypeId::VARCHAR || type.id() == LogicalTypeId::UUID) {
+		// compared under the stats column's UTF-8 BIN2 collation, which is DuckDB's byte order. An N
+		// literal carries any text whatever the database's code page, and the cast puts it in that
+		// collation, so `раздел3` compares as DuckDB compares it.
+		// The collation goes on the N literal BEFORE the cast: a cast to VARCHAR converts into the code
+		// page of the collation the value has, and a bare N literal has the database's - CP1252 here,
+		// where `раздел3` became `???????3` and the pruning dropped every file (attach_mssql.test).
+		return StringUtil::Format("CAST(N%s COLLATE Latin1_General_100_BIN2_UTF8 AS VARCHAR(MAX))",
+		                          DuckLakeUtil::SQLLiteralToString(text));
+	}
+	return string();
+}
+
+string MSSQLMetadataManager::CastStatsToTarget(const string &stats, const LogicalType &type, StatsCastType cast_type) {
+	if (!building_tsql_file_list) {
+		// DuckLake's own, repeated for the same reason (DuckLakeMetadataManager::CastStatsToTarget)
+		if (RequiresValueComparison(type)) {
+			return "TRY_CAST(" + stats + " AS " + type.ToString() + ")";
+		}
+		return stats;
+	}
+	if (!RequiresValueComparison(type)) {
+		return (type.id() == LogicalTypeId::VARCHAR || type.id() == LogicalTypeId::UUID) ? stats : string();
+	}
+	auto target = StatsTypeFor(type);
+	if (target.type.empty()) {
+		return string();
+	}
+	auto text = type.id() == LogicalTypeId::TIMESTAMP_TZ
+	                ? StringUtil::Format("(CASE WHEN %s LIKE '%%[+-][0-9][0-9]' THEN %s + ':00' ELSE %s END)", stats,
+	                                     stats, stats)
+	                : stats;
+	auto cast = StringUtil::Format("TRY_CONVERT(%s, %s)", target.type, text);
+	switch (cast_type) {
+	case StatsCastType::MIN:
+		// a bound the server cannot read must not exclude a file: DuckDB reads every value it wrote,
+		// SQL Server does not (an infinity, a HUGEINT past 10^38, a year past 9999)
+		return StringUtil::Format("COALESCE(%s, %s)", cast, target.lowest);
+	case StatsCastType::MAX:
+		return StringUtil::Format("COALESCE(%s, %s)", cast, target.highest);
+	default:
+		return cast;
+	}
+}
+
+string MSSQLMetadataManager::GenerateFileListQuery(DuckLakeTableEntry &table, const FilterPushdownInfo *filter_info,
+                                                   const vector<DuckLakeFileListDynamicFilter> &dynamic_filters,
+                                                   const vector<idx_t> &runtime_filter_stats_columns,
+                                                   FileListType file_list_type, const string &metadata_table_prefix,
+                                                   const FileColumnStatsCTEBodyGenerator &generate_cte_body) {
+	auto catalog_path = [&]() {
+		return DuckLakeMetadataManager::GenerateFileListQuery(table, filter_info, dynamic_filters,
+		                                                      runtime_filter_stats_columns, file_list_type,
+		                                                      metadata_table_prefix, generate_cte_body);
+	};
+	if (ServerFileListDisabled()) {
+		return catalog_path();
+	}
+	// DuckLake's builder, with the schema as the server names it, our CTE body and our casts
+	auto native_cte = [](const CTERequirement &req, TableIndex table_id) {
+		string select_list = "data_file_id";
+		for (auto &stat : req.referenced_stats) {
+			select_list += ", " + stat;
+		}
+		return StringUtil::Format("  SELECT %s\n  FROM {METADATA_SCHEMA_ESCAPED}.ducklake_file_column_stats\n"
+		                          "  WHERE column_id = %d AND table_id = %d\n",
+		                          select_list, req.column_field_index, table_id.index);
+	};
+	string query;
+	building_tsql_file_list = true;
+	try {
+		query = DuckLakeMetadataManager::GenerateFileListQuery(table, filter_info, dynamic_filters,
+		                                                       runtime_filter_stats_columns, file_list_type,
+		                                                       "{METADATA_SCHEMA_ESCAPED}", native_cte);
+	} catch (...) {
+		building_tsql_file_list = false;
+		throw;
+	}
+	building_tsql_file_list = false;
+	auto outcome = FileListToTSQL(query);
+	if (outcome == FileListOutcome::KNOWN_LIMIT) {
+		return catalog_path();
+	}
+	if (outcome == FileListOutcome::UNKNOWN) {
+		if (StrictBatchEnabled()) {
+			throw InvalidInputException("mssql_ducklake: a file-list query the server-side read does not cover "
+			                            "(specs/015): %s",
+			                            query);
+		}
+		return catalog_path();
+	}
+	// the sole source of its statement, described by the server (the select list varies with the
+	// read), the placeholders left for the base to substitute
+	return "SELECT * FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, " + SQLString(query) + ")";
 }
 
 string MSSQLMetadataManager::GetLatestSnapshotQuery() const {

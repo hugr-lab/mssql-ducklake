@@ -92,6 +92,23 @@ public:
 	//! catalog queries a read makes (specs/005 D13).
 	string GetLatestSnapshotQuery() const override;
 
+	//! The read path (specs/015): the file list of a scan - DuckLake's query with its stats CTEs and
+	//! pruning filters - run on the server as ONE statement, the way the postgres manager runs it in
+	//! postgres, instead of through the catalog path in pieces. DuckLake builds it with our CTE body
+	//! and our casts; a closed list of rewrites makes it T-SQL; anything outside that list keeps the
+	//! catalog path.
+	string GenerateFileListQuery(DuckLakeTableEntry &table, const FilterPushdownInfo *filter_info,
+	                             const vector<DuckLakeFileListDynamicFilter> &dynamic_filters,
+	                             const vector<idx_t> &runtime_filter_stats_columns, FileListType file_list_type,
+	                             const string &metadata_table_prefix,
+	                             const FileColumnStatsCTEBodyGenerator &generate_cte_body) override;
+	//! The pruning casts, in T-SQL while the file list is being built for the server and DuckLake's
+	//! own otherwise (the catalog-path fallback is DuckDB SQL).
+	string CastValueToTarget(const Value &value, const LogicalType &type) override;
+	string CastStatsToTarget(const string &stats, const LogicalType &type, StatsCastType cast_type) override;
+	//! Set while GenerateFileListQuery builds the server's statement.
+	bool building_tsql_file_list = false;
+
 	//! Intercepts exactly one of DuckLake's queries - the commit loop's conflict check - and swaps it
 	//! for a form that reads ducklake_snapshot once instead of twice (specs/007 D1). Everything else
 	//! goes to the base untouched. Both query texts are constants in the .cpp; nothing outside needs
