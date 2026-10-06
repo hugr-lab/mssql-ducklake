@@ -50,3 +50,4 @@ specs are the shareable distillation of that work.
 | [012](012-forced-parameterization/spec.md) | forced parameterization on the catalog's database | implemented |
 | [013](013-docs-site/spec.md) | the documentation site | implemented |
 | [014](014-commit-batch-tsql/spec.md) | the commit batch as our T-SQL, statement by known statement | implemented |
+| [015](015-duckdb-2-line/spec.md) | the DuckDB 2.0 line — what the port changed in the manager, and the transition | draft (on `recon/duckdb-2.0-pushdown`) |
