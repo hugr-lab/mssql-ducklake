@@ -476,6 +476,20 @@ the batch - so the difference is in what each costs:
   do; for the extension.
 - **`AUTO_UPDATE_STATISTICS_ASYNC`** (specs/017) costs the commit nothing: 20.1–20.9 ms either way.
 
+## The flush's one commit, past the server's memory (measured 2026-10-06)
+
+Both 2.0 runs of the full bench had one error, in `flush_inlined`: *SQL Server error 701: There is
+insufficient system memory in resource pool 'default'* (the integration server runs with 2 GB).
+The flush of 1000 tables is ONE commit, and the T-SQL run sent it as ONE `mssql_exec`: per table a
+`ducklake_table_stats` update, the column-stats refresh (41 statements before the coalescing above,
+one after) and a `DELETE` from its inlined table - ~3000 statements, ~2.7 MB (11 MB before the
+coalescing). SQL Server parses and compiles a batch whole, and the cost is superlinear: 0.27 MB
+took 218 ms, 0.80 MB 1245–1820 ms. A run now goes as several calls past 256 KB, cut between
+statements, all on the transaction's connection - the commit stays one transaction. At 300 tables
+the commit's run went from one 0.80 MB call in 1820 ms to three of at most 0.28 MB, ~0.7 s together;
+64 KB is worse again (twelve calls). `MSSQL_DUCKLAKE_RUN_LIMIT_KB` overrides it; the suite passes
+with it at 1 KB, every statement nearly its own call.
+
 ## Dependencies on the mssql extension
 
 Sent to the mssql session on 2026-10-06, ranked by the measurements above.

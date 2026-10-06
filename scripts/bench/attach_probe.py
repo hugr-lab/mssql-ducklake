@@ -249,6 +249,15 @@ def main() -> int:
                     r"ducklake_snapshot VALUES \((\d+), [^,]+, (\d+)", m)
                 tag = f"  [snapshot {snap.group(1)}{', schema ' + snap.group(2) if snap and snap.lastindex == 2 else ''}]" if snap else ""
                 print(f"{ms:>6}  {shape(redact(m, dsn))[:100]}{tag}")
+        runs = [(ms, len(m)) for ms, m in timed[start:stop] if m.startswith("SELECT mssql_exec(")]
+        if runs:
+            big = max(runs, key=lambda r: r[1])
+            dump = os.environ.get("PROBE_DUMP_LARGEST")
+            if dump:
+                with open(dump, "w") as fh:
+                    fh.write(max((m for _, m in timed[start:stop] if m.startswith("SELECT mssql_exec(")), key=len))
+            print(f"T-SQL runs in the flush: {len(runs)}, the largest {big[1] / 1e6:.2f} MB taking {big[0]} ms, "
+                  f"all {sum(r[1] for r in runs) / 1e6:.2f} MB")
         total = sum(ms for ms, _ in timed[start:stop])
         print(f"flush of {n} tables: {total} ms, {total / n:.1f} ms a table, "
               f"{sum(c for c, _ in per.values()) / n:.1f} statements a table")

@@ -86,6 +86,19 @@ inline bool InlinedRowsInRunDisabled() {
 	return disabled;
 }
 
+//! The size past which a T-SQL run goes as several calls, cut at statement boundaries, all on the
+//! transaction's connection (specs/015). SQL Server parses and compiles a batch whole: one flush of
+//! 1000 tables' inlined data was a 2.7 MB batch of ~3000 statements, superlinear in time (0.27 MB
+//! 218 ms, 0.80 MB 1245 ms) and past the 2 GB server's memory (error 701). MSSQL_DUCKLAKE_RUN_LIMIT_KB
+//! overrides it, for measuring.
+inline idx_t RunLimitBytes() {
+	static const idx_t limit = [] {
+		auto *env = getenv("MSSQL_DUCKLAKE_RUN_LIMIT_KB");
+		return static_cast<idx_t>(env ? std::strtoull(env, nullptr, 10) : 256) * 1024;
+	}();
+	return limit;
+}
+
 //! specs/014: an unrecognised catalog statement in the commit batch is an error rather than a
 //! fallback to the base. On in the integration suite, so that a ducklake bump that adds a shape
 //! fails the suite naming the statement; off for a user, whose catalog keeps working, slower.

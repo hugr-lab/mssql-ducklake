@@ -1090,7 +1090,7 @@ unique_ptr<QueryResult> MSSQLMetadataManager::RewriteWriteStatement(string query
 	const string update_head = string("UPDATE ") + CATALOG_PREFIX;
 	const string delete_head = string("DELETE FROM ") + CATALOG_PREFIX;
 	const string drop_head = string("DROP TABLE IF EXISTS ") + CATALOG_PREFIX;
-	string run;
+	vector<string> pieces;
 	vector<string> dropped_in_run;
 	for (auto &statement : statements) {
 		// a CTE is a write only when an UPDATE follows it; DuckLake's stats reads are CTEs too
@@ -1103,11 +1103,11 @@ unique_ptr<QueryResult> MSSQLMetadataManager::RewriteWriteStatement(string query
 		string tsql, dropped;
 		if (RewriteUpdate(statement, schema, tsql) || RewriteDelete(statement, schema, tsql) ||
 		    RewriteCteUpdate(statement, schema, tsql)) {
-			run += tsql + "\n";
+			pieces.push_back(tsql + "\n");
 			continue;
 		}
 		if (RewriteDropIfExists(statement, schema, tsql, dropped)) {
-			run += tsql + "\n";
+			pieces.push_back(tsql + "\n");
 			dropped_in_run.push_back(dropped);
 			continue;
 		}
@@ -1119,7 +1119,19 @@ unique_ptr<QueryResult> MSSQLMetadataManager::RewriteWriteStatement(string query
 		}
 		return nullptr;
 	}
-	auto result = RunCommitBatch(run);
+	// every statement recognised before any runs; then in calls of a bounded size
+	unique_ptr<QueryResult> result;
+	string run;
+	for (idx_t i = 0; i < pieces.size(); i++) {
+		run += pieces[i];
+		if (i + 1 == pieces.size() || run.size() + pieces[i + 1].size() > RunLimitBytes()) {
+			result = RunCommitBatch(run);
+			run.clear();
+			if (result->HasError()) {
+				return result;
+			}
+		}
+	}
 	if (!result->HasError()) {
 		for (auto &table : dropped_in_run) {
 			InvalidateTableCache(table);
@@ -1146,6 +1158,7 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 	string run;
 	vector<string> dropped_in_run;
 	unique_ptr<QueryResult> last;
+	bool failed = false;
 	auto flush = [&]() -> bool {
 		if (run.empty()) {
 			return true;
@@ -1161,12 +1174,20 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 		dropped_in_run.clear();
 		return true;
 	};
+	// the run grows statement by statement and goes as a call of its own past the limit
+	auto append = [&](const string &tsql) {
+		if (!run.empty() && run.size() + tsql.size() > RunLimitBytes() && !flush()) {
+			failed = true;
+			return;
+		}
+		run += tsql;
+	};
 
 	// the per-column stats refreshes of one table, gathered while they come one after another
 	vector<ColumnStatsRefresh> refreshes;
 	auto close_refreshes = [&]() {
 		if (!refreshes.empty()) {
-			run += CoalescedColumnStatsRefresh(schema, refreshes);
+			append(CoalescedColumnStatsRefresh(schema, refreshes));
 			refreshes.clear();
 		}
 	};
@@ -1181,11 +1202,17 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 			}
 			if (!joins) {
 				close_refreshes();
+				if (failed) {
+					return last;
+				}
 			}
 			refreshes.push_back(std::move(refresh));
 			continue;
 		}
 		close_refreshes();
+		if (failed) {
+			return last;
+		}
 		// the user's inlined rows, rendered by our WriteNewInlinedData
 		if (StringUtil::StartsWith(stmt, INLINED_ROWS_MARKER)) {
 			auto index = std::stoull(stmt.substr(strlen(INLINED_ROWS_MARKER)));
@@ -1193,12 +1220,15 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 				throw InternalException("mssql_ducklake: inlined rows %llu written by no WriteNewInlinedData", index);
 			}
 			auto &statement = inlined_rows_statements[index];
-			run += statement.head;
+			string rows_sql = statement.head;
 			for (idx_t i = 0; i < statement.rows.size(); i++) {
-				run += StringUtil::Format("%s(%lld, %llu, NULL%s)", i == 0 ? "" : ", ", statement.rows[i].first,
-				                          snapshot.snapshot_id, statement.rows[i].second);
+				rows_sql += StringUtil::Format("%s(%lld, %llu, NULL%s)", i == 0 ? "" : ", ", statement.rows[i].first,
+				                               snapshot.snapshot_id, statement.rows[i].second);
 			}
-			run += ";\n";
+			append(rows_sql + ";\n");
+			if (failed) {
+				return last;
+			}
 			continue;
 		}
 		// the one DDL in the batch: the inlined deletion table, created keyed and outside the
@@ -1221,11 +1251,18 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 		string tsql, dropped;
 		if (rewrite && (RewriteInsert(stmt, schema, v1_1, tsql) || RewriteUpdate(stmt, schema, tsql) ||
 		                RewriteDelete(stmt, schema, tsql) || RewriteCteUpdate(stmt, schema, tsql))) {
-			run += tsql + "\n";
+			append(tsql + "\n");
+			if (failed) {
+				return last;
+			}
 			continue;
 		}
 		if (rewrite && RewriteDropIfExists(stmt, schema, tsql, dropped)) {
-			run += tsql + "\n";
+			// appended first: a run cut here sends the earlier drops with their own invalidation
+			append(tsql + "\n");
+			if (failed) {
+				return last;
+			}
 			dropped_in_run.push_back(dropped);
 			continue;
 		}
@@ -1246,7 +1283,7 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 		}
 	}
 	close_refreshes();
-	if (!flush()) {
+	if (failed || !flush()) {
 		return last;
 	}
 	if (!last) {
