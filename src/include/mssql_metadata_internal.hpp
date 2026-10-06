@@ -43,19 +43,6 @@ inline idx_t ServerCommitMinFiles() {
 	return threshold;
 }
 
-//! Where the server-side apply merges the per-table column statistics (specs/015 R5).
-//! `client` (the default) - DuckLake merges them, with its own MergeFileStats, from the stored stats
-//! read under the apply's lock, and the apply writes the result as DuckLake's own statements: exact
-//! by construction, one more round trip. `server` - the apply merges them itself in T-SQL, a second
-//! copy of DuckLake's rules that has to be kept in step with them.
-inline bool StatsMergeOnServer() {
-	static const bool on_server = [] {
-		auto *env = getenv("MSSQL_DUCKLAKE_STATS_MERGE");
-		return env && string(env) == "server";
-	}();
-	return on_server;
-}
-
 inline bool SkipSnapshotFetchEnabled() {
 	static const bool enabled = getenv("MSSQL_DUCKLAKE_SERVER_COMMIT_SKIP_FETCH") != nullptr;
 	return enabled;
