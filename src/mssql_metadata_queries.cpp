@@ -167,6 +167,18 @@ void MSSQLMetadataManager::CreateInlinedDeletionTable(const string &table_name) 
 	tables_already_refreshed.insert(table_name);
 }
 
+//! The join and filter of BuildCatalogForSnapshot's tables+columns statement, verbatim, and the same
+//! with the column filter inside the joined table.
+static constexpr const char *DUCKLAKE_LOAD_COLUMNS_JOIN =
+    "LEFT JOIN {METADATA_CATALOG}.ducklake_column col USING (table_id)\n"
+    "WHERE {SNAPSHOT_ID} >= tbl.begin_snapshot AND ({SNAPSHOT_ID} < tbl.end_snapshot OR tbl.end_snapshot IS NULL)\n"
+    "  AND (({SNAPSHOT_ID} >= col.begin_snapshot AND ({SNAPSHOT_ID} < col.end_snapshot OR col.end_snapshot IS NULL)) "
+    "OR column_id IS NULL)\n";
+static constexpr const char *MSSQL_LOAD_COLUMNS_JOIN =
+    "LEFT JOIN (SELECT * FROM {METADATA_CATALOG}.ducklake_column WHERE {SNAPSHOT_ID} >= begin_snapshot AND "
+    "({SNAPSHOT_ID} < end_snapshot OR end_snapshot IS NULL)) col USING (table_id)\n"
+    "WHERE {SNAPSHOT_ID} >= tbl.begin_snapshot AND ({SNAPSHOT_ID} < tbl.end_snapshot OR tbl.end_snapshot IS NULL)\n";
+
 unique_ptr<QueryResult> MSSQLMetadataManager::Query(DuckLakeSnapshot snapshot, string &query) {
 	EnsureReady();
 	// Recognised by comparing with DuckLake's own template, before any placeholder is substituted -
@@ -181,6 +193,17 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Query(DuckLakeSnapshot snapshot, s
 	// mismatch into an error at attach, because the alternative is a silent return of the crash.
 	if (ConflictRewriteEnabled() && query == DUCKLAKE_CONFLICT_CHECK_QUERY) {
 		query = MSSQL_CONFLICT_CHECK_QUERY;
+	}
+	// The catalog load's tables+columns statement (BuildCatalogForSnapshot) filters the columns AFTER
+	// its LEFT JOIN - `((<visible>) OR column_id IS NULL)` - where no filter can be pushed below the
+	// join, so every load read ALL of ducklake_column: 293 loads of a 300-table lake brought 3.6M
+	// rows off the server, 3.95 s of its 4.4 s (specs/015). The same filter inside the joined table
+	// is pushed into the scan, and the server returns the visible columns only. The two differ only
+	// for a visible table without one visible column, which DuckLake never writes - and the base
+	// would then reject it as "does not have any columns" either way. Matched on the template's exact
+	// text: a ducklake bump that edits it leaves the statement as it is, merely slower.
+	if (!LoadRewriteDisabled() && query.find(DUCKLAKE_LOAD_COLUMNS_JOIN) != string::npos) {
+		query = StringUtil::Replace(query, DUCKLAKE_LOAD_COLUMNS_JOIN, MSSQL_LOAD_COLUMNS_JOIN);
 	}
 	// a write DuckLake sends through Query - the expiry's, the cleanup's, the flush's DELETEs -
 	// takes the commit batch's T-SQL path when it is one of its families (specs/014 D3c)

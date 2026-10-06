@@ -490,6 +490,32 @@ the commit's run went from one 0.80 MB call in 1820 ms to three of at most 0.28 
 64 KB is worse again (twelve calls). `MSSQL_DUCKLAKE_RUN_LIMIT_KB` overrides it; the suite passes
 with it at 1 KB, every statement nearly its own call.
 
+## The lake-wide merge against postgres, query by query (measured 2026-10-06)
+
+The upstream cause of `partitioned_merge_adjacent` 64 → 121 s (postgres 9.7 → 85 s) is DuckLake's:
+since its v1.5 head `can_merge_into_latest` looks every candidate file's table up at the file's
+schema version when it is not the lake's latest, a full catalog load per table, where the old pin
+loaded only for groups it was about to merge. Not ours to change, and not filed (the owner's call).
+**The 121 against 85 is ours.** Same build, the same 300-table lake on both, the DuckLakeMetadata
+log's own elapsed time per query: 16.3 s on SQL Server, 11.9 on postgres; two thirds of the
+difference is the tables+columns load (8.0 s against 5.0).
+
+The server's statistics said why: of the merge's 18.7 s, SQL Server worked 4.4, and 3.95 of that
+was one statement - all of `ducklake_column`, 12,300 rows, for every load (3.6M rows for 293
+loads). The statement filters the columns *after* its `LEFT JOIN` (`((<visible>) OR column_id IS
+NULL)`), where no filter can be pushed below the join, so every load reads every column of every
+version on any backend - postgres just pays less a row (with or without the mssql extension's
+pushdown, and with or without TLS, the same). Our `Query(snapshot)` now moves that filter into the
+joined table, matched on the template's exact text: 3.6M → 1.5M rows, the scan 3.95 → 1.97 s on
+the server, **the merge 18.4 → 16.7 s (postgres 16.4)**. The loaded schemas at every version of a
+table with dropped, renamed, added nested and re-defaulted columns are identical to the base's.
+`MSSQL_DUCKLAKE_NO_LOAD_REWRITE=1` turns it off.
+
+Found on the way, for the extension: a query naming a table that does not exist loads every
+schema's metadata of the catalog's database (DuckDB's "did you mean" enumeration), and on this
+line it does so on every such query - 27–34 s each on a 4,724-table database, 0.011 s cached on
+v0.2.5 (hugr-lab/mssql-extension#412).
+
 ## Dependencies on the mssql extension
 
 Sent to the mssql session on 2026-10-06, ranked by the measurements above.

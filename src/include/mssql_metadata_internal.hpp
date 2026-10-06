@@ -73,6 +73,12 @@ inline bool HasFourDigitYear(const string &text) {
 	       text[7] == '-';
 }
 
+//! Off switch for the catalog load's column filter moved into its join (specs/015), for measuring.
+inline bool LoadRewriteDisabled() {
+	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_LOAD_REWRITE") != nullptr;
+	return disabled;
+}
+
 //! Off switch for the server-side file list (specs/015), so its absence can be measured.
 inline bool ServerFileListDisabled() {
 	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_SERVER_FILE_LIST") != nullptr;
