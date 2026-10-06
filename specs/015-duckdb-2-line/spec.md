@@ -370,7 +370,7 @@ small in rows. Their cost is the catalog reload (R4), not the commit, so they co
 | duckdb | the 2.0 line | a released tag |
 | ducklake | **untouched** (R1) | the bump's SHA |
 | mssql | hugr-lab/mssql-extension#407 head 9f369d5 (pushed; 081 on top of main 88fe137) | a release tag |
-| `CMakeLists.txt` | the new `format.py` wants 80 columns | one reformat commit |
+| `CMakeLists.txt` | the new `format.py` wants 80 columns | ~~one reformat commit~~ done; `make format-check` passes |
 | `make tidy-check` | the pattern without the trailing slash | validated in CI |
 | fast-path suite | — | in CI |
 | bench catalog | in its own schema | the integration suite resets `dbo`, and it wiped the bench catalog three times |
