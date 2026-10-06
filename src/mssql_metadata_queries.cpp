@@ -11,6 +11,7 @@
 #include "duckdb/main/database.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_stats.hpp"
+#include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_metadata_info.hpp"
 #include "storage/ducklake_staged_commit.hpp"
 #include "storage/ducklake_transaction_changes.hpp"
@@ -409,6 +410,12 @@ FileListOutcome FileListToTSQL(string &query) {
 
 } // namespace
 
+string MSSQLMetadataManager::AddFileListParameter(const string &value, const string &declaration) {
+	auto name = "p" + to_string(file_list_parameters.size() + 1);
+	file_list_parameters.push_back({name, value, declaration});
+	return "@" + name;
+}
+
 string MSSQLMetadataManager::CastValueToTarget(const Value &value, const LogicalType &type) {
 	if (!building_tsql_file_list) {
 		// DuckLake's own, for the catalog path - repeated rather than called, because the base keeps
@@ -420,6 +427,10 @@ string MSSQLMetadataManager::CastValueToTarget(const Value &value, const Logical
 		}
 		return DuckLakeUtil::SQLLiteralToString(value.ToString());
 	}
+	// On the server every constant is a parameter: one plan for every value, with or without the
+	// database's forced parameterization (specs/012 is best-effort and has an opt-out), and a string
+	// travels as nvarchar - any text, compared under the stats column's UTF-8 BIN2 collation, which
+	// wins over the parameter's - so no literal has to survive the database's code page.
 	if (value.IsNull()) {
 		return string();
 	}
@@ -437,28 +448,22 @@ string MSSQLMetadataManager::CastValueToTarget(const Value &value, const Logical
 			    !Value::IsFinite(value.GetValue<double>())) {
 				return string();
 			}
-			return StringUtil::Format("CAST(%s AS %s)", DuckLakeUtil::SQLLiteralToString(text), target.type);
+		} else if (type.id() == LogicalTypeId::BOOLEAN) {
+			text = value.GetValue<bool>() ? "1" : "0";
+		} else {
+			if (!HasFourDigitYear(text)) {
+				return string();
+			}
+			if (type.id() == LogicalTypeId::TIMESTAMP_TZ) {
+				text = WithMinuteOffset(text);
+			}
 		}
-		if (type.id() == LogicalTypeId::BOOLEAN) {
-			return value.GetValue<bool>() ? "CAST(1 AS BIT)" : "CAST(0 AS BIT)";
-		}
-		if (!HasFourDigitYear(text)) {
-			return string();
-		}
-		if (type.id() == LogicalTypeId::TIMESTAMP_TZ) {
-			text = WithMinuteOffset(text);
-		}
-		return StringUtil::Format("CAST(%s AS %s)", DuckLakeUtil::SQLLiteralToString(text), target.type);
+		// passed as text and converted by the declaration, so the value is the server's reading of
+		// exactly the text DuckDB printed - the same reading the stats strings get
+		return AddFileListParameter(DuckLakeUtil::SQLLiteralToString(text), target.type);
 	}
 	if (type.id() == LogicalTypeId::VARCHAR || type.id() == LogicalTypeId::UUID) {
-		// compared under the stats column's UTF-8 BIN2 collation, which is DuckDB's byte order. An N
-		// literal carries any text whatever the database's code page, and the cast puts it in that
-		// collation, so `раздел3` compares as DuckDB compares it.
-		// The collation goes on the N literal BEFORE the cast: a cast to VARCHAR converts into the code
-		// page of the collation the value has, and a bare N literal has the database's - CP1252 here,
-		// where `раздел3` became `???????3` and the pruning dropped every file (attach_mssql.test).
-		return StringUtil::Format("CAST(N%s COLLATE Latin1_General_100_BIN2_UTF8 AS VARCHAR(MAX))",
-		                          DuckLakeUtil::SQLLiteralToString(text));
+		return AddFileListParameter(DuckLakeUtil::SQLLiteralToString(text), "NVARCHAR(MAX)");
 	}
 	return string();
 }
@@ -508,15 +513,18 @@ string MSSQLMetadataManager::GenerateFileListQuery(DuckLakeTableEntry &table, co
 	if (ServerFileListDisabled()) {
 		return catalog_path();
 	}
-	// DuckLake's builder, with the schema as the server names it, our CTE body and our casts
-	auto native_cte = [](const CTERequirement &req, TableIndex table_id) {
+	// DuckLake's builder, with the schema as the server names it, our CTE body (its column id a
+	// parameter) and our casts (its constants parameters)
+	file_list_parameters.clear();
+	auto native_cte = [this](const CTERequirement &req, TableIndex) {
 		string select_list = "data_file_id";
 		for (auto &stat : req.referenced_stats) {
 			select_list += ", " + stat;
 		}
+		auto column = AddFileListParameter(to_string(req.column_field_index), "BIGINT");
 		return StringUtil::Format("  SELECT %s\n  FROM {METADATA_SCHEMA_ESCAPED}.ducklake_file_column_stats\n"
-		                          "  WHERE column_id = %d AND table_id = %d\n",
-		                          select_list, req.column_field_index, table_id.index);
+		                          "  WHERE column_id = %s AND table_id = @table_id\n",
+		                          select_list, column);
 	};
 	string query;
 	building_tsql_file_list = true;
@@ -541,9 +549,51 @@ string MSSQLMetadataManager::GenerateFileListQuery(DuckLakeTableEntry &table, co
 		}
 		return catalog_path();
 	}
-	// the sole source of its statement, described by the server (the select list varies with the
-	// read), the placeholders left for the base to substitute
-	return "SELECT * FROM mssql_scan({METADATA_CATALOG_NAME_LITERAL}, " + SQLString(query) + ")";
+	// The rest of what DuckLake wrote into the text: this table's id, and the snapshot. Both as
+	// parameters, so the statement's text is the same for every table and every snapshot.
+	auto table_id = to_string(table.GetTableId().index);
+	query = std::regex_replace(query, std::regex("\\btable_id\\s*=\\s*" + table_id + "\\b"), "table_id = @table_id");
+	query = StringUtil::Replace(query, "{SNAPSHOT_ID}", "@snapshot");
+
+	string params = "'snapshot': {SNAPSHOT_ID}, 'table_id': " + table_id;
+	string declarations = "@snapshot BIGINT, @table_id BIGINT";
+	for (auto &parameter : file_list_parameters) {
+		params += ", '" + parameter.name + "': " + parameter.value;
+		declarations += ", @" + parameter.name + " " + parameter.declaration;
+	}
+
+	// The shape, given: it follows from the same inputs the select list does (GetFileSelectList,
+	// GetDeleteFileSelectList, GenerateFileListQuery), so the bind sends nothing to the server. A
+	// ducklake bump that changes the select list makes the stream disagree, and that is an error
+	// naming the statement - never a misread column.
+	auto encrypted = query.find("AS data_encryption_key") != string::npos;
+	auto file_columns = [&](const string &prefix) {
+		string out = StringUtil::Format("'%s_path': 'VARCHAR', '%s_path_is_relative': 'BOOLEAN', "
+		                                "'%s_file_size_bytes': 'BIGINT', '%s_footer_size': 'BIGINT'",
+		                                prefix, prefix, prefix, prefix);
+		if (encrypted) {
+			out += StringUtil::Format(", '%s_encryption_key': 'VARCHAR'", prefix);
+		}
+		return out;
+	};
+	string columns;
+	if (file_list_type == FileListType::EXTENDED) {
+		columns = "'data_file_id': 'BIGINT', 'delete_file_id': 'BIGINT', 'record_count': 'BIGINT', " +
+		          file_columns("data") + ", 'row_id_start': 'BIGINT', 'mapping_id': 'BIGINT', " + file_columns("del") +
+		          ", 'del_format': 'VARCHAR', 'begin_snapshot': 'BIGINT'";
+	} else {
+		columns = "'data_file_id': 'BIGINT', " + file_columns("data") +
+		          ", 'row_id_start': 'BIGINT', 'begin_snapshot': 'BIGINT', 'partial_max': 'BIGINT', "
+		          "'mapping_id': 'BIGINT', " +
+		          file_columns("del") + ", 'del_format': 'VARCHAR'";
+		for (auto &column : runtime_filter_stats_columns) {
+			columns += StringUtil::Format(
+			    ", 'col_%llu_stats_min_value': 'VARCHAR', 'col_%llu_stats_max_value': 'VARCHAR'", column, column);
+		}
+	}
+	return StringUtil::Format("SELECT * FROM mssql_scan_params_unsafe({METADATA_CATALOG_NAME_LITERAL}, %s, {%s}, %s, "
+	                          "columns := {%s})",
+	                          SQLString(query), params, SQLString(declarations), columns);
 }
 
 string MSSQLMetadataManager::GetLatestSnapshotQuery() const {

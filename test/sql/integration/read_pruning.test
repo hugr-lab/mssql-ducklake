@@ -133,9 +133,11 @@ SELECT i FROM lake.t ORDER BY i DESC LIMIT 3;
 198
 197
 
-# and the file lists above went to the server as one statement each
+# and the file lists above went to the server as one statement each, parameterized - the table,
+# the snapshot and the constants as parameters, so its text is the same for every table and value -
+# with the shape given, so its bind sent nothing
 query I
-SELECT count(*) > 0 FROM duckdb_logs() WHERE type = 'DuckLakeMetadata' AND message LIKE '%mssql_scan(%WITH col_%';
+SELECT count(*) > 0 FROM duckdb_logs() WHERE type = 'DuckLakeMetadata' AND message LIKE '%mssql_scan_params_unsafe(%WITH col_%table_id = @table_id%';
 ----
 true
 

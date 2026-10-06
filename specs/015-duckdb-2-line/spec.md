@@ -402,10 +402,20 @@ Where postgres is still ahead:
 
 1. **inlined inserts**, ~7.6 ms a commit;
 2. **a merge of adjacent files over the whole lake**, 37 s;
-3. **the read path**. The postgres manager overrides `GenerateFileListQuery` and the file-column-stats
-   CTE and runs the whole file-list query natively in postgres through one `postgres_query`. Ours goes
-   through the catalog path piece by piece, a restriction the given-shape scans now lift. It costs only
-   milliseconds per query, but it is paid on every read.
+3. **the read path** — closed since. The postgres manager overrides `GenerateFileListQuery` and the
+   file-column-stats CTE and runs the whole file-list query natively in postgres through one
+   `postgres_query`; ours went through the catalog path piece by piece. Now ours does the same: the
+   file list is DuckLake's query, its casts and the few non-T-SQL spellings rewritten (`TRY_CONVERT`,
+   `COALESCE` extremes for `MIN`/`MAX`, `contains_nan`, `IS DISTINCT FROM`, `NULLS LAST`), sent as one
+   `mssql_scan_params_unsafe` with the shape given. A filter it does not cover goes to the catalog path
+   (strict mode: an error naming it); `MSSQL_DUCKLAKE_NO_SERVER_FILE_LIST=1` forces the catalog path.
+   Every constant, the table id, the column ids and the snapshot are **parameters**, so the text is
+   one per filter shape, whatever the table or the value, and no literal has to survive the
+   database's code page (a `раздел3` literal did not, before). Measured, 500-table lake, a
+   range read of one table: catalog path 13 ms, server statement 9–11 ms (postgres: 10 ms). Over 40
+   reads of different tables with different bounds the server holds 2 prepared plans used 80 times —
+   identically under `PARAMETERIZATION SIMPLE` and `FORCED`, so the read no longer depends on
+   specs/012's best-effort option. `read_pruning.test` pins the pruning type by type, file against file.
 
 The errors in both runs' logs are the reduced configuration's (queries for partitioned and deep
 tables it was told not to make), identical across every run of the day and on both backends.

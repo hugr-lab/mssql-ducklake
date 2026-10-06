@@ -108,6 +108,15 @@ public:
 	string CastStatsToTarget(const string &stats, const LogicalType &type, StatsCastType cast_type) override;
 	//! Set while GenerateFileListQuery builds the server's statement.
 	bool building_tsql_file_list = false;
+	//! The parameters that statement collects as it is built: the name, the value as a DuckDB literal
+	//! (for the params STRUCT), and its T-SQL declaration.
+	struct FileListParameter {
+		string name;
+		string value;
+		string declaration;
+	};
+	vector<FileListParameter> file_list_parameters;
+	string AddFileListParameter(const string &value, const string &declaration);
 
 	//! Intercepts exactly one of DuckLake's queries - the commit loop's conflict check - and swaps it
 	//! for a form that reads ducklake_snapshot once instead of twice (specs/007 D1). Everything else
