@@ -122,6 +122,18 @@ above saves ~1 s, which that measurement could not see. What remains against pos
 1.93 ms against ~0.57), and ~0.6 ms of bind: the mssql extension's per-scan cost (sent there with
 these numbers, 2026-10-06).
 
+### Plain VARCHAR in the metadata database (2026-10-07)
+
+Bounded, the columns met the mssql extension's native types: a `varchar(n)` column of an attached
+table is `MSSQL_VARCHAR(n)` (VARCHAR with an alias), where a `MAX` one is plain `VARCHAR`. DuckLake
+reads every catalog row with `GetValue<string>`, which for a type that is not VARCHAR is a full cast
+per value: profiled over CREATE TABLE commits, `Value::ToString`/`CastAs` took ~1/3 of the main
+thread (8.5k samples against 0.9k on postgres). The option is global in the mssql extension, so the
+ATTACH wrapper passes `META_NATIVE_TYPES false` to the metadata database's ATTACH (mssql #416, the
+per-catalog override); a `META_NATIVE_TYPES` given at the ATTACH wins. 400 CREATE TABLEs, the DuckDB
+process's CPU: 43.2–44.6 s with native types, 36.2 s without, 38.8 s on postgres; wall 51.5–53.0 s
+against 44.2–44.6.
+
 ### Found on the way: a leftover inlined table
 
 The inlined-data table is created outside the transaction (so the mssql extension can see it before

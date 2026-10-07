@@ -5,6 +5,7 @@
 #include "duckdb/common/operator/cast_operators.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/attached_database.hpp"
+#include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/storage/storage_extension.hpp"
@@ -313,13 +314,38 @@ unique_ptr<Catalog> AttachWithLimits(optional_ptr<StorageExtensionInfo> storage_
                                      AttachedDatabase &db, const string &name, AttachInfo &info,
                                      AttachOptions &options) {
 	CatalogLengths lengths;
+	bool on_mssql = StringUtil::StartsWith(StringUtil::Lower(info.path), "mssql:");
+	bool native_types_given = false;
 	for (auto it = options.options.begin(); it != options.options.end();) {
-		if (StringUtil::Lower(it->first) == "meta_limits") {
+		auto key = StringUtil::Lower(it->first);
+		if (key == "meta_type") {
+			on_mssql = StringUtil::Lower(it->second.ToString()) == "mssql";
+		} else if (key == "meta_native_types") {
+			native_types_given = true;
+		} else if (key == "metadata_parameters" && it->second.type().id() == LogicalTypeId::MAP) {
+			for (auto &child : MapValue::GetChildren(it->second)) {
+				auto &key_value = StructValue::GetChildren(child);
+				auto parameter = StringUtil::Lower(key_value[0].ToString());
+				native_types_given = native_types_given || parameter == "native_types";
+				if (parameter == "type") {
+					on_mssql = StringUtil::Lower(key_value[1].ToString()) == "mssql";
+				}
+			}
+		}
+		if (key == "meta_limits") {
 			lengths = CatalogLengths::FromValue(it->second);
 			it = options.options.erase(it);
 		} else {
 			++it;
 		}
+	}
+	// The catalog's bounded strings as plain VARCHAR: under the mssql extension's native types they
+	// arrive as MSSQL_VARCHAR(n), and DuckLake reads each catalog row with GetValue<string>, which
+	// for a type that is not VARCHAR is a full cast per value - a third of the client's time on a
+	// commit (specs/018). Only for this catalog's metadata database (mssql #416); META_NATIVE_TYPES
+	// or a native_types metadata parameter given at the ATTACH wins.
+	if (on_mssql && !native_types_given) {
+		options.options["meta_native_types"] = Value::BOOLEAN(false);
 	}
 	{
 		// the same AttachedDatabase the manager meets as its catalog's GetAttached(); a re-attach under

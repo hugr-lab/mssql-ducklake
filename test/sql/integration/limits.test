@@ -67,6 +67,25 @@ SELECT list(name ORDER BY name) FROM mssql_ducklake_catalog_info('lake') WHERE k
 ----
 [ducklake_snapshot_changes.changes_made]
 
+# and the metadata database reads them as plain VARCHAR, not the mssql extension's MSSQL_VARCHAR(n):
+# DuckLake reads every catalog row with GetValue<string>, a full cast per value for any other type
+query I
+SELECT column_type FROM (DESCRIBE __ducklake_metadata_lake.limits_a.ducklake_table) WHERE column_name = 'table_name';
+----
+VARCHAR
+
+statement ok
+DETACH lake;
+
+# META_NATIVE_TYPES given at the ATTACH wins
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/limits_a', METADATA_SCHEMA 'limits_a', META_NATIVE_TYPES true);
+
+query I
+SELECT column_type FROM (DESCRIBE __ducklake_metadata_lake.limits_a.ducklake_table) WHERE column_name = 'table_name';
+----
+MSSQL_VARCHAR(256)
+
 statement ok
 DETACH lake;
 
