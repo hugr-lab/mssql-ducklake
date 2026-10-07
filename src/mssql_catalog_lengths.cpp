@@ -316,17 +316,21 @@ unique_ptr<Catalog> AttachWithLimits(optional_ptr<StorageExtensionInfo> storage_
 	CatalogLengths lengths;
 	bool on_mssql = StringUtil::StartsWith(StringUtil::Lower(info.path), "mssql:");
 	bool native_types_given = false;
+	bool min_connections_given = false;
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto key = StringUtil::Lower(it->first);
 		if (key == "meta_type") {
 			on_mssql = StringUtil::Lower(it->second.ToString()) == "mssql";
 		} else if (key == "meta_native_types") {
 			native_types_given = true;
+		} else if (key == "meta_min_connections") {
+			min_connections_given = true;
 		} else if (key == "metadata_parameters" && it->second.type().id() == LogicalTypeId::MAP) {
 			for (auto &child : MapValue::GetChildren(it->second)) {
 				auto &key_value = StructValue::GetChildren(child);
 				auto parameter = StringUtil::Lower(key_value[0].ToString());
 				native_types_given = native_types_given || parameter == "native_types";
+				min_connections_given = min_connections_given || parameter == "min_connections";
 				if (parameter == "type") {
 					on_mssql = StringUtil::Lower(key_value[1].ToString()) == "mssql";
 				}
@@ -346,6 +350,13 @@ unique_ptr<Catalog> AttachWithLimits(optional_ptr<StorageExtensionInfo> storage_
 	// or a native_types metadata parameter given at the ATTACH wins.
 	if (on_mssql && !native_types_given) {
 		options.options["meta_native_types"] = Value::BOOLEAN(false);
+	}
+	// A warm pool: the mssql extension opens these at the metadata ATTACH, the logins in parallel,
+	// and keeps them past its idle timeout. A connection opened on demand is a TLS login, ~200 ms
+	// here, paid by the first metadata query that needs one (specs/015); 4 covers the
+	// transaction's pinned connection and a few concurrent autocommit reads.
+	if (on_mssql && !min_connections_given) {
+		options.options["meta_min_connections"] = Value::BIGINT(4);
 	}
 	{
 		// the same AttachedDatabase the manager meets as its catalog's GetAttached(); a re-attach under
