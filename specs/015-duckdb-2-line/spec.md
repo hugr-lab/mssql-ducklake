@@ -593,9 +593,12 @@ all 55–59 ms for the same five shapes on a cold plan cache, 1.7–2.0 ms a cal
 optimizer's price per shape per process; fewer shapes (they vary with the set of filtered columns)
 is the only lever left.
 
-**Ours, next:** shaping a new catalog compiles ~25 `IF EXISTS (… sys.key_constraints …)` at ~33 ms
-each (12.7 s of the 44.7 s compile in a full bench run with its concurrent part, Query Store) -
-`create_schemas` 2.0 s against postgres 0.3; one state query for the whole catalog instead.
+**Shaping a new catalog, from one read of its state.** It compiled ~25 `IF EXISTS (… sys.key_constraints
+…)` guards at ~33 ms each (12.7 s of the 44.7 s compile in a full bench run with its concurrent part,
+Query Store) - `create_schemas`, which pays the shaping of the catalog just created, 1.63–1.88 s
+against postgres 0.3. One statement now reads the tables, keys with their columns, indexes, string
+columns and properties, and the DDL is generated from it without guards: the state read 145–151 ms,
+the column batch 124–145, the key and index batch 27–29; the phase 0.63–0.71 s.
 
 ## Dependencies on the mssql extension
 

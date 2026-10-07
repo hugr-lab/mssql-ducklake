@@ -1,5 +1,8 @@
 #pragma once
 
+#include <map>
+#include <set>
+
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/main/connection.hpp"
 #include "mssql_catalog_lengths.hpp"
@@ -169,6 +172,9 @@ private:
 	//! error the way the base's Execute does, so the commit loop's retry and rollback see the same
 	//! thing (specs/014 D3).
 	unique_ptr<QueryResult> RunCommitBatch(const string &tsql);
+	//! connection.Query, reported to the catalog's query callback when one is set - the statements
+	//! this manager sends past DuckLake's ExecuteRaw, which mssql_ducklake_trace would otherwise miss
+	unique_ptr<QueryResult> TracedQuery(Connection &connection, const string &query);
 
 	//! The user's inlined rows as T-SQL (specs/015), so they join the run instead of taking DuckDB's
 	//! DML path, a round trip of their own. A row set with a value we do not render goes to the base
@@ -237,6 +243,24 @@ private:
 		string limits;
 	};
 	CatalogMarkers ReadCatalogMarkers();
+	//! What a catalog's shaping needs to know, read in one statement: its tables, primary keys (name,
+	//! key columns in order), indexes, string columns and the properties on ducklake_metadata.
+	struct ShapeColumn {
+		string type;
+		int64_t max_length = 0;
+		string collation;
+		bool nullable = true;
+	};
+	struct ShapeState {
+		std::set<string> tables;
+		std::map<string, pair<string, string>> keys;
+		std::set<string> indexes;
+		std::map<pair<string, string>, ShapeColumn> columns;
+		std::set<string> properties;
+		//! the schema-level shape stamp an older build wrote
+		bool schema_stamp = false;
+	};
+	ShapeState ReadShapeState();
 	//! The server must have the UTF-8 BIN2 collation the shaping converts the catalog's strings to.
 	void RequireUtf8Collation();
 	//! This manager has already found the attach ready - one check per transaction at most.
