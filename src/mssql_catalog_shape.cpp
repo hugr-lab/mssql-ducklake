@@ -1,4 +1,5 @@
 #include "mssql_metadata_manager.hpp"
+#include <set>
 #include "mssql_metadata_internal.hpp"
 
 #include "common/ducklake_types.hpp"
@@ -44,13 +45,15 @@ MSSQLMetadataManager::CatalogMarkers MSSQLMetadataManager::ReadCatalogMarkers() 
 		                          "WHERE class = 1 AND major_id = %s AND minor_id = 0 AND name = ''%s'')",
 		                          type, anchor, name);
 	};
-	auto result = connection.Query(StringUtil::Format(
-	    "SELECT present, shape, migration, limits FROM mssql_scan_unsafe(%s, 'SELECT "
-	    "CAST(CASE WHEN %s IS NULL THEN 0 ELSE 1 END AS BIGINT) AS present, %s AS shape, %s AS migration, "
-	    "%s AS limits', columns := {'present': 'BIGINT', 'shape': 'BIGINT', 'migration': 'VARCHAR', 'limits': "
-	    "'VARCHAR'})",
-	    CatalogLiteral(), anchor, property(SHAPE_VERSION_PROPERTY, "BIGINT"),
-	    property(MIGRATION_MARKER_PROPERTY, "NVARCHAR(64)"), property(LIMITS_PROPERTY, "NVARCHAR(400)")));
+	auto result = TracedQuery(
+	    connection,
+	    StringUtil::Format(
+	        "SELECT present, shape, migration, limits FROM mssql_scan_unsafe(%s, 'SELECT "
+	        "CAST(CASE WHEN %s IS NULL THEN 0 ELSE 1 END AS BIGINT) AS present, %s AS shape, %s AS migration, "
+	        "%s AS limits', columns := {'present': 'BIGINT', 'shape': 'BIGINT', 'migration': 'VARCHAR', 'limits': "
+	        "'VARCHAR'})",
+	        CatalogLiteral(), anchor, property(SHAPE_VERSION_PROPERTY, "BIGINT"),
+	        property(MIGRATION_MARKER_PROPERTY, "NVARCHAR(64)"), property(LIMITS_PROPERTY, "NVARCHAR(400)")));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to inspect the DuckLake catalog on SQL Server: ");
 	}
@@ -77,7 +80,8 @@ void MSSQLMetadataManager::RequireUtf8Collation() {
 	// COUNT_BIG rather than COUNT: `COUNT(*)` is an `int` on the server and a given shape is checked
 	// strictly, so declaring BIGINT over COUNT would fail at execution.
 	auto &connection = transaction.GetConnection();
-	auto probe = connection.Query(
+	auto probe = TracedQuery(
+	    connection,
 	    StringUtil::Format("SELECT collations FROM mssql_scan_unsafe(%s, 'SELECT COUNT_BIG(*) AS collations "
 	                       "FROM sys.fn_helpcollations() WHERE name = ''%s''', columns := {'collations': 'BIGINT'})",
 	                       CatalogLiteral(), VARCHAR_COLLATION));
@@ -180,10 +184,51 @@ void MSSQLMetadataManager::MigrateToV1_1Dev1() {
 	if (from_v1_0) {
 		ApplyMigrationLimits();
 	}
+	// The metadata database is preloaded at its ATTACH (specs/015), so a table just altered is cached
+	// as it was - ducklake_schema without parent_schema_id. Those tables, and only those, are dropped
+	// from the cache here, while this transaction holds no lock on them (the migration ran on a
+	// connection of its own); the rest of the preload stays. Nothing added, nothing dropped.
+	const bool changed = !ReadCatalogMarkers().shape_current;
+	std::set<string> altered;
+	if (changed) {
+		for (auto &entry : added_columns) {
+			altered.insert(entry.first);
+		}
+		altered.insert("ducklake_view_column_tag");
+	}
+	if (from_v1_0) {
+		auto requested = RequestedLengths(transaction.GetCatalog().GetAttached());
+		auto given = [&](LengthClass length_class) {
+			switch (length_class) {
+			case LengthClass::NAME:
+				return requested.name != CatalogLengths::NOT_GIVEN;
+			case LengthClass::PATH:
+				return requested.path != CatalogLengths::NOT_GIVEN;
+			case LengthClass::COLUMN_TYPE:
+				return requested.column_type != CatalogLengths::NOT_GIVEN;
+			case LengthClass::DEFAULT_VALUE:
+				return requested.default_value != CatalogLengths::NOT_GIVEN;
+			case LengthClass::TEXT:
+				return requested.text != CatalogLengths::NOT_GIVEN;
+			case LengthClass::STATS:
+				return requested.stats != CatalogLengths::NOT_GIVEN;
+			default:
+				return false;
+			}
+		};
+		for (auto &column : CatalogStringColumns()) {
+			if (given(column.length_class)) {
+				altered.insert(column.table);
+			}
+		}
+	}
+	for (auto &table : altered) {
+		InvalidateTableCache(table);
+	}
 	// The migration runs on this manager in the attach transaction, before DuckLake swaps it for a
 	// stock one (specs/015 R1), so it shapes its own result here rather than leaving it to a later
 	// attach - and only when the run added something, which the stamp now says.
-	if (!ReadCatalogMarkers().shape_current) {
+	if (changed) {
 		EnsureCatalogShape();
 	}
 }
@@ -207,6 +252,30 @@ void MSSQLMetadataManager::MigrateInlinedColumnNames(bool probe_renamed) {
 	// to a variable in a SELECT that also says DISTINCT has no defined result - it renamed nothing.
 	// All of the renames or none: a user column colliding with a prefixed name fails one sp_rename,
 	// and a catalog left half-prefixed is one a 1.0 build can no longer read
+	// the tables it will rename, read first: their cached entries (preloaded at the ATTACH) are the
+	// ones to drop afterwards, and none at all when there is nothing to rename
+	auto listing = TracedQuery(
+	    transaction.GetConnection(),
+	    StringUtil::Format(
+	        "SELECT name FROM mssql_scan_unsafe(%s, %s, columns := {'name': 'VARCHAR'})", CatalogLiteral(),
+	        DuckLakeUtil::SQLLiteralToString(StringUtil::Format(
+	            "SELECT DISTINCT CAST(t.name AS NVARCHAR(128)) AS name FROM %s.ducklake_inlined_data_tables idt "
+	            "JOIN sys.tables t ON t.name = idt.table_name COLLATE DATABASE_DEFAULT AND t.schema_id = "
+	            "SCHEMA_ID(%s) JOIN sys.columns c ON c.object_id = t.object_id AND c.column_id <= 3 "
+	            "WHERE c.name IN ('row_id', 'begin_snapshot', 'end_snapshot')",
+	            schema, schema_literal))));
+	if (listing->HasError()) {
+		listing->GetErrorObject().Throw("Failed to list the inlined tables to rename to v1.1-dev1: ");
+	}
+	vector<string> renamed;
+	while (auto chunk = listing->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			renamed.push_back(chunk->GetValue(0, row).ToString());
+		}
+	}
+	if (renamed.empty()) {
+		return;
+	}
 	auto statement = StringUtil::Format(R"(
 DECLARE @rename NVARCHAR(MAX);
 SELECT @rename = STRING_AGG(CAST(stmt AS NVARCHAR(MAX)), CHAR(10))
@@ -227,6 +296,10 @@ END;
 )",
 	                                    schema_literal, schema, schema_literal);
 	RunServerSideOutsideTransaction(statement, "Failed to rename the inlined metadata columns to v1.1-dev1: ");
+	// the renamed tables' cached columns are the old names (see MigrateToV1_1Dev1)
+	for (auto &table : renamed) {
+		InvalidateTableCache(table);
+	}
 }
 
 //! The explicit path, `ATTACH … (AUTOMATIC_MIGRATION TRUE)`: every statement is guarded, so a
@@ -260,10 +333,12 @@ void MSSQLMetadataManager::MigrateV10Dev() {
 }
 
 string MSSQLMetadataManager::CatalogVersion() {
-	auto result = transaction.GetConnection().Query(StringUtil::Format(
-	    "SELECT v FROM mssql_scan_unsafe(%s, 'SELECT CAST([value] AS NVARCHAR(64)) AS v FROM %s.ducklake_metadata "
-	    "WHERE [key] = N''version''', columns := {'v': 'VARCHAR'})",
-	    CatalogLiteral(), StringUtil::Replace(SchemaIdentifier(), "'", "''")));
+	auto result = TracedQuery(
+	    transaction.GetConnection(),
+	    StringUtil::Format(
+	        "SELECT v FROM mssql_scan_unsafe(%s, 'SELECT CAST([value] AS NVARCHAR(64)) AS v FROM %s.ducklake_metadata "
+	        "WHERE [key] = N''version''', columns := {'v': 'VARCHAR'})",
+	        CatalogLiteral(), StringUtil::Replace(SchemaIdentifier(), "'", "''")));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to read the DuckLake catalog's version: ");
 	}
@@ -337,10 +412,11 @@ IF @sql = N'' SET @sql = N'SELECT CAST(NULL AS NVARCHAR(128)) AS tbl, CAST(NULL 
 SET @sql = N'SELECT tbl, col, bound, longest FROM (' + @sql + N') x WHERE longest > bound';
 EXEC sp_executesql @sql;)",
 	                                VARCHAR_COLLATION, targets, schema_literal);
-	auto result = transaction.GetConnection().Query(StringUtil::Format(
-	    "SELECT * FROM mssql_scan_unsafe(%s, %s, columns := {'tbl': 'VARCHAR', 'col': 'VARCHAR', 'bound': 'INTEGER', "
-	    "'longest': 'BIGINT'})",
-	    CatalogLiteral(), DuckLakeUtil::SQLLiteralToString(check)));
+	auto result = TracedQuery(transaction.GetConnection(),
+	                          StringUtil::Format("SELECT * FROM mssql_scan_unsafe(%s, %s, columns := {'tbl': "
+	                                             "'VARCHAR', 'col': 'VARCHAR', 'bound': 'INTEGER', "
+	                                             "'longest': 'BIGINT'})",
+	                                             CatalogLiteral(), DuckLakeUtil::SQLLiteralToString(check)));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to check the DuckLake catalog's strings against META_LIMITS: ");
 	}
@@ -410,10 +486,12 @@ CatalogLengths MSSQLMetadataManager::ResolveCatalogLengths() {
 	if (!markers.shaped) {
 		// never shaped: a new catalog, or one a stock manager created and used - only the first may
 		// be narrowed without looking at what it holds
-		auto result = transaction.GetConnection().Query(StringUtil::Format(
-		    "SELECT s FROM mssql_scan_unsafe(%s, 'SELECT CAST(ISNULL(MAX(snapshot_id), 0) AS BIGINT) AS s FROM "
-		    "%s.ducklake_snapshot', columns := {'s': 'BIGINT'})",
-		    CatalogLiteral(), StringUtil::Replace(SchemaIdentifier(), "'", "''")));
+		auto result = TracedQuery(
+		    transaction.GetConnection(),
+		    StringUtil::Format(
+		        "SELECT s FROM mssql_scan_unsafe(%s, 'SELECT CAST(ISNULL(MAX(snapshot_id), 0) AS BIGINT) AS s FROM "
+		        "%s.ducklake_snapshot', columns := {'s': 'BIGINT'})",
+		        CatalogLiteral(), StringUtil::Replace(SchemaIdentifier(), "'", "''")));
 		if (result->HasError()) {
 			result->GetErrorObject().Throw("Failed to inspect the DuckLake catalog on SQL Server: ");
 		}

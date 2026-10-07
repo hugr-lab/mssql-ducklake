@@ -317,6 +317,8 @@ unique_ptr<Catalog> AttachWithLimits(optional_ptr<StorageExtensionInfo> storage_
 	bool on_mssql = StringUtil::StartsWith(StringUtil::Lower(info.path), "mssql:");
 	bool native_types_given = false;
 	bool min_connections_given = false;
+	bool preload_given = false;
+	string metadata_schema = "dbo";
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto key = StringUtil::Lower(it->first);
 		if (key == "meta_type") {
@@ -325,12 +327,17 @@ unique_ptr<Catalog> AttachWithLimits(optional_ptr<StorageExtensionInfo> storage_
 			native_types_given = true;
 		} else if (key == "meta_min_connections") {
 			min_connections_given = true;
+		} else if (key == "meta_preload" || key == "meta_schema_filter") {
+			preload_given = true;
+		} else if (key == "metadata_schema") {
+			metadata_schema = it->second.ToString();
 		} else if (key == "metadata_parameters" && it->second.type().id() == LogicalTypeId::MAP) {
 			for (auto &child : MapValue::GetChildren(it->second)) {
 				auto &key_value = StructValue::GetChildren(child);
 				auto parameter = StringUtil::Lower(key_value[0].ToString());
 				native_types_given = native_types_given || parameter == "native_types";
 				min_connections_given = min_connections_given || parameter == "min_connections";
+				preload_given = preload_given || parameter == "preload" || parameter == "schema_filter";
 				if (parameter == "type") {
 					on_mssql = StringUtil::Lower(key_value[1].ToString()) == "mssql";
 				}
@@ -357,6 +364,24 @@ unique_ptr<Catalog> AttachWithLimits(optional_ptr<StorageExtensionInfo> storage_
 	// transaction's pinned connection and a few concurrent autocommit reads.
 	if (on_mssql && !min_connections_given) {
 		options.options["meta_min_connections"] = Value::BIGINT(4);
+	}
+	// The catalog's metadata loaded at the metadata ATTACH, in one pass and outside any transaction,
+	// instead of table by table on first use: the first scan of an inlined table 3.1 -> 1.1 ms, 20
+	// first reads of a fresh session 891-1382 -> 837-864 ms (specs/015). Filtered to the lake's
+	// schema - the metadata database sees no other - so the pass reads only it: the ATTACH costs the
+	// same as without it (514-528 ms against 898-1168 for the whole database).
+	if (on_mssql && !preload_given) {
+		string pattern = "^";
+		for (auto c : metadata_schema) {
+			if (StringUtil::CharacterIsAlphaNumeric(c) || c == '_') {
+				pattern += c;
+			} else {
+				pattern += string("\\") + c;
+			}
+		}
+		pattern += "$";
+		options.options["meta_preload"] = Value::BOOLEAN(true);
+		options.options["meta_schema_filter"] = Value(pattern);
 	}
 	{
 		// the same AttachedDatabase the manager meets as its catalog's GetAttached(); a re-attach under
