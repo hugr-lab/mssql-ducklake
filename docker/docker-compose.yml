@@ -25,8 +25,10 @@ services:
     environment:
       - ACCEPT_EULA=Y
       - MSSQL_SA_PASSWORD=${MSSQL_DUCKLAKE_PASS:-TestPassword1}
-      # the catalog server shares a machine with a duckdb build (CI) or an IDE; cap its buffer pool
-      - MSSQL_MEMORY_LIMIT_MB=2048
+      # the catalog server shares a machine with a duckdb build (CI) or an IDE; cap its memory. 2 GB
+      # starves it under the 1000-table benchmark (the server shrinks its target to ~0.5 GB and
+      # stalls in compiles), so a bench machine raises it: MSSQL_DUCKLAKE_MEMORY_MB=8192
+      - MSSQL_MEMORY_LIMIT_MB=${MSSQL_DUCKLAKE_MEMORY_MB:-2048}
     ports:
       # loopback only: a test server with a committed sa password has no business on the LAN
       - "127.0.0.1:${MSSQL_DUCKLAKE_PORT:-7433}:1433"

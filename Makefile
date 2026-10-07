@@ -52,9 +52,12 @@ docker-up docker-down docker-status: export MSSQL_DUCKLAKE_PORT := $(MSSQL_DUCKL
 docker-up docker-down docker-status: export MSSQL_DUCKLAKE_PASS := $(MSSQL_DUCKLAKE_PASS)
 docker-up docker-down docker-status: export MSSQL_DUCKLAKE_DB := $(MSSQL_DUCKLAKE_DB)
 docker-up docker-down docker-status: export MSSQL_DUCKLAKE_IMAGE := $(MSSQL_DUCKLAKE_IMAGE)
+docker-up docker-down docker-status: export MSSQL_DUCKLAKE_MEMORY_MB := $(MSSQL_DUCKLAKE_MEMORY_MB)
 # `run --rm` starts sqlserver, waits for its health check (depends_on), streams the init's output,
 # propagates its exit code and removes the one-shot container
+# `up` first, so a changed setting (MSSQL_DUCKLAKE_MEMORY_MB) recreates the server; its volume stays
 docker-up:
+	$(DOCKER_COMPOSE) up -d --wait sqlserver
 	$(DOCKER_COMPOSE) run --rm sqlserver-init
 
 docker-down:
