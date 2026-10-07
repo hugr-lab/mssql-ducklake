@@ -770,6 +770,7 @@ void MSSQLMetadataManager::ApplyDatabaseOptions() {
 	// benchmark went from 937 s to 686-698 s, the first write into each table two to three times
 	// faster, the first read after an attach four times (specs/012).
 	ApplyDatabaseOption("mssql_ducklake_forced_parameterization", "PARAMETERIZATION FORCED",
+	                    "is_parameterization_forced = 1",
 	                    "which costs a plan compile per distinct literal (specs/012)");
 	// A catalog grows by thousands of rows per minute of commits, so its statistics go stale often,
 	// and by default the query that finds them stale recomputes them before it runs: the first read
@@ -777,10 +778,12 @@ void MSSQLMetadataManager::ApplyDatabaseOptions() {
 	// (300k rows) for a 9 ms statement. Asynchronous, that query runs on the old statistics and the
 	// recompute happens beside it - postgres' ANALYZE is a background job too (specs/017).
 	ApplyDatabaseOption("mssql_ducklake_async_statistics", "AUTO_UPDATE_STATISTICS_ASYNC ON",
+	                    "is_auto_update_stats_async_on = 1",
 	                    "which makes the first query after many commits wait for its statistics (specs/017)");
 }
 
-void MSSQLMetadataManager::ApplyDatabaseOption(const char *setting, const char *option, const char *without_it) {
+void MSSQLMetadataManager::ApplyDatabaseOption(const char *setting, const char *option, const char *already_set,
+                                               const char *without_it) {
 	// Database-wide options, so each has an opt-out, and best-effort, so a login that may shape the
 	// schema but not alter the database - or a platform without the option, Fabric Warehouse and
 	// Synapse among them - still gets a working catalog. Applied here, with the rest of the shape,
@@ -794,11 +797,16 @@ void MSSQLMetadataManager::ApplyDatabaseOption(const char *setting, const char *
 		return;
 	}
 	auto statement = StringUtil::Format("ALTER DATABASE CURRENT SET %s;", option);
+	// Only when it is not set yet: ALTER DATABASE ... SET flushes the database's plan cache even when
+	// it changes nothing, and every new catalog in the database shapes - each would throw away the
+	// plans of every other catalog there.
+	auto guarded = StringUtil::Format(
+	    "IF NOT EXISTS (SELECT 1 FROM sys.databases WHERE database_id = DB_ID() AND %s) %s", already_set, statement);
 	try {
 		// ALTER DATABASE is refused inside a transaction; on its own connection it is also online -
 		// measured against a session holding uncommitted DDL and a row lock in this database, it
 		// completed in a second.
-		RunServerSideOutsideTransaction(statement,
+		RunServerSideOutsideTransaction(guarded,
 		                                StringUtil::Format("Failed to set %s on the catalog's database: ", option));
 	} catch (std::exception &ex) {
 		DUCKDB_LOG_WARNING(*client_context,

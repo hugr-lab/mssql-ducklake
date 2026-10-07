@@ -222,9 +222,9 @@ private:
 	//! the catalog's database options - `PARAMETERIZATION FORCED` (specs/012) and
 	//! `AUTO_UPDATE_STATISTICS_ASYNC` (specs/017), each skipped when its setting is false.
 	void ApplyDatabaseOptions();
-	//! One of them: `ALTER DATABASE CURRENT SET <option>` unless `setting` is false, a warning
-	//! naming the statement when the server refuses it.
-	void ApplyDatabaseOption(const char *setting, const char *option, const char *without_it);
+	//! One of them: `ALTER DATABASE CURRENT SET <option>` unless `setting` is false or `already_set`
+	//! (a `sys.databases` condition) holds, a warning naming the statement when the server refuses it.
+	void ApplyDatabaseOption(const char *setting, const char *option, const char *already_set, const char *without_it);
 	//! What the server says about this catalog, in one statement: does it exist yet, is its shape
 	//! this build's, and has this build's migration run on it (specs/015 R3).
 	struct CatalogMarkers {

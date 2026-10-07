@@ -32,6 +32,13 @@ connection of its own outside the transaction, each a warning in `duckdb_logs()`
 statement when the server refuses it. `SHAPE_VERSION` 6 → 7, so a catalog shaped by an earlier build
 gets the option at its next attach.
 
+Each `ALTER DATABASE` is guarded by its `sys.databases` flag (`is_parameterization_forced`,
+`is_auto_update_stats_async_on`) and runs only when the option is not on yet: the statement flushes
+the database's plan cache even when it changes nothing, and every new catalog in a database shapes -
+the server log showed both options set again on each catalog the benchmarks created, throwing away
+the plans of every other catalog there (found 2026-10-07; verified: a new catalog in a database that
+has both leaves no new entry in the log).
+
 ## Testing
 
 `attach_mssql.test` puts the database back to synchronous statistics before the first attach and
