@@ -557,6 +557,46 @@ What is left is the extension's per-scan cost (M1: the joins of a vetoed plan pu
 `LIST` built locally - one statement instead of five; pushdown not planning what it will veto) and
 upstream's loads.
 
+## The metadata database's ATTACH, and cold reads (measured 2026-10-07)
+
+Measured with a trace of every metadata round trip (`mssql_ducklake_trace`, the manager's calls and
+DuckLake's query callback) beside the servers' own (Extended Events, postgres' statement log).
+
+**The server's memory first.** At `MSSQL_MEMORY_LIMIT_MB=2048` SQL Server shrank its target to ~0.5
+GB under the 1000-table bench: an almost empty plan cache, compiles stalling 0.7–41 s on
+`CMEMTHREAD`, new logins timing out - and the flush's final commit (a 262 KB batch that replays in
+0.33 s) timing out at 30 s, its locks then blocking `merge_adjacent` for 22 s. At 8192
+(`MSSQL_DUCKLAKE_MEMORY_MB`, the docker setting) the run is clean. The numbers below are at 8 GB.
+
+**Steady reads are at parity.** The same table read 200 times: 163 ops/s against 159 on postgres
+(N=1), 519 against 514 (N=4). What the benches showed as slower reads is the cold path - the
+concurrent bench's 20 operations a thread are dominated by the first, and every read phase of the
+scale bench is one cold read.
+
+Three defaults on the metadata ATTACH, all passed by the ATTACH wrapper unless the ATTACH names
+them (mssql #324, #416, #417):
+
+| | why | measured |
+| --- | --- | --- |
+| `META_NATIVE_TYPES false` | the bounded columns (specs/018) otherwise arrive as `MSSQL_VARCHAR(n)`, and DuckLake's `GetValue<string>` per catalog row became a full cast per value | 400 CREATE TABLEs: client CPU 43–45 → 36 s (postgres 39); the scale bench 587 → 477 s |
+| `META_MIN_CONNECTIONS 4` | a connection opened on demand is a TLS login, ~200 ms, paid by the first query that needs it | 4 cold concurrent readers: max 238–280 → 95–107 ms; the ATTACH ~+15 ms |
+| `META_PRELOAD true`, `META_SCHEMA_FILTER '^<schema>$'` | a table's first use is its describe; one pass over the lake's schema instead, outside any transaction | 20 first reads of a fresh session 921–1332 → 897–902 ms; the inlined table's first scan 3.1 → 1.1 ms; the ATTACH unchanged (the whole database: +400 ms) |
+
+A preloaded entry is as stale as a server change behind it, so the migrations drop exactly what they
+changed: the 1.1 tables they add columns to (when they add any), the tables META_LIMITS narrows,
+and the inlined tables they rename columns in - listed before the rename. Nothing else leaves the
+cache: a schema-wide clear would throw the preload away.
+
+**Not kept: query hints on the file list.** Each new file-list shape compiles in ~11 ms on SQL
+Server (postgres plans in ~1), whatever the hint: `MAXDOP 1`, `KEEPFIXED PLAN`, both, `FORCE ORDER`
+all 55–59 ms for the same five shapes on a cold plan cache, 1.7–2.0 ms a call after. It is the
+optimizer's price per shape per process; fewer shapes (they vary with the set of filtered columns)
+is the only lever left.
+
+**Ours, next:** shaping a new catalog compiles ~25 `IF EXISTS (… sys.key_constraints …)` at ~33 ms
+each (12.7 s of the 44.7 s compile in a full bench run with its concurrent part, Query Store) -
+`create_schemas` 2.0 s against postgres 0.3; one state query for the whole catalog instead.
+
 ## Dependencies on the mssql extension
 
 Sent to the mssql session on 2026-10-06, ranked by the measurements above.
