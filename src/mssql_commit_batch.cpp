@@ -542,9 +542,12 @@ bool NumericBody(const string &body, const string &schema, string &out) {
 			SkipSpace(body, next);
 			if (next < body.size() && body[next] == '(') {
 				// the calls these families carry: IN (...), NOT EXISTS (...), and the CTE updates'
-				// CAST(x AS BIT), already rewritten from BOOLEAN by the caller
+				// CAST(x AS BIT), already rewritten from BOOLEAN by the caller - and a parenthesised
+				// condition after a connective, as the flush's delete of its inlined rows writes since
+				// ducklake main: `... <= N AND (_ducklake_end_snapshot IS NULL OR ... <= N)`
 				auto upper = StringUtil::Upper(word);
-				if (upper != "IN" && upper != "EXISTS" && upper != "CAST") {
+				if (upper != "IN" && upper != "EXISTS" && upper != "CAST" && upper != "AND" && upper != "OR" &&
+				    upper != "NOT") {
 					return false;
 				}
 			}
@@ -910,7 +913,7 @@ bool InlinedDeletionDdlIsDuckLakes(DuckLakeMetadataManager &manager) {
 
 unique_ptr<QueryResult> MSSQLMetadataManager::RunCommitBatch(const string &tsql) {
 	auto &connection = transaction.GetConnection();
-	return connection.Query(StringUtil::Format("SELECT mssql_exec(%s, %s)", CatalogLiteral(), SQLString(tsql)));
+	return TracedQuery(connection, StringUtil::Format("SELECT mssql_exec(%s, %s)", CatalogLiteral(), SQLString(tsql)));
 }
 
 //===--------------------------------------------------------------------===//
@@ -1123,10 +1126,11 @@ string MSSQLMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_snapsh
 				}
 				commit_snapshot.schema_version++;
 			}
-			string inlined_tables, inlined_table_queries;
+			vector<string> inlined_tables;
+			string inlined_table_queries;
 			inlined_table_name =
 			    GetInlinedTableQueries(commit_snapshot, table_info, inlined_tables, inlined_table_queries);
-			batch += "INSERT INTO {METADATA_CATALOG}.ducklake_inlined_data_tables VALUES " + inlined_tables + ";";
+			batch += InsertValuesSql("ducklake_inlined_data_tables", inlined_tables);
 			batch += inlined_table_queries;
 		}
 
@@ -1382,7 +1386,7 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 	}
 	if (!last) {
 		// nothing ran - every statement was the DDL above; the base would refuse an empty batch
-		last = transaction.GetConnection().Query("SELECT 1");
+		last = TracedQuery(transaction.GetConnection(), "SELECT 1");
 	}
 	return last;
 }

@@ -177,12 +177,13 @@ idx_t MSSQLMetadataManager::StageCommitLocally(DuckLakeTransaction &flush_transa
 	auto staging_sql = batch.substr(0, call);
 
 	auto &connection = flush_transaction.GetConnection();
-	auto result = connection.Query(staging_sql);
+	auto result = TracedQuery(connection, staging_sql);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to stage the DuckLake commit: ");
 	}
-	auto rows = connection.Query(StringUtil::Format(
-	    "SELECT count(*) FROM %s", SQLIdentifier(DuckLakeStagedTable::BaseName(DuckLakeStagedTableType::DATA_FILE))));
+	auto rows = TracedQuery(connection,
+	                        StringUtil::Format("SELECT count(*) FROM %s", SQLIdentifier(DuckLakeStagedTable::BaseName(
+	                                                                          DuckLakeStagedTableType::DATA_FILE))));
 	if (rows->HasError()) {
 		rows->GetErrorObject().Throw("Failed to inspect the staged DuckLake commit: ");
 	}
@@ -203,7 +204,7 @@ void MSSQLMetadataManager::StageCommit(DuckLakeTransaction &flush_transaction) {
 		const string name = DuckLakeStagedTable::BaseName(type);
 		// most of the seventeen are empty in any one commit; a bulk load of nothing is still a round
 		// trip, and the count is local
-		auto rows = connection.Query(StringUtil::Format("SELECT count(*) FROM %s", SQLIdentifier(name)));
+		auto rows = TracedQuery(connection, StringUtil::Format("SELECT count(*) FROM %s", SQLIdentifier(name)));
 		if (rows->HasError()) {
 			rows->GetErrorObject().Throw("Failed to inspect the staged DuckLake commit: ");
 		}
@@ -224,7 +225,8 @@ void MSSQLMetadataManager::StageCommit(DuckLakeTransaction &flush_transaction) {
 		}
 		// `#name` is a session temp table: private to this connection, and gone if the transaction
 		// rolls back. REPLACE, because the connection may have staged an earlier commit already.
-		auto copy = connection.Query(
+		auto copy = TracedQuery(
+		    connection,
 		    StringUtil::Format("COPY %s TO 'mssql://%s/#%s' (FORMAT 'bcp', CREATE_TABLE true, REPLACE true)",
 		                       SQLIdentifier(name), catalog_name, name));
 		if (copy->HasError()) {
@@ -284,12 +286,14 @@ bool MSSQLMetadataManager::CanSkipSnapshotFetch(const TransactionChangeInformati
 //! latest snapshot the stats are read at), and the stats reads DuckLake would make anyway.
 string MSSQLMetadataManager::ClientMergedStatsSql(DuckLakeTransaction &flush_transaction, DuckLakeSnapshot &locked) {
 	auto &connection = flush_transaction.GetConnection();
-	auto lock = connection.Query(StringUtil::Format(
-	    "SELECT snapshot_id, schema_version, next_catalog_id, next_file_id FROM mssql_scan_unsafe(%s, "
-	    "'SELECT TOP 1 snapshot_id, schema_version, next_catalog_id, next_file_id FROM %s.ducklake_snapshot "
-	    "WITH (UPDLOCK, HOLDLOCK) ORDER BY snapshot_id DESC', columns := {'snapshot_id': 'BIGINT', "
-	    "'schema_version': 'BIGINT', 'next_catalog_id': 'BIGINT', 'next_file_id': 'BIGINT'})",
-	    CatalogLiteral(), StringUtil::Replace(SchemaIdentifier(), "'", "''")));
+	auto lock = TracedQuery(
+	    connection,
+	    StringUtil::Format(
+	        "SELECT snapshot_id, schema_version, next_catalog_id, next_file_id FROM mssql_scan_unsafe(%s, "
+	        "'SELECT TOP 1 snapshot_id, schema_version, next_catalog_id, next_file_id FROM %s.ducklake_snapshot "
+	        "WITH (UPDLOCK, HOLDLOCK) ORDER BY snapshot_id DESC', columns := {'snapshot_id': 'BIGINT', "
+	        "'schema_version': 'BIGINT', 'next_catalog_id': 'BIGINT', 'next_file_id': 'BIGINT'})",
+	        CatalogLiteral(), StringUtil::Replace(SchemaIdentifier(), "'", "''")));
 	if (lock->HasError()) {
 		lock->GetErrorObject().Throw("The server-side DuckLake commit could not lock the catalog: ");
 	}
@@ -302,11 +306,11 @@ string MSSQLMetadataManager::ClientMergedStatsSql(DuckLakeTransaction &flush_tra
 	auto &catalog = flush_transaction.GetCatalog();
 	string sql;
 	for (auto &entry : flush_transaction.GetLocalChanges().Changes()) {
-		auto &changes = entry.GetTableChanges();
+		auto &changes = entry.second;
 		if (changes.new_data_files.empty()) {
 			continue;
 		}
-		auto table_id = entry.GetTableIndex();
+		auto table_id = entry.first;
 		DuckLakeNewGlobalStats new_globals;
 		auto current = catalog.GetTableStats(flush_transaction, locked, table_id);
 		if (current) {
@@ -346,7 +350,7 @@ void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_tra
 	// (specs/015 D7). The count is in the transaction's own changes.
 	idx_t new_files = 0;
 	for (auto &entry : flush_transaction.GetLocalChanges().Changes()) {
-		new_files += entry.GetTableChanges().new_data_files.size();
+		new_files += entry.second.new_data_files.size();
 	}
 	if (new_files < ServerCommitMinFiles() && !SkipSnapshotFetchEnabled()) {
 		// (With the snapshot fetch skipped there is no falling back - see CanSkipSnapshotFetch - so
@@ -376,7 +380,7 @@ void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_tra
 	                             commit_info.commit_message.IsNull() ? "" : commit_info.commit_message.ToString(),
 	                             commit_info.commit_extra_info.IsNull() ? "" : commit_info.commit_extra_info.ToString(),
 	                             flush_transaction.GetCatalog().SupportsV1_1Metadata())));
-	auto applied = connection.Query(call);
+	auto applied = TracedQuery(connection, call);
 	// No fallback from here on: the procedure writes inside this transaction, so the client loop
 	// cannot start over in it. Everything that chooses between the two paths happens before the call.
 	if (applied->HasError()) {
@@ -390,7 +394,8 @@ void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_tra
 			written->GetErrorObject().Throw("The server-side DuckLake commit could not write its statistics: ");
 		}
 	}
-	auto result = connection.Query(
+	auto result = TracedQuery(
+	    connection,
 	    StringUtil::Format("SELECT snapshot_id, schema_version, had_flushes FROM mssql_scan_unsafe(%s, "
 	                       "'SELECT snapshot_id, schema_version, had_flushes FROM #ducklake_commit_result', "
 	                       "columns := {'snapshot_id': 'BIGINT', 'schema_version': 'BIGINT', "

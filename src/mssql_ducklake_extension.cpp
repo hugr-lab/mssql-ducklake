@@ -9,6 +9,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_helper.hpp"
 #include "mssql_catalog_lengths.hpp"
+#include "mssql_trace.hpp"
 #include "mssql_metadata_manager.hpp"
 #include "storage/ducklake_metadata_manager.hpp"
 
@@ -87,6 +88,7 @@ void LoadInternal(ExtensionLoader &loader) {
 	    "catalog is shaped; a query that finds stale statistics no longer waits for their update",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
 	RegisterCatalogInfoFunction(loader);
+	RegisterTraceFunctions(loader);
 	loader.RegisterFunction(
 	    ScalarFunction("mssql_ducklake_version", {}, LogicalType::VARCHAR, MssqlDucklakeVersionFun));
 }

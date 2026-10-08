@@ -259,7 +259,7 @@ void MSSQLMetadataManager::MigrateInlinedColumnNames(bool probe_renamed) {
 	    transaction.GetConnection(),
 	    StringUtil::Format(
 	        "SELECT name FROM mssql_scan_unsafe(%s, %s, columns := {'name': 'VARCHAR'})", CatalogLiteral(),
-	        DuckLakeUtil::SQLLiteralToString(StringUtil::Format(
+	        SQLString::ToString(StringUtil::Format(
 	            "SELECT DISTINCT CAST(t.name AS NVARCHAR(128)) AS name FROM %s.ducklake_inlined_data_tables idt "
 	            "JOIN sys.tables t ON t.name = idt.table_name COLLATE DATABASE_DEFAULT AND t.schema_id = "
 	            "SCHEMA_ID(%s) JOIN sys.columns c ON c.object_id = t.object_id AND c.column_id <= 3 "
@@ -417,7 +417,7 @@ EXEC sp_executesql @sql;)",
 	                          StringUtil::Format("SELECT * FROM mssql_scan_unsafe(%s, %s, columns := {'tbl': "
 	                                             "'VARCHAR', 'col': 'VARCHAR', 'bound': 'INTEGER', "
 	                                             "'longest': 'BIGINT'})",
-	                                             CatalogLiteral(), DuckLakeUtil::SQLLiteralToString(check)));
+	                                             CatalogLiteral(), SQLString::ToString(check)));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to check the DuckLake catalog's strings against META_LIMITS: ");
 	}
@@ -539,7 +539,7 @@ MSSQLMetadataManager::ShapeState MSSQLMetadataManager::ReadShapeState() {
 	    transaction.GetConnection(),
 	    StringUtil::Format("SELECT kind, tbl, name, info, flag FROM mssql_scan_unsafe(%s, %s, columns := {'kind': "
 	                       "'VARCHAR', 'tbl': 'VARCHAR', 'name': 'VARCHAR', 'info': 'VARCHAR', 'flag': 'BIGINT'})",
-	                       CatalogLiteral(), DuckLakeUtil::SQLLiteralToString(tsql)));
+	                       CatalogLiteral(), SQLString::ToString(tsql)));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to inspect the DuckLake catalog's shape on SQL Server: ");
 	}
@@ -581,7 +581,7 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	RequireUtf8Collation();
 	const string schema = SchemaIdentifier();
 	const string schema_literal =
-	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
+	    SQLString::ToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
 	const auto lengths = ResolveCatalogLengths();
 
 	// Primary keys. DuckLake declares a few itself; the rest are ours, and they are what make the

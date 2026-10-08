@@ -45,7 +45,7 @@ bool MSSQLMetadataManager::HasStatsPastBound() const {
 		return false;
 	};
 	for (auto &entry : transaction.GetLocalChanges().Changes()) {
-		auto &changes = entry.GetTableChanges();
+		auto &changes = entry.second;
 		for (auto &file : changes.new_data_files) {
 			if (past(file)) {
 				return true;
@@ -167,22 +167,34 @@ string MSSQLMetadataManager::TSQLColumnType(const LogicalType &column_type) cons
 //===--------------------------------------------------------------------===//
 
 string MSSQLMetadataManager::SchemaIdentifier() const {
-	return DuckLakeUtil::SQLIdentifierToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
+	return SQLQuotedIdentifier::ToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
 }
 
 string MSSQLMetadataManager::SchemaLiteral() const {
-	return DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
+	return SQLString::ToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
 }
 
 string MSSQLMetadataManager::CatalogLiteral() const {
-	return DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataDatabaseName());
+	return SQLString::ToString(transaction.GetCatalog().MetadataDatabaseName());
 }
 
 void MSSQLMetadataManager::RunOn(Connection &connection, const string &tsql, const string &context) {
-	auto result = connection.Query(StringUtil::Format("SELECT mssql_exec(%s, %s)", CatalogLiteral(), SQLString(tsql)));
+	auto result =
+	    TracedQuery(connection, StringUtil::Format("SELECT mssql_exec(%s, %s)", CatalogLiteral(), SQLString(tsql)));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw(context);
 	}
+}
+
+unique_ptr<QueryResult> MSSQLMetadataManager::TracedQuery(Connection &connection, const string &query) {
+	auto &callback = transaction.GetCatalog().GetQueryCallback();
+	if (!callback) {
+		return connection.Query(query);
+	}
+	auto start = std::chrono::steady_clock::now();
+	auto result = connection.Query(query);
+	callback(query, std::chrono::steady_clock::now() - start);
+	return result;
 }
 
 void MSSQLMetadataManager::RunServerSide(const string &tsql, const string &context) {
@@ -215,7 +227,7 @@ void MSSQLMetadataManager::ClearCache() {
 	// Nothing recorded means we do not know what changed - the attach-time clear - and the schema is
 	// the honest answer then.
 	auto &connection = transaction.GetConnection();
-	auto schema = DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
+	auto schema = SQLString::ToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
 	vector<string> calls;
 	if (tables_pending_cache_refresh.empty()) {
 		calls.push_back(StringUtil::Format("SELECT mssql_invalidate_cache(%s, %s)", CatalogLiteral(), schema));
@@ -225,13 +237,13 @@ void MSSQLMetadataManager::ClearCache() {
 				continue;
 			}
 			calls.push_back(StringUtil::Format("SELECT mssql_invalidate_cache(%s, %s, %s)", CatalogLiteral(), schema,
-			                                   DuckLakeUtil::SQLLiteralToString(table_name)));
+			                                   SQLString::ToString(table_name)));
 		}
 	}
 	tables_pending_cache_refresh.clear();
 	tables_already_refreshed.clear();
 	for (auto &call : calls) {
-		auto result = connection.Query(call);
+		auto result = TracedQuery(connection, call);
 		if (result->HasError()) {
 			result->GetErrorObject().Throw("Failed to refresh the SQL Server catalog cache: ");
 		}
@@ -240,10 +252,11 @@ void MSSQLMetadataManager::ClearCache() {
 
 void MSSQLMetadataManager::InvalidateTableCache(const string &table_name) {
 	auto &connection = transaction.GetConnection();
-	auto result = connection.Query(StringUtil::Format(
-	    "SELECT mssql_invalidate_cache(%s, %s, %s)", CatalogLiteral(),
-	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName()),
-	    DuckLakeUtil::SQLLiteralToString(table_name)));
+	auto result = TracedQuery(
+	    connection,
+	    StringUtil::Format("SELECT mssql_invalidate_cache(%s, %s, %s)", CatalogLiteral(),
+	                       SQLString::ToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName()),
+	                       SQLString::ToString(table_name)));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to refresh the SQL Server catalog cache: ");
 	}
@@ -357,7 +370,7 @@ void MSSQLMetadataManager::EnsureReady() {
 //===--------------------------------------------------------------------===//
 
 string MSSQLMetadataManager::GetInlinedTableQueries(DuckLakeSnapshot commit_snapshot, const DuckLakeTableInfo &table,
-                                                    string &inlined_tables, string &inlined_table_queries) {
+                                                    vector<string> &inlined_tables, string &inlined_table_queries) {
 	// The base registers the table and builds DuckDB DDL for it; we keep the registration and write
 	// the DDL ourselves, because the column types are T-SQL and could not travel in the duckdb batch.
 	string base_ddl;
@@ -382,16 +395,17 @@ string MSSQLMetadataManager::GetInlinedTableQueries(DuckLakeSnapshot commit_snap
 	// that no row of ducklake_inlined_data_tables names is such a leftover: asked on this
 	// transaction's connection - its own locks (the shaping's ALTERs on a new catalog among them)
 	// would block any other - and dropped by the statement that creates the table afresh.
-	const auto schema_literal =
-	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
-	const auto name_literal = DuckLakeUtil::SQLLiteralToString(table_name);
-	auto probe = transaction.GetConnection().Query(StringUtil::Format(
-	    "SELECT leftover FROM mssql_scan_unsafe(%s, %s, columns := {'leftover': 'BIGINT'})", CatalogLiteral(),
-	    DuckLakeUtil::SQLLiteralToString(StringUtil::Format(
-	        "SELECT CAST(CASE WHEN OBJECT_ID(QUOTENAME(%s) + '.' + QUOTENAME(%s)) IS NOT NULL AND NOT EXISTS "
-	        "(SELECT 1 FROM %s.ducklake_inlined_data_tables WHERE table_name = %s) THEN 1 ELSE 0 END AS BIGINT) AS "
-	        "leftover",
-	        schema_literal, name_literal, SchemaIdentifier(), name_literal))));
+	const auto schema_literal = SQLString::ToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName());
+	const auto name_literal = SQLString::ToString(table_name);
+	auto probe = TracedQuery(
+	    transaction.GetConnection(),
+	    StringUtil::Format(
+	        "SELECT leftover FROM mssql_scan_unsafe(%s, %s, columns := {'leftover': 'BIGINT'})", CatalogLiteral(),
+	        SQLString::ToString(StringUtil::Format(
+	            "SELECT CAST(CASE WHEN OBJECT_ID(QUOTENAME(%s) + '.' + QUOTENAME(%s)) IS NOT NULL AND NOT EXISTS "
+	            "(SELECT 1 FROM %s.ducklake_inlined_data_tables WHERE table_name = %s) THEN 1 ELSE 0 END AS BIGINT) AS "
+	            "leftover",
+	            schema_literal, name_literal, SchemaIdentifier(), name_literal))));
 	if (probe->HasError()) {
 		probe->GetErrorObject().Throw("Failed to create the inlined data table: ");
 	}

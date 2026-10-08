@@ -425,7 +425,7 @@ namespace {
 
 unique_ptr<FunctionData> CatalogInfoBind(ClientContext &context, TableFunctionBindInput &input,
                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
-	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input.inputs[0]);
+	auto &catalog = DuckLakeBaseMetadataFunction::GetCatalog(context, input);
 	auto &ducklake_catalog = catalog.Cast<DuckLakeCatalog>();
 	if (ducklake_catalog.MetadataType() != "mssql") {
 		throw InvalidInputException("mssql_ducklake_catalog_info: '%s' is not a DuckLake catalog on SQL Server",
@@ -453,10 +453,10 @@ WHERE t.schema_id = SCHEMA_ID(N'%s') AND t.name LIKE N'ducklake[_]%%' AND t.name
   AND t.name NOT LIKE N'ducklake[_]inlined[_]delete[_][0-9]%%' AND ty.name IN (N'varchar', N'nvarchar'))",
 	                               schema_literal, schema_literal);
 	auto &transaction = DuckLakeTransaction::Get(context, ducklake_catalog);
-	auto query = StringUtil::Format("SELECT * FROM mssql_scan_unsafe(%s, %s, columns := {'kind': 'VARCHAR', 'name': "
-	                                "'VARCHAR', 'value': 'VARCHAR'}) ORDER BY kind DESC, name",
-	                                DuckLakeUtil::SQLLiteralToString(ducklake_catalog.MetadataDatabaseName()),
-	                                DuckLakeUtil::SQLLiteralToString(tsql));
+	auto query =
+	    StringUtil::Format("SELECT * FROM mssql_scan_unsafe(%s, %s, columns := {'kind': 'VARCHAR', 'name': "
+	                       "'VARCHAR', 'value': 'VARCHAR'}) ORDER BY kind DESC, name",
+	                       SQLString::ToString(ducklake_catalog.MetadataDatabaseName()), SQLString::ToString(tsql));
 	auto result = transaction.GetConnection().Query(query);
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("mssql_ducklake_catalog_info: ");

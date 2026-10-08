@@ -70,7 +70,7 @@ public:
 	//! The inlined table's DDL is ours: its column types are T-SQL, which the duckdb-parsed commit
 	//! batch could not carry, so it is executed separately (specs/004 D2).
 	string GetInlinedTableQueries(DuckLakeSnapshot commit_snapshot, const DuckLakeTableInfo &table,
-	                              string &inlined_tables, string &inlined_table_queries) override;
+	                              vector<string> &inlined_tables, string &inlined_table_queries) override;
 
 	//! The inlining type matrix (specs/004 D4). A type SQL Server cannot hold exactly is stored as
 	//! text and cast back on read.
@@ -106,8 +106,7 @@ public:
 	string GenerateFileListQuery(DuckLakeTableEntry &table, const FilterPushdownInfo *filter_info,
 	                             const vector<DuckLakeFileListDynamicFilter> &dynamic_filters,
 	                             const vector<idx_t> &runtime_filter_stats_columns, FileListType file_list_type,
-	                             const string &metadata_table_prefix,
-	                             const FileColumnStatsCTEBodyGenerator &generate_cte_body) override;
+	                             const string &metadata_table_prefix) override;
 	//! The pruning casts, in T-SQL while the file list is being built for the server and DuckLake's
 	//! own otherwise (the catalog-path fallback is DuckDB SQL).
 	string CastValueToTarget(const Value &value, const LogicalType &type) override;

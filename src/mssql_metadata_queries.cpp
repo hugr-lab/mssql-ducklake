@@ -40,7 +40,10 @@ namespace {
 //!
 //! Kept verbatim so that a ducklake bump editing this query is caught at attach - see
 //! ProbeServerCapabilities - rather than silently disabling the rewrite below.
-constexpr const char *DUCKLAKE_CONFLICT_CHECK_QUERY = R"(
+//! DuckLake writes the query in two forms - `include_exactness` adds min_is_exact/max_is_exact to
+//! both arms of the union, and a 1.1 catalog asks for that one - so both are kept here, assembled
+//! from the same pieces the base assembles them from.
+constexpr const char *CONFLICT_HEAD = R"(
 SELECT
     snapshot_id,
     schema_version,
@@ -60,7 +63,8 @@ SELECT
     NULL AS contains_nan,
     NULL AS min_value,
     NULL AS max_value,
-    NULL AS extra_stats
+    NULL AS extra_stats)";
+constexpr const char *CONFLICT_MID = R"(
     FROM {METADATA_CATALOG}.ducklake_snapshot
     WHERE snapshot_id = (
         SELECT MAX(snapshot_id)
@@ -81,14 +85,21 @@ SELECT
     contains_nan,
     min_value,
     max_value,
-    extra_stats
+    extra_stats)";
+constexpr const char *CONFLICT_TAIL = R"(
 FROM {METADATA_CATALOG}.ducklake_table_stats
 LEFT JOIN {METADATA_CATALOG}.ducklake_table_column_stats
     USING (table_id)
-WHERE record_count IS NOT NULL
-    AND file_size_bytes IS NOT NULL
 ORDER BY table_id NULLS FIRST;
 	)";
+
+string DuckLakeConflictCheckQuery(bool exactness) {
+	if (!exactness) {
+		return string(CONFLICT_HEAD) + CONFLICT_MID + CONFLICT_TAIL;
+	}
+	return string(CONFLICT_HEAD) + ",\n    NULL AS min_is_exact,\n    NULL AS max_is_exact" + CONFLICT_MID +
+	       ",\n    min_is_exact,\n    max_is_exact" + CONFLICT_TAIL;
+}
 
 //! The replacement: the same question asked as ONE statement the server answers by itself.
 //!
@@ -104,9 +115,13 @@ ORDER BY table_id NULLS FIRST;
 //! `ORDER BY`; `CAST(NULL AS ...)` so the union resolves the column types rather than guessing from
 //! an untyped NULL; and no `NULLS FIRST`, which SQL Server does not have and does not need, since it
 //! sorts NULLs first ascending - which is what puts the snapshot row where the parser expects it.
+//! A stats row whose sizes are NULL is returned as the base returns it: FillMissingTableSizes asks
+//! for those after.
 //!
 //! The inner text travels inside a DuckDB string literal, so each of its own quotes is doubled once.
-constexpr const char *MSSQL_CONFLICT_CHECK_QUERY = R"(
+string MSSQLConflictCheckQuery(bool exactness) {
+	return StringUtil::Format(
+	    R"(
 FROM mssql_scan_unsafe({METADATA_CATALOG_NAME_LITERAL}, '
 SELECT s.snapshot_id, s.schema_version, s.next_catalog_id, s.next_file_id,
        COALESCE((SELECT STRING_AGG(changes_made, '','')
@@ -121,21 +136,24 @@ SELECT s.snapshot_id, s.schema_version, s.next_catalog_id, s.next_file_id,
        CAST(NULL AS BIT) AS contains_nan,
        CAST(NULL AS VARCHAR(MAX)) AS min_value,
        CAST(NULL AS VARCHAR(MAX)) AS max_value,
-       CAST(NULL AS VARCHAR(MAX)) AS extra_stats
+       CAST(NULL AS VARCHAR(MAX)) AS extra_stats%s
 FROM (SELECT TOP 1 * FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot ORDER BY snapshot_id DESC) s
 UNION ALL
 SELECT NULL, NULL, NULL, NULL, NULL,
        ts.table_id, cs.column_id, ts.record_count, ts.next_row_id, ts.file_size_bytes,
-       cs.contains_null, cs.contains_nan, cs.min_value, cs.max_value, cs.extra_stats
+       cs.contains_null, cs.contains_nan, cs.min_value, cs.max_value, cs.extra_stats%s
 FROM {METADATA_SCHEMA_ESCAPED}.ducklake_table_stats ts
 LEFT JOIN {METADATA_SCHEMA_ESCAPED}.ducklake_table_column_stats cs ON cs.table_id = ts.table_id
-WHERE ts.record_count IS NOT NULL AND ts.file_size_bytes IS NOT NULL
 ORDER BY table_id', columns := {
     'snapshot_id': 'BIGINT', 'schema_version': 'BIGINT', 'next_catalog_id': 'BIGINT',
     'next_file_id': 'BIGINT', 'changes': 'VARCHAR', 'table_id': 'BIGINT', 'column_id': 'BIGINT',
     'record_count': 'BIGINT', 'next_row_id': 'BIGINT', 'file_size_bytes': 'BIGINT',
     'contains_null': 'BOOLEAN', 'contains_nan': 'BOOLEAN', 'min_value': 'VARCHAR',
-    'max_value': 'VARCHAR', 'extra_stats': 'VARCHAR'}))";
+    'max_value': 'VARCHAR', 'extra_stats': 'VARCHAR'%s}))",
+	    exactness ? ",\n       CAST(NULL AS BIT) AS min_is_exact, CAST(NULL AS BIT) AS max_is_exact" : "",
+	    exactness ? ", cs.min_is_exact, cs.max_is_exact" : "",
+	    exactness ? ", 'min_is_exact': 'BOOLEAN', 'max_is_exact': 'BOOLEAN'" : "");
+}
 
 } // namespace
 
@@ -144,11 +162,8 @@ DuckLakeInlinedColNames InlinedColumnNames(DuckLakeTransaction &transaction) {
 }
 
 bool ConflictCheckQueryIsDuckLakes() {
-	// RECON (design/005): ducklake main takes `include_exactness` here and emits a different query for
-	// each value, so the exact-match rewrite of specs/007 now has TWO texts to recognise, not one.
-	// This checks the false form only - enough to build and run; the port has to decide whether to
-	// carry both texts or to drop the rewrite in favour of DuckDB 2.0's own pushdown (design/004).
-	return DuckLakeMetadataManager::GetSnapshotAndStatsAndChangesQuery(false) == DUCKLAKE_CONFLICT_CHECK_QUERY;
+	return DuckLakeMetadataManager::GetSnapshotAndStatsAndChangesQuery(false) == DuckLakeConflictCheckQuery(false) &&
+	       DuckLakeMetadataManager::GetSnapshotAndStatsAndChangesQuery(true) == DuckLakeConflictCheckQuery(true);
 }
 
 void MSSQLMetadataManager::CreateInlinedDeletionTable(const string &table_name) {
@@ -158,8 +173,8 @@ void MSSQLMetadataManager::CreateInlinedDeletionTable(const string &table_name) 
 	    "IF OBJECT_ID(QUOTENAME(%s) + '.' + QUOTENAME(%s)) IS NULL "
 	    "CREATE TABLE %s.%s(file_id BIGINT NOT NULL, row_id BIGINT NOT NULL, begin_snapshot BIGINT NOT NULL, "
 	    "CONSTRAINT %s PRIMARY KEY (file_id, row_id, begin_snapshot));",
-	    DuckLakeUtil::SQLLiteralToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName()),
-	    DuckLakeUtil::SQLLiteralToString(table_name), SchemaIdentifier(), SQLIdentifier(table_name),
+	    SQLString::ToString(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName()),
+	    SQLString::ToString(table_name), SchemaIdentifier(), SQLIdentifier(table_name),
 	    SQLIdentifier("pk_" + table_name));
 	RunServerSideOutsideTransaction(statement, "Failed to create the inlined deletion table: ");
 	InvalidateTableCache(table_name);
@@ -191,8 +206,13 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Query(DuckLakeSnapshot snapshot, s
 	// An exact match, so a ducklake bump that edits the query stops matching rather than applying a
 	// rewrite to something that no longer says what we think. ProbeServerCapabilities turns that
 	// mismatch into an error at attach, because the alternative is a silent return of the crash.
-	if (ConflictRewriteEnabled() && query == DUCKLAKE_CONFLICT_CHECK_QUERY) {
-		query = MSSQL_CONFLICT_CHECK_QUERY;
+	if (ConflictRewriteEnabled()) {
+		for (bool exactness : {false, true}) {
+			if (query == DuckLakeConflictCheckQuery(exactness)) {
+				query = MSSQLConflictCheckQuery(exactness);
+				break;
+			}
+		}
 	}
 	// The catalog load's tables+columns statement (BuildCatalogForSnapshot) filters the columns AFTER
 	// its LEFT JOIN - `((<visible>) OR column_id IS NULL)` - where no filter can be pushed below the
@@ -432,7 +452,7 @@ string MSSQLMetadataManager::CastValueToTarget(const Value &value, const Logical
 		if (type.IsNumeric() && finite) {
 			return value.ToString();
 		}
-		return DuckLakeUtil::SQLLiteralToString(value.ToString());
+		return SQLString::ToString(value.ToString());
 	}
 	// On the server every constant is a parameter: one plan for every value, with or without the
 	// database's forced parameterization (specs/012 is best-effort and has an opt-out), and a string
@@ -467,10 +487,10 @@ string MSSQLMetadataManager::CastValueToTarget(const Value &value, const Logical
 		}
 		// passed as text and converted by the declaration, so the value is the server's reading of
 		// exactly the text DuckDB printed - the same reading the stats strings get
-		return AddFileListParameter(DuckLakeUtil::SQLLiteralToString(text), target.type);
+		return AddFileListParameter(SQLString::ToString(text), target.type);
 	}
 	if (type.id() == LogicalTypeId::VARCHAR || type.id() == LogicalTypeId::UUID) {
-		return AddFileListParameter(DuckLakeUtil::SQLLiteralToString(text), "NVARCHAR(MAX)");
+		return AddFileListParameter(SQLString::ToString(text), "NVARCHAR(MAX)");
 	}
 	return string();
 }
@@ -510,40 +530,43 @@ string MSSQLMetadataManager::CastStatsToTarget(const string &stats, const Logica
 string MSSQLMetadataManager::GenerateFileListQuery(DuckLakeTableEntry &table, const FilterPushdownInfo *filter_info,
                                                    const vector<DuckLakeFileListDynamicFilter> &dynamic_filters,
                                                    const vector<idx_t> &runtime_filter_stats_columns,
-                                                   FileListType file_list_type, const string &metadata_table_prefix,
-                                                   const FileColumnStatsCTEBodyGenerator &generate_cte_body) {
+                                                   FileListType file_list_type, const string &metadata_table_prefix) {
 	auto catalog_path = [&]() {
-		return DuckLakeMetadataManager::GenerateFileListQuery(table, filter_info, dynamic_filters,
-		                                                      runtime_filter_stats_columns, file_list_type,
-		                                                      metadata_table_prefix, generate_cte_body);
+		return DuckLakeMetadataManager::GenerateFileListQuery(
+		    table, filter_info, dynamic_filters, runtime_filter_stats_columns, file_list_type, metadata_table_prefix);
 	};
 	if (ServerFileListDisabled()) {
 		return catalog_path();
 	}
-	// DuckLake's builder, with the schema as the server names it, our CTE body (its column id a
-	// parameter) and our casts (its constants parameters)
+	// DuckLake's builder, with the schema as the server names it and our casts (its constants
+	// parameters). Its stats CTE bodies (GenerateFileColumnStatsCTEBody) carry the column id and the
+	// table id as literals; both become parameters below, so the statement's text is one per shape.
 	file_list_parameters.clear();
-	auto native_cte = [this](const CTERequirement &req, TableIndex) {
-		string select_list = "data_file_id";
-		for (auto &stat : req.referenced_stats) {
-			select_list += ", " + stat;
-		}
-		auto column = AddFileListParameter(to_string(req.column_field_index), "BIGINT");
-		return StringUtil::Format("  SELECT %s\n  FROM {METADATA_SCHEMA_ESCAPED}.ducklake_file_column_stats\n"
-		                          "  WHERE column_id = %s AND table_id = @table_id\n",
-		                          select_list, column);
-	};
 	string query;
 	building_tsql_file_list = true;
 	try {
 		query = DuckLakeMetadataManager::GenerateFileListQuery(table, filter_info, dynamic_filters,
 		                                                       runtime_filter_stats_columns, file_list_type,
-		                                                       "{METADATA_SCHEMA_ESCAPED}", native_cte);
+		                                                       "{METADATA_SCHEMA_ESCAPED}");
 	} catch (...) {
 		building_tsql_file_list = false;
 		throw;
 	}
 	building_tsql_file_list = false;
+	{
+		const std::regex cte_filter("WHERE column_id = (\\d+) AND table_id = " + to_string(table.GetTableId().index) +
+		                            "\\b");
+		string rewritten;
+		auto last = query.cbegin();
+		for (std::sregex_iterator it(query.begin(), query.end(), cte_filter), end; it != end; ++it) {
+			rewritten.append(last, (*it)[0].first);
+			auto column = AddFileListParameter((*it)[1].str(), "BIGINT");
+			rewritten += "WHERE column_id = " + column + " AND table_id = @table_id";
+			last = (*it)[0].second;
+		}
+		rewritten.append(last, query.cend());
+		query = std::move(rewritten);
+	}
 	auto outcome = FileListToTSQL(query);
 	if (outcome == FileListOutcome::KNOWN_LIMIT) {
 		return catalog_path();
