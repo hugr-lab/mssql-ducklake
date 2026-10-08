@@ -12,6 +12,8 @@
 #include "common/ducklake_util.hpp"
 #include "functions/ducklake_table_functions.hpp"
 #include "storage/ducklake_catalog.hpp"
+#include "storage/ducklake_secret.hpp"
+#include "duckdb/main/secret/secret.hpp"
 #include "storage/ducklake_transaction.hpp"
 
 #include <mutex>
@@ -320,10 +322,16 @@ unique_ptr<Catalog> AttachWithLimits(optional_ptr<StorageExtensionInfo> storage_
 	bool preload_given = false;
 	bool lazy_validation = false;
 	string metadata_schema;
-	for (auto it = options.options.begin(); it != options.options.end();) {
-		auto key = StringUtil::Lower(it->first);
-		if (key == "meta_type") {
-			on_mssql = StringUtil::Lower(it->second.ToString()) == "mssql";
+	// What decides the options below, from wherever DuckLake takes it: a ducklake secret first - the
+	// ATTACH's name for one (`ducklake:<secret>`), or the default secret with no path - looked up the
+	// way DuckLake looks it up, through every registered secret storage (a remote one too); then the
+	// ATTACH's own options, which override the secret's as they do in DuckLake.
+	auto consider = [&](const string &raw_key, const Value &value) {
+		auto key = StringUtil::Lower(raw_key);
+		if (key == "metadata_path") {
+			on_mssql = StringUtil::StartsWith(StringUtil::Lower(value.ToString()), "mssql:");
+		} else if (key == "meta_type") {
+			on_mssql = StringUtil::Lower(value.ToString()) == "mssql";
 		} else if (key == "meta_native_types") {
 			native_types_given = true;
 		} else if (key == "meta_min_connections") {
@@ -333,9 +341,9 @@ unique_ptr<Catalog> AttachWithLimits(optional_ptr<StorageExtensionInfo> storage_
 		} else if (key == "meta_lazy_validation" || key == "meta_lazyvalidation") {
 			lazy_validation = true;
 		} else if (key == "metadata_schema") {
-			metadata_schema = it->second.ToString();
-		} else if (key == "metadata_parameters" && it->second.type().id() == LogicalTypeId::MAP) {
-			for (auto &child : MapValue::GetChildren(it->second)) {
+			metadata_schema = value.ToString();
+		} else if (key == "metadata_parameters" && value.type().id() == LogicalTypeId::MAP) {
+			for (auto &child : MapValue::GetChildren(value)) {
 				auto &key_value = StructValue::GetChildren(child);
 				auto parameter = StringUtil::Lower(key_value[0].ToString());
 				native_types_given = native_types_given || parameter == "native_types";
@@ -347,6 +355,17 @@ unique_ptr<Catalog> AttachWithLimits(optional_ptr<StorageExtensionInfo> storage_
 				}
 			}
 		}
+	};
+	auto secret = DuckLakeSecret::GetSecret(context, info.path.empty() ? DuckLakeSecret::DEFAULT_SECRET : info.path);
+	if (secret) {
+		on_mssql = false; // the path named a secret, not a metadata path
+		for (auto &entry : secret->secret->Cast<KeyValueSecret>().secret_map) {
+			consider(entry.first.GetIdentifierName(), entry.second);
+		}
+	}
+	for (auto it = options.options.begin(); it != options.options.end();) {
+		auto key = StringUtil::Lower(it->first);
+		consider(it->first, it->second);
 		if (key == "meta_limits") {
 			lengths = CatalogLengths::FromValue(it->second);
 			it = options.options.erase(it);
