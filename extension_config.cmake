@@ -25,11 +25,10 @@ duckdb_extension_load(mssql
 
 # RECON (specs/015): the postgres arm of the bench. The 2.0-line duckdb is a dev build with no
 # published postgres_scanner, so it is built from source like mssql - a loadable, loaded by build
-# path. Not part of the release build. Its pin is on duckdb 097ee1d34a (09-30), ours is 4af9740da4:
-# one call changed in between (`Parser::ParseExpressionList` is no longer static), patched by hand
-# in build/release/_deps/postgres_scanner_extension_fc-src - redo it after a clean build.
+# path. Not part of the release build. Pinned to duckdb-postgres main, which carries the v2.0-cyanoptera
+# patches (Parser's expression list is no longer static there).
 duckdb_extension_load(postgres_scanner
     GIT_URL https://github.com/duckdb/duckdb-postgres
-    GIT_TAG f9db66ec5a5c35a30ce868d2b7233ffc0a21a08e
+    GIT_TAG a0fcfdece407d3450dae7ce19baa1251f11fd356
     SUBMODULES database-connector
 )
