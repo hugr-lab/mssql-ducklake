@@ -2,13 +2,13 @@
 # same inputs. Full platform coverage (Windows MSVC/MinGW, musl, linux_arm64, ...) lives here; the
 # PR loop stays on ci.yml's Linux job.
 #
-# On the DuckDB 2.0 line. Until v2.0.0 is tagged, duckdb_version is the release branch
-# (v2.0-cyanoptera), not the submodule's commit: the reusable workflow turns duckdb_version into the
-# build's version string, and a 40-character SHA does not fit the 32 bytes an extension's metadata
-# keeps of it - the loadables then refuse to LOAD in the tests ("built specifically for DuckDB
-# version '4fbae437...'"). A branch name fits, as `main` does in extension-ci-tools' own CI. So this
-# build floats with the branch head while ci.yml builds the pinned submodule; at the release both
-# become the tag (and extension-ci-tools' v2.0 branch). A red run means our code or a pin bump.
+# On the DuckDB 2.0 line, pinned to the duckdb submodule's commit. Until v2.0.0 is tagged this is a
+# build check across the platforms, without the tests: the reusable workflow turns duckdb_version
+# into the build's version string, and an extension's metadata keeps 32 bytes of a 40-character SHA,
+# so the loadables refuse to LOAD in a test ("built specifically for DuckDB version '4fbae437...'").
+# A branch name would fit but floats past our pin (v2.0-cyanoptera's head already changed an API the
+# embedded ducklake uses). The tests run in ci.yml, on the pinned submodule. At the release:
+# duckdb_version v2.0.0, extension-ci-tools' v2.0 branch, and skip_tests goes.
 name: Distribution build
 
 on:
@@ -29,17 +29,19 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       extension_name: mssql_ducklake
-      duckdb_version: v2.0-cyanoptera
+      duckdb_version: 4fbae437b223047ba34e15222f269a2f6b364afc
       ci_tools_version: main
       # wasm is out: mssql (raw TDS sockets) does not exist there, and the manager is nothing
       # without it
       exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
+      # until v2.0.0: see the header
+      skip_tests: true
 
   code-quality-check:
     name: Code Quality Check
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
     with:
       extension_name: mssql_ducklake
-      duckdb_version: v2.0-cyanoptera
+      duckdb_version: 4fbae437b223047ba34e15222f269a2f6b364afc
       ci_tools_version: main
       format_checks: 'format;tidy'
