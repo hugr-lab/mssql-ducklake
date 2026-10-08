@@ -57,6 +57,61 @@ inline bool ConflictRewriteEnabled() {
 	return !disabled;
 }
 
+//! DuckDB prints a TIMESTAMPTZ with a bare hour offset (`+00`); SQL Server reads `+00:00`.
+inline string WithMinuteOffset(const string &text) {
+	auto n = text.size();
+	if (n > 3 && (text[n - 3] == '+' || text[n - 3] == '-') && StringUtil::CharacterIsDigit(text[n - 2]) &&
+	    StringUtil::CharacterIsDigit(text[n - 1])) {
+		return text + ":00";
+	}
+	return text;
+}
+
+inline bool HasFourDigitYear(const string &text) {
+	return text.size() >= 10 && StringUtil::CharacterIsDigit(text[0]) && StringUtil::CharacterIsDigit(text[1]) &&
+	       StringUtil::CharacterIsDigit(text[2]) && StringUtil::CharacterIsDigit(text[3]) && text[4] == '-' &&
+	       text[7] == '-';
+}
+
+//! Off switch for the catalog load's column filter moved into its join (specs/015), for measuring.
+//! the catalog-wide incremental cache of the global table stats off (specs/019): every call reads
+//! every table's stats, as the base does
+inline bool StatsCacheDisabled() {
+	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_STATS_CACHE") != nullptr;
+	return disabled;
+}
+
+inline bool LoadRewriteDisabled() {
+	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_LOAD_REWRITE") != nullptr;
+	return disabled;
+}
+
+//! Off switch for the server-side file list (specs/015), so its absence can be measured.
+inline bool ServerFileListDisabled() {
+	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_SERVER_FILE_LIST") != nullptr;
+	return disabled;
+}
+
+//! Off switch for the user's inlined rows in the T-SQL run (specs/015): they take DuckDB's DML path
+//! again, one round trip of their own. For measuring, and for running the two against each other.
+inline bool InlinedRowsInRunDisabled() {
+	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_INLINED_TSQL") != nullptr;
+	return disabled;
+}
+
+//! The size past which a T-SQL run goes as several calls, cut at statement boundaries, all on the
+//! transaction's connection (specs/015). SQL Server parses and compiles a batch whole: one flush of
+//! 1000 tables' inlined data was a 2.7 MB batch of ~3000 statements, superlinear in time (0.27 MB
+//! 218 ms, 0.80 MB 1245 ms) and past the 2 GB server's memory (error 701). MSSQL_DUCKLAKE_RUN_LIMIT_KB
+//! overrides it, for measuring.
+inline idx_t RunLimitBytes() {
+	static const idx_t limit = [] {
+		auto *env = getenv("MSSQL_DUCKLAKE_RUN_LIMIT_KB");
+		return static_cast<idx_t>(env ? std::strtoull(env, nullptr, 10) : 256) * 1024;
+	}();
+	return limit;
+}
+
 //! specs/014: an unrecognised catalog statement in the commit batch is an error rather than a
 //! fallback to the base. On in the integration suite, so that a ducklake bump that adds a shape
 //! fails the suite naming the statement; off for a user, whose catalog keeps working, slower.
@@ -88,6 +143,11 @@ bool ConflictCheckQueryIsDuckLakes();
 
 //! Whether DuckLake's commit loop still writes the inlined deletion table's DDL into the batch in the
 //! text the Execute seam recognises (specs/006 D5b). Asked at attach for the same reason.
-bool InlinedDeletionDdlIsDuckLakes();
+bool InlinedDeletionDdlIsDuckLakes(DuckLakeMetadataManager &manager);
+
+//! The inlined tables' own metadata columns are named by the catalog's DuckLake format: bare on 1.0,
+//! `_ducklake_`-prefixed from 1.1-dev1 (DuckLakeInlinedColNames). Our inlined DDL is ours to write,
+//! so it has to follow the format rather than hard-code the 1.0 names (design/005).
+DuckLakeInlinedColNames InlinedColumnNames(DuckLakeTransaction &transaction);
 
 } // namespace duckdb

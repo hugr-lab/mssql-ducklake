@@ -50,3 +50,8 @@ specs are the shareable distillation of that work.
 | [012](012-forced-parameterization/spec.md) | forced parameterization on the catalog's database | implemented |
 | [013](013-docs-site/spec.md) | the documentation site | implemented |
 | [014](014-commit-batch-tsql/spec.md) | the commit batch as our T-SQL, statement by known statement | implemented |
+| [015](015-duckdb-2-line/spec.md) | the DuckDB 2.0 line — rework, after the prototype | draft (prototype: `recon/duckdb-2.0-pushdown`) |
+| [016](016-concurrent-bench/spec.md) | many writers and readers through one DuckDB | draft (measured) |
+| [017](017-async-statistics/spec.md) | asynchronous statistics on the catalog's database | implemented |
+| [018](018-bounded-strings/spec.md) | bounded string columns, chosen at ATTACH (`META_LIMITS`) | implemented |
+| [019](019-global-stats-cache/spec.md) | the global table stats, cached per catalog; deadlocked commits retried | implemented (branch `recon/global-stats-cache`) |

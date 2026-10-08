@@ -8,6 +8,8 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/extension_helper.hpp"
+#include "mssql_catalog_lengths.hpp"
+#include "mssql_trace.hpp"
 #include "mssql_metadata_manager.hpp"
 #include "storage/ducklake_metadata_manager.hpp"
 
@@ -32,9 +34,9 @@ namespace {
 //! of the build) stays what Version() returns, for duckdb_extensions().
 void MssqlDucklakeVersionFun(DataChunk &args, ExpressionState &state, Vector &result) {
 #ifdef MSSQL_DUCKLAKE_VERSION
-	result.Reference(Value(MSSQL_DUCKLAKE_VERSION));
+	result.Reference(Value(MSSQL_DUCKLAKE_VERSION), count_t(args.size()));
 #else
-	result.Reference(Value(MssqlDucklakeExtension().Version()));
+	result.Reference(Value(MssqlDucklakeExtension().Version()), count_t(args.size()));
 #endif
 }
 
@@ -61,6 +63,9 @@ void LoadInternal(ExtensionLoader &loader) {
 	// the full ducklake surface: the `ducklake` ATTACH prefix, ducklake_* functions, secret type,
 	// settings - registered by ducklake's own init, same image
 	ducklake_duckdb_cpp_init(loader);
+	// META_LIMITS - the lengths of a catalog's string columns (specs/018) - is this extension's, not
+	// DuckLake's: read and taken out on the way into DuckLake's ATTACH
+	WatchDuckLakeAttach(DBConfig::GetConfig(db));
 
 	// the registry is process-global while Load runs per database instance; a second Register of
 	// the same key throws by design
@@ -68,8 +73,8 @@ void LoadInternal(ExtensionLoader &loader) {
 	std::call_once(register_once, [] { DuckLakeMetadataManager::Register("mssql", MSSQLMetadataManager::Create); });
 
 	loader.SetDescription("DuckLake with SQL Server metadata catalog support (embeds ducklake)");
-	// The one database-wide thing the manager does to a catalog's database, and so the one with an
-	// opt-out (specs/012). Read when the catalog is shaped - at its creation, or at the first attach
+	// The database-wide things the manager does to a catalog's database, and so the ones with an
+	// opt-out (specs/012, 017). Read when the catalog is shaped - at its creation, or at the first attach
 	// with a build whose shape version is newer - not on every attach.
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption(
@@ -77,6 +82,13 @@ void LoadInternal(ExtensionLoader &loader) {
 	    "Set PARAMETERIZATION FORCED on a DuckLake catalog's SQL Server database when the catalog "
 	    "is shaped; one plan per query shape instead of one per literal",
 	    LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+	config.AddExtensionOption(
+	    "mssql_ducklake_async_statistics",
+	    "Set AUTO_UPDATE_STATISTICS_ASYNC ON on a DuckLake catalog's SQL Server database when the "
+	    "catalog is shaped; a query that finds stale statistics no longer waits for their update",
+	    LogicalType::BOOLEAN, Value::BOOLEAN(true), nullptr, SetScope::GLOBAL);
+	RegisterCatalogInfoFunction(loader);
+	RegisterTraceFunctions(loader);
 	loader.RegisterFunction(
 	    ScalarFunction("mssql_ducklake_version", {}, LogicalType::VARCHAR, MssqlDucklakeVersionFun));
 }

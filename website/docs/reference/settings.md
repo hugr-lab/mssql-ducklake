@@ -9,6 +9,7 @@ sidebar_position: 1
 
 | setting | type | default | meaning |
 | --- | --- | --- | --- |
+| `mssql_ducklake_async_statistics` | BOOLEAN | `true` | Whether shaping a catalog sets `AUTO_UPDATE_STATISTICS_ASYNC ON` on its database ([Shaping](../catalog/shaping.md#asynchronous-statistics)), so a query that finds stale statistics does not wait for their update. Read when the catalog is shaped, like the one below. `false` leaves the database's setting as it is. |
 | `mssql_ducklake_forced_parameterization` | BOOLEAN | `true` | Whether shaping a catalog sets `PARAMETERIZATION FORCED` on its database ([Shaping](../catalog/shaping.md#forced-parameterization)). Read when the catalog is shaped — at creation, or at the first attach with a build whose shape version is newer — not on every attach. `false` leaves the database's setting as it is. |
 
 DuckLake's own settings — `ducklake_max_retry_count`, `ducklake_retry_wait_ms`,
@@ -18,12 +19,13 @@ connections; see the [mssql extension's reference](https://hugr-lab.github.io/ms
 
 ### Attach options
 
-`DATA_PATH`, `METADATA_SCHEMA`, `META_TYPE` and DuckLake's own — on the [attach page](../catalog/attach.md#options).
+`DATA_PATH`, `METADATA_SCHEMA`, `META_TYPE`, `META_LIMITS` and DuckLake's own — on the [attach page](../catalog/attach.md#options).
 
 ### Functions
 
 | function | returns |
 | --- | --- |
+| `mssql_ducklake_catalog_info('lake')` | `(kind, name, value)` rows about a catalog on SQL Server: its limits (`limit`, one per `META_LIMITS` key), its shape stamp and migration marker (`property`), the database's forced parameterization, asynchronous statistics and read committed snapshot (`database`), and every string column with its declared type as the server reports it (`column`). |
 | `mssql_ducklake_version()` | the extension's release version, `0.1.2` in this one — the same idea as the mssql extension's `mssql_version()`; a build between releases answers the coming version with `-dev`. `duckdb_extensions()` shows the build's git hash instead. |
 
 Everything else is DuckLake's: `ducklake_snapshots()`, `ducklake_table_info()`,

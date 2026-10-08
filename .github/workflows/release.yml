@@ -45,11 +45,11 @@ jobs:
   build:
     name: Build extension binaries
     needs: guard
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.6
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       extension_name: mssql_ducklake
-      duckdb_version: v1.5.6
-      ci_tools_version: v1.5.6
+      duckdb_version: 4fbae437b223047ba34e15222f269a2f6b364afc
+      ci_tools_version: main
       exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
 
   release:
@@ -72,7 +72,7 @@ jobs:
           VERSION: ${{ needs.guard.outputs.version }}
         run: |
           mkdir -p release
-          # one artifact per platform: mssql_ducklake-v1.5.6-extension-<platform>/mssql_ducklake.duckdb_extension
+          # one artifact per platform: mssql_ducklake-<duckdb version>-extension-<platform>/mssql_ducklake.duckdb_extension
           for dir in artifacts/mssql_ducklake-*-extension-*; do
             platform="${dir##*-extension-}"
             file=$(find "$dir" -name 'mssql_ducklake.duckdb_extension' | head -1)
@@ -98,9 +98,9 @@ jobs:
           body: |
             ## mssql_ducklake ${{ github.ref_name }} — DuckLake on SQL Server
 
-            Built for DuckDB **v1.5.6**; embeds DuckLake at the pin named in
+            Built for DuckDB **2.0**; embeds DuckLake at the pin named in
             [Versions](https://hugr-lab.github.io/mssql-ducklake/versions/); needs the mssql
-            extension v0.2.5 or newer at runtime. What is in this release, and what is not:
+            extension built for the same DuckDB at runtime. What is in this release, and what is not:
             [release notes](https://hugr-lab.github.io/mssql-ducklake/releases/) ·
             [limitations](https://hugr-lab.github.io/mssql-ducklake/reference/limitations/).
 

@@ -1,0 +1,152 @@
+# name: test/sql/integration/read_pruning.test
+# description: A read's file list run on the server, and the pruning it does, type by type (specs/015)
+# group: [integration]
+
+# The file list of a scan - DuckLake's query with its stats CTEs and filters - goes to SQL Server as
+# one statement, with the comparisons in T-SQL. A pruning filter that is wrong does not fail: it
+# drops files, and the answer comes back short. So every case here has two files whose bounds sit
+# on either side of the filter, and the answer says whether the right one survived. Each table gets
+# one file per insert (past the inlining limit), so the bounds below are the files' own.
+require-env MSSQL_DUCKLAKE_TEST_DSN
+
+require parquet
+
+statement ok
+SET autoload_known_extensions = false;
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
+
+statement ok
+ATTACH '${MSSQL_DUCKLAKE_TEST_DSN}' AS srv (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''read_pruning'';
+EXEC sp_executesql @sql;
+IF SCHEMA_ID(''read_pruning'') IS NULL EXEC(''CREATE SCHEMA read_pruning'');');
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/read_pruning', METADATA_SCHEMA 'read_pruning');
+
+statement ok
+CALL enable_logging('DuckLakeMetadata');
+
+statement ok
+CREATE TABLE lake.t(i BIGINT, neg INTEGER, d DECIMAL(18, 4), f DOUBLE, dt DATE, ts TIMESTAMP, tz TIMESTAMPTZ,
+                    v VARCHAR, u UUID, b BOOLEAN, h HUGEINT);
+
+# file one: the low values
+statement ok
+INSERT INTO lake.t SELECT r, -r - 1000, r * 0.5, r * 0.25, DATE '2020-01-01' + r::INTEGER,
+                          TIMESTAMP '2020-01-01 00:00:00' + INTERVAL (r) MINUTE, to_timestamp(1577836800 + r * 60),
+                          'alpha' || lpad(r::VARCHAR, 3, '0'), '00000000-0000-0000-0000-' || lpad(r::VARCHAR, 12, '0'),
+                          false, r FROM range(0, 100) t(r);
+
+# file two: the high values, the Unicode ones, a NaN, a HUGEINT past DECIMAL(38)
+statement ok
+INSERT INTO lake.t SELECT r, -r, r * 0.5, CASE WHEN r = 150 THEN 'nan'::DOUBLE ELSE r * 0.25 END,
+                          DATE '2030-01-01' + (r - 100)::INTEGER, TIMESTAMP '2030-01-01 00:00:00' + INTERVAL (r - 100) MINUTE,
+                          to_timestamp(1893456000 + (r - 100) * 60), 'ключ' || lpad(r::VARCHAR, 3, '0'),
+                          'ffffffff-0000-0000-0000-' || lpad(r::VARCHAR, 12, '0'), true,
+                          CASE WHEN r = 199 THEN '150000000000000000000000000000000000000'::HUGEINT ELSE r END
+                   FROM range(100, 200) t(r);
+
+query I
+SELECT count(*) FROM lake.t WHERE i BETWEEN 120 AND 129;
+----
+10
+
+query I
+SELECT count(*) FROM lake.t WHERE neg < -1050;
+----
+49
+
+query I
+SELECT count(*) FROM lake.t WHERE d >= 75.5;
+----
+49
+
+# 161..199, and the NaN - bigger than anything
+query I
+SELECT count(*) FROM lake.t WHERE f > 40;
+----
+40
+
+# NaN is bigger than anything: the file holding one must survive a `>` filter
+query I
+SELECT count(*) FROM lake.t WHERE f > 1000;
+----
+1
+
+query I
+SELECT count(*) FROM lake.t WHERE dt = DATE '2030-01-05';
+----
+1
+
+query I
+SELECT count(*) FROM lake.t WHERE ts < TIMESTAMP '2020-01-01 00:10:00';
+----
+10
+
+query I
+SELECT count(*) FROM lake.t WHERE tz >= to_timestamp(1893456000 + 90 * 60);
+----
+10
+
+query I
+SELECT count(*) FROM lake.t WHERE v = 'ключ150';
+----
+1
+
+query I
+SELECT count(*) FROM lake.t WHERE v < 'alpha010';
+----
+10
+
+query I
+SELECT count(*) FROM lake.t WHERE u = 'ffffffff-0000-0000-0000-000000000150'::UUID;
+----
+1
+
+query I
+SELECT count(*) FROM lake.t WHERE b;
+----
+100
+
+# the HUGEINT bound past DECIMAL(38,0) does not cast on the server: unknown, and the file stays
+query I
+SELECT count(*) FROM lake.t WHERE h > 10000;
+----
+1
+
+# Top-N: DuckLake orders the file list by a bound (`NULLS LAST` in its SQL, a CASE in ours)
+query I
+SELECT i FROM lake.t ORDER BY i DESC LIMIT 3;
+----
+199
+198
+197
+
+# and the file lists above went to the server as one statement each, parameterized - the table,
+# the snapshot and the constants as parameters, so its text is the same for every table and value -
+# with the shape given, so its bind sent nothing
+query I
+SELECT count(*) > 0 FROM duckdb_logs() WHERE type = 'DuckLakeMetadata' AND message LIKE '%mssql_scan_params_unsafe(%WITH col_%table_id = @table_id%';
+----
+true
+
+statement ok
+DETACH lake;
+
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''read_pruning'';
+EXEC sp_executesql @sql; DROP SCHEMA read_pruning;');

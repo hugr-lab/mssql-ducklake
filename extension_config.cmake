@@ -7,7 +7,6 @@
 # like production does, with an explicit LOAD.
 duckdb_extension_load(mssql_ducklake
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
-    DONT_LINK
     LOAD_TESTS
 )
 
@@ -16,8 +15,20 @@ duckdb_extension_load(mssql_ducklake
 # (`LOAD '__BUILD_DIRECTORY__/extension/mssql/...'`). The pin is the release tag built against
 # the v1.5 line (v0.2.5: the catalog's default schema is dbo, multi-scan plans on a pinned
 # connection materialize - spec 003); its openssl/simdutf arrive through the merged vcpkg manifest.
+# RECON (specs/015): mssql main ed7cb2e - spec 081's given-shape vehicle (`mssql_scan_unsafe`,
+# #407), RPC parameters (083), metadata query shapes (084), the native_types ATTACH option, on the
+# same duckdb pin (4fbae437b22, #418). Move to a release tag before merge.
 duckdb_extension_load(mssql
-    DONT_LINK
     GIT_URL https://github.com/hugr-lab/mssql-extension
-    GIT_TAG v0.2.5
+    GIT_TAG ed7cb2efb4ee3c5a977dc30c3c83bae44f17ef23
+)
+
+# RECON (specs/015): the postgres arm of the bench. The 2.0-line duckdb is a dev build with no
+# published postgres_scanner, so it is built from source like mssql - a loadable, loaded by build
+# path. Not part of the release build. Pinned to duckdb-postgres main, which carries the v2.0-cyanoptera
+# patches (Parser's expression list is no longer static there).
+duckdb_extension_load(postgres_scanner
+    GIT_URL https://github.com/duckdb/duckdb-postgres
+    GIT_TAG a0fcfdece407d3450dae7ce19baa1251f11fd356
+    SUBMODULES database-connector
 )

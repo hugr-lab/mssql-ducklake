@@ -5,6 +5,8 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/database.hpp"
 #include "storage/ducklake_catalog.hpp"
+#include "storage/ducklake_inlined_data.hpp"
+#include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
 
 namespace duckdb {
@@ -39,23 +41,31 @@ struct Literal {
 //! and the columns its migrations added): n BIGINT, s VARCHAR, b BOOLEAN, t TIMESTAMPTZ, u UUID.
 //! A tuple is rendered column by column against this, and a table that is not here - or a tuple
 //! of another width - is not rewritten.
-const unordered_map<string, string> &CatalogColumns() {
+//!
+//! Both formats are supported (specs/015 R1), and they differ only at the end of five tables: format
+//! 1.1 appends `row_group_count` to the data and delete files, `min_is_exact`/`max_is_exact` to both
+//! stats tables and `parent_schema_id` to schemas, and adds `ducklake_view_column_tag`. A migrated
+//! catalog gets those columns by `ALTER … ADD`, which appends - so the 1.0 layout is the 1.1 one with
+//! the tail cut, and that is how it is derived rather than written out twice.
+const unordered_map<string, string> &CatalogColumnsV1_1() {
 	static const unordered_map<string, string> columns = {
 	    {"ducklake_metadata", "sssn"},
 	    {"ducklake_snapshot", "ntnnn"},
 	    {"ducklake_snapshot_changes", "nssss"},
-	    {"ducklake_schema", "nunnssb"},
+	    {"ducklake_schema", "nunnssbn"},
 	    {"ducklake_table", "nunnnssb"},
 	    {"ducklake_view", "nunnnssss"},
 	    {"ducklake_tag", "nnnss"},
 	    {"ducklake_column_tag", "nnnnss"},
-	    {"ducklake_data_file", "nnnnnsbsnnnnnsnn"},
-	    {"ducklake_file_column_stats", "nnnnnnssbs"},
+	    // 1.1: tags on a view's columns, keyed on the column NAME rather than an id
+	    {"ducklake_view_column_tag", "nsnnss"},
+	    {"ducklake_data_file", "nnnnnsbsnnnnnsnnn"},
+	    {"ducklake_file_column_stats", "nnnnnnssbsbb"},
 	    {"ducklake_file_variant_stats", "nnnssnnnssbs"},
-	    {"ducklake_delete_file", "nnnnnsbsnnnsn"},
+	    {"ducklake_delete_file", "nnnnnsbsnnnsnn"},
 	    {"ducklake_column", "nnnnnssssbnss"},
 	    {"ducklake_table_stats", "nnnn"},
-	    {"ducklake_table_column_stats", "nnbbsss"},
+	    {"ducklake_table_column_stats", "nnbbsssbb"},
 	    {"ducklake_partition_info", "nnnn"},
 	    {"ducklake_partition_column", "nnnns"},
 	    {"ducklake_file_partition_value", "nnns"},
@@ -294,7 +304,97 @@ string ChunkedStatements(const string &head, const vector<string> &rows, const s
 
 //! `INSERT INTO {METADATA_CATALOG}.<table> VALUES (...)[, (...)]` for a table on the list. The
 //! macros' generator writes `values(` in lower case with no space; both forms are the same statement.
-bool RewriteInsert(const string &stmt, const string &schema, string &tsql) {
+const unordered_map<string, string> &CatalogColumnsV1_0() {
+	static const unordered_map<string, string> columns = [] {
+		auto result = CatalogColumnsV1_1();
+		const vector<pair<string, idx_t>> added_by_v1_1 = {
+		    {"ducklake_data_file", 1},          {"ducklake_delete_file", 1}, {"ducklake_file_column_stats", 2},
+		    {"ducklake_table_column_stats", 2}, {"ducklake_schema", 1},
+		};
+		for (auto &entry : added_by_v1_1) {
+			auto &kinds = result.at(entry.first);
+			kinds.resize(kinds.size() - entry.second);
+		}
+		result.erase("ducklake_view_column_tag");
+		return result;
+	}();
+	return columns;
+}
+
+const unordered_map<string, string> &CatalogColumns(bool v1_1) {
+	return v1_1 ? CatalogColumnsV1_1() : CatalogColumnsV1_0();
+}
+
+//! The statistics columns of the tables that carry them, in DDL order (format 1.1): a bound longer
+//! than the catalog's stats_length is written as NULL, and so is its exactness (specs/018).
+const unordered_map<string, vector<string>> &StatsColumnOrder() {
+	static const unordered_map<string, vector<string>> order = {
+	    {"ducklake_file_column_stats",
+	     {"data_file_id", "table_id", "column_id", "column_size_bytes", "value_count", "null_count", "min_value",
+	      "max_value", "contains_nan", "extra_stats", "min_is_exact", "max_is_exact"}},
+	    {"ducklake_table_column_stats",
+	     {"table_id", "column_id", "contains_null", "contains_nan", "min_value", "max_value", "extra_stats",
+	      "min_is_exact", "max_is_exact"}},
+	    {"ducklake_file_variant_stats",
+	     {"data_file_id", "table_id", "column_id", "variant_path", "shredded_type", "column_size_bytes", "value_count",
+	      "null_count", "min_value", "max_value", "contains_nan", "extra_stats"}},
+	};
+	return order;
+}
+
+//! The bytes a string literal stands for: its text with each doubled quote counted once.
+idx_t LiteralBytes(const Literal &lit) {
+	idx_t doubled = 0;
+	for (idx_t i = 0; i + 1 < lit.text.size(); i++) {
+		if (lit.text[i] == '\'' && lit.text[i + 1] == '\'') {
+			doubled++;
+			i++;
+		}
+	}
+	return lit.text.size() - doubled;
+}
+
+//! A min or max past the bound becomes NULL - unknown, which DuckLake reads as "do not prune on it" and
+//! never resurrects in a merge (ducklake_stats.cpp) - and its exactness with it.
+void BoundStats(const string &table, const vector<string> &listed, int64_t stats_length,
+                vector<vector<Literal>> &tuples) {
+	if (stats_length <= 0) {
+		return;
+	}
+	auto entry = StatsColumnOrder().find(table);
+	if (entry == StatsColumnOrder().end()) {
+		return;
+	}
+	auto &columns = listed.empty() ? entry->second : listed;
+	auto position = [&](const char *name) -> optional_idx {
+		for (idx_t i = 0; i < columns.size(); i++) {
+			if (columns[i] == name) {
+				return i;
+			}
+		}
+		return optional_idx();
+	};
+	const pair<const char *, const char *> bounds[] = {{"min_value", "min_is_exact"}, {"max_value", "max_is_exact"}};
+	for (auto &tuple : tuples) {
+		for (auto &bound : bounds) {
+			auto value = position(bound.first);
+			if (!value.IsValid() || value.GetIndex() >= tuple.size()) {
+				continue;
+			}
+			auto &lit = tuple[value.GetIndex()];
+			if (lit.kind != LiteralKind::STRING || LiteralBytes(lit) <= idx_t(stats_length)) {
+				continue;
+			}
+			lit = Literal {LiteralKind::NULL_VALUE, string()};
+			auto exact = position(bound.second);
+			if (exact.IsValid() && exact.GetIndex() < tuple.size()) {
+				tuple[exact.GetIndex()] = Literal {LiteralKind::NULL_VALUE, string()};
+			}
+		}
+	}
+}
+
+bool RewriteInsert(const string &stmt, const string &schema, bool v1_1, int64_t stats_length, string &tsql) {
 	const string head = string("INSERT INTO ") + CATALOG_PREFIX;
 	if (!StringUtil::StartsWith(stmt, head)) {
 		return false;
@@ -305,13 +405,51 @@ bool RewriteInsert(const string &stmt, const string &schema, string &tsql) {
 	if (StringUtil::StartsWith(table, INLINED_DELETE_PREFIX)) {
 		kinds = "nnn";
 	} else {
-		auto entry = CatalogColumns().find(table);
-		if (entry == CatalogColumns().end()) {
+		auto &columns = CatalogColumns(v1_1);
+		auto entry = columns.find(table);
+		if (entry == columns.end()) {
 			return false;
 		}
 		kinds = entry->second;
 	}
 	SkipSpace(stmt, pos);
+	// 1.1 writes some of these with an explicit column list -
+	// `INSERT INTO t (schema_id, schema_uuid, …) VALUES (…)`. T-SQL takes the same list, so it is
+	// carried through verbatim; the kinds stay positional, and a listed column count that does not
+	// match the table's refuses the rewrite rather than guessing (the strict guard then names it).
+	string column_list;
+	vector<string> listed_columns;
+	if (pos < stmt.size() && stmt[pos] == '(') {
+		auto close = stmt.find(')', pos);
+		if (close == string::npos) {
+			return false;
+		}
+		auto listed = stmt.substr(pos + 1, close - pos - 1);
+		idx_t listed_count = 1;
+		for (auto ch : listed) {
+			if (ch == ',') {
+				listed_count++;
+			}
+		}
+		if (listed_count != kinds.size()) {
+			return false;
+		}
+		string rendered_list;
+		for (auto &name : StringUtil::Split(listed, ',')) {
+			auto trimmed = name;
+			StringUtil::Trim(trimmed);
+			for (auto ch : trimmed) {
+				if (!IsIdentifierChar(ch)) {
+					return false;
+				}
+			}
+			rendered_list += (rendered_list.empty() ? "" : ", ") + QuotedIfReserved(trimmed);
+			listed_columns.push_back(trimmed);
+		}
+		column_list = " (" + rendered_list + ")";
+		pos = close + 1;
+		SkipSpace(stmt, pos);
+	}
 	auto keyword = ReadIdentifier(stmt, pos);
 	if (StringUtil::Upper(keyword) != "VALUES") {
 		return false;
@@ -320,6 +458,7 @@ bool RewriteInsert(const string &stmt, const string &schema, string &tsql) {
 	if (!ReadTuples(stmt, pos, tuples) || tuples.empty()) {
 		return false;
 	}
+	BoundStats(table, listed_columns, stats_length, tuples);
 	// SQL Server takes at most 1000 rows in one VALUES list (error 10738); a commit of two hundred
 	// files writes eight thousand statistics rows in one INSERT, so the statement is emitted per
 	// thousand rows - still one round trip, since the run is one batch
@@ -338,7 +477,7 @@ bool RewriteInsert(const string &stmt, const string &schema, string &tsql) {
 		}
 		rows.push_back("(" + rendered + ")");
 	}
-	tsql = ChunkedStatements("INSERT INTO " + schema + "." + table + " VALUES ", rows, ";");
+	tsql = ChunkedStatements("INSERT INTO " + schema + "." + table + column_list + " VALUES ", rows, ";");
 	return true;
 }
 
@@ -373,15 +512,42 @@ bool NumericBody(const string &body, const string &schema, string &out) {
 			result += lit.text;
 			continue;
 		}
+		if (c == '\'') {
+			// 1.1 writes the per-column statistics refresh as a direct UPDATE with the min/max
+			// values as string literals in the SET list, where 1.0 carried them in a CTE's VALUES.
+			// The literal is rendered the way every other catalog string is: N'...', so the text
+			// travels as UTF-16 into the UTF-8 column rather than through the database's code page.
+			Literal lit;
+			if (!ReadLiteral(body, pos, lit) || lit.kind != LiteralKind::STRING) {
+				return false;
+			}
+			result += "N'" + lit.text + "'";
+			continue;
+		}
 		if (IsIdentifierChar(c)) {
 			auto word = ReadIdentifier(body, pos);
+			// 1.1 writes `CAST(true AS BOOLEAN)` into the stats refresh's SET list, and DuckDB's
+			// spelling of a boolean is not T-SQL's: `true`/`false` are column references to SQL
+			// Server (error 207 "Invalid column name 'true'"), and BOOLEAN is not a type name
+			auto upper_word = StringUtil::Upper(word);
+			if (upper_word == "TRUE" || upper_word == "FALSE") {
+				result += upper_word == "TRUE" ? "1" : "0";
+				continue;
+			}
+			if (upper_word == "BOOLEAN") {
+				result += "BIT";
+				continue;
+			}
 			auto next = pos;
 			SkipSpace(body, next);
 			if (next < body.size() && body[next] == '(') {
 				// the calls these families carry: IN (...), NOT EXISTS (...), and the CTE updates'
-				// CAST(x AS BIT), already rewritten from BOOLEAN by the caller
+				// CAST(x AS BIT), already rewritten from BOOLEAN by the caller - and a parenthesised
+				// condition after a connective, as the flush's delete of its inlined rows writes since
+				// ducklake main: `... <= N AND (_ducklake_end_snapshot IS NULL OR ... <= N)`
 				auto upper = StringUtil::Upper(word);
-				if (upper != "IN" && upper != "EXISTS" && upper != "CAST") {
+				if (upper != "IN" && upper != "EXISTS" && upper != "CAST" && upper != "AND" && upper != "OR" &&
+				    upper != "NOT") {
 					return false;
 				}
 			}
@@ -586,6 +752,140 @@ vector<string> SplitStatements(const string &batch) {
 	return out;
 }
 
+//! One per-column refresh of `ducklake_table_column_stats`, as UpdateGlobalTableStatsSql writes it
+//! since ducklake's v1.5 head: `UPDATE {METADATA_CATALOG}.ducklake_table_column_stats SET
+//! contains_null=CAST(<b> AS BOOLEAN), contains_nan=CAST(<b> AS BOOLEAN), min_value=<s>,
+//! max_value=<s>, extra_stats=<s>[, min_is_exact=CAST(<b> AS BOOLEAN), max_is_exact=CAST(<b> AS
+//! BOOLEAN)] WHERE table_id=<n> AND column_id=<n>`, values already T-SQL.
+struct ColumnStatsRefresh {
+	string table_id;
+	string column_id;
+	bool exactness = false;
+	//! contains_null, contains_nan, min, max, extra[, min_is_exact, max_is_exact]
+	vector<string> values;
+};
+
+bool ReadColumnStatsRefresh(const string &stmt, ColumnStatsRefresh &out) {
+	idx_t pos = 0;
+	auto expect = [&](const char *text) {
+		auto n = strlen(text);
+		if (stmt.compare(pos, n, text) != 0) {
+			return false;
+		}
+		pos += n;
+		return true;
+	};
+	auto boolean = [&](string &value) {
+		Literal lit;
+		if (!expect("CAST(") || !ReadLiteral(stmt, pos, lit) || !expect(" AS BOOLEAN)")) {
+			return false;
+		}
+		// a bare 1/0/NULL: the BIT column converts it on assignment, and the batch is a third shorter
+		// than with a CAST per value - its text is parsed on every commit
+		if (lit.kind == LiteralKind::BOOLEAN) {
+			value = lit.text;
+		} else if (lit.kind == LiteralKind::NULL_VALUE) {
+			value = "NULL";
+		} else {
+			return false;
+		}
+		return true;
+	};
+	auto text = [&](string &value) {
+		Literal lit;
+		if (!ReadLiteral(stmt, pos, lit)) {
+			return false;
+		}
+		if (lit.kind == LiteralKind::STRING) {
+			// N'...': UTF-16 into the UTF-8 column, not through the database's code page
+			value = "N'" + lit.text + "'";
+		} else if (lit.kind == LiteralKind::NULL_VALUE) {
+			value = "NULL";
+		} else {
+			return false;
+		}
+		return true;
+	};
+	auto number = [&](string &value) {
+		Literal lit;
+		if (!ReadLiteral(stmt, pos, lit) || lit.kind != LiteralKind::NUMBER) {
+			return false;
+		}
+		value = lit.text;
+		return true;
+	};
+	out.values.assign(5, string());
+	if (!expect("UPDATE ") || !expect(CATALOG_PREFIX) || !expect("ducklake_table_column_stats SET contains_null=") ||
+	    !boolean(out.values[0]) || !expect(", contains_nan=") || !boolean(out.values[1]) || !expect(", min_value=") ||
+	    !text(out.values[2]) || !expect(", max_value=") || !text(out.values[3]) || !expect(", extra_stats=") ||
+	    !text(out.values[4])) {
+		return false;
+	}
+	out.exactness = stmt.compare(pos, 15, ", min_is_exact=") == 0;
+	if (out.exactness) {
+		out.values.resize(7);
+		if (!expect(", min_is_exact=") || !boolean(out.values[5]) || !expect(", max_is_exact=") ||
+		    !boolean(out.values[6])) {
+			return false;
+		}
+	}
+	return expect(" WHERE table_id=") && number(out.table_id) && expect(" AND column_id=") && number(out.column_id) &&
+	       pos == stmt.size();
+}
+
+//! The refresh's min and max past the bound become NULL, their exactness too (specs/018).
+void BoundRefresh(ColumnStatsRefresh &refresh, int64_t stats_length) {
+	if (stats_length <= 0) {
+		return;
+	}
+	for (idx_t bound = 2; bound <= 3; bound++) {
+		auto &value = refresh.values[bound];
+		if (!StringUtil::StartsWith(value, "N'")) {
+			continue;
+		}
+		Literal lit {LiteralKind::STRING, value.substr(2, value.size() - 3)};
+		if (LiteralBytes(lit) <= idx_t(stats_length)) {
+			continue;
+		}
+		value = "NULL";
+		if (refresh.exactness) {
+			refresh.values[bound + 3] = "NULL";
+		}
+	}
+}
+
+//! A run of those for one table as ONE statement: the 1.0 shape, `UPDATE ... FROM (VALUES ...)`.
+//! DuckLake split it into a statement per column for a DuckDB-backed catalog, whose multi-row VALUES
+//! corrupted long strings beside NULLs; SQL Server has no such bug, and 41 statements cost ~4 ms of
+//! a commit's ~23 against one (specs/015).
+string CoalescedColumnStatsRefresh(const string &schema, const vector<ColumnStatsRefresh> &rows) {
+	static constexpr idx_t ROWS_PER_STATEMENT = 1000;
+	auto exactness = rows[0].exactness;
+	string set = "contains_null = v.contains_null, contains_nan = v.contains_nan, min_value = v.min_value, "
+	             "max_value = v.max_value, extra_stats = v.extra_stats";
+	string names = "column_id, contains_null, contains_nan, min_value, max_value, extra_stats";
+	if (exactness) {
+		set += ", min_is_exact = v.min_is_exact, max_is_exact = v.max_is_exact";
+		names += ", min_is_exact, max_is_exact";
+	}
+	string out;
+	for (idx_t start = 0; start < rows.size(); start += ROWS_PER_STATEMENT) {
+		auto end = MinValue<idx_t>(start + ROWS_PER_STATEMENT, rows.size());
+		string values;
+		for (idx_t i = start; i < end; i++) {
+			values += (i == start ? "(" : ", (") + rows[i].column_id;
+			for (auto &value : rows[i].values) {
+				values += ", " + value;
+			}
+			values += ")";
+		}
+		out += StringUtil::Format("UPDATE s SET %s FROM %s.ducklake_table_column_stats s JOIN (VALUES %s) v(%s) "
+		                          "ON s.table_id = %s AND s.column_id = v.column_id;\n",
+		                          set, schema, values, names, rows[0].table_id);
+	}
+	return out;
+}
+
 bool IsInlinedRowsInsert(const string &stmt) {
 	const string head = string("INSERT INTO ") + CATALOG_PREFIX + INLINED_DATA_PREFIX;
 	return StringUtil::StartsWith(stmt, head) && !StringUtil::StartsWith(stmt, head + "tables");
@@ -600,18 +900,292 @@ constexpr const char *INLINED_DELETE_DDL_HEAD =
     "CREATE TABLE IF NOT EXISTS {METADATA_CATALOG}.ducklake_inlined_delete_";
 constexpr const char *INLINED_DELETE_DDL_TAIL = "(file_id BIGINT, row_id BIGINT, begin_snapshot BIGINT)";
 
-bool InlinedDeletionDdlIsDuckLakes() {
+bool InlinedDeletionDdlIsDuckLakes(DuckLakeMetadataManager &manager) {
 	DuckLakeInlinedFileDeletionInfo probe;
 	probe.table_id = TableIndex(7);
 	vector<DuckLakeInlinedFileDeletionInfo> one;
 	one.push_back(std::move(probe));
-	auto generated = DuckLakeMetadataManager::WriteNewInlinedFileDeletesSqlBatch(one);
+	// ducklake main made this a member (it marks the manager's cache for clearing); on the v1.5 line
+	// it was static. RECON: the real port wants a check that does not touch the live manager.
+	auto generated = manager.WriteNewInlinedFileDeletesSqlBatch(one);
 	return StringUtil::StartsWith(generated, string(INLINED_DELETE_DDL_HEAD) + "7" + INLINED_DELETE_DDL_TAIL + ";");
 }
 
 unique_ptr<QueryResult> MSSQLMetadataManager::RunCommitBatch(const string &tsql) {
 	auto &connection = transaction.GetConnection();
-	return connection.Query(StringUtil::Format("SELECT mssql_exec(%s, %s)", CatalogLiteral(), SQLString(tsql)));
+	// back at NORMAL after the conflict check's HIGH (MSSQLConflictCheckQuery): a deadlock between the
+	// two is this batch's to lose, and it is retried
+	return TracedQuery(connection, StringUtil::Format("SELECT mssql_exec(%s, %s)", CatalogLiteral(),
+	                                                  SQLString("SET DEADLOCK_PRIORITY NORMAL;\n" + tsql)));
+}
+
+bool MSSQLMetadataManager::IsRetryableCommitError(const string &message) const {
+	// SQL Server's deadlock victim (1205): its transaction is rolled back whole, which is exactly what
+	// DuckLake's retry starts from. By number, in both of the mssql extension's forms - mssql_exec's
+	// "SQL Server error 1205: ..." and a scan's "SQL Server error [1205, severity 13]: ..." - since the
+	// text is in the login's language
+	return StringUtil::Contains(message, "SQL Server error 1205:") || StringUtil::Contains(message, "[1205,");
+}
+
+unique_ptr<QueryResult> MSSQLMetadataManager::ExecuteInTransaction(string &query) {
+	// ducklake main sends the drop of an empty superseded inlined table here - a DELETE from the
+	// registry and the DROP, all or none. The base wraps them in BEGIN/COMMIT for Query, where the
+	// BEGIN makes the whole string a read to our rewrite; the statements are the rewrite's own
+	// families, so they take its path, as one transaction.
+	wrote_in_transaction = true;
+	rewrite_as_one_transaction = true;
+	unique_ptr<QueryResult> result;
+	try {
+		result = BatchRewriteEnabled() ? RewriteWriteStatement(query) : nullptr;
+	} catch (...) {
+		rewrite_as_one_transaction = false;
+		throw;
+	}
+	rewrite_as_one_transaction = false;
+	if (result) {
+		return result;
+	}
+	if (StrictBatchEnabled()) {
+		throw InvalidInputException("mssql_ducklake: a transaction DuckLake sent through ExecuteInTransaction that the "
+		                            "T-SQL rewrite does not recognise (specs/014): %s",
+		                            query);
+	}
+	return DuckLakeMetadataManager::ExecuteInTransaction(query);
+}
+
+//===--------------------------------------------------------------------===//
+// The user's inlined rows in the run (specs/015)
+//===--------------------------------------------------------------------===//
+
+namespace {
+
+//! T-SQL's limit on the rows of one VALUES
+constexpr idx_t MAX_STATEMENT_ROWS = 1000;
+
+//! One value of an inlined row as a T-SQL literal for its column (TSQLColumnType), or false when it
+//! is not ours to render - the row set then goes to the base, DuckDB's DML path. A type the column
+//! holds as text is the text DuckDB's own cast gives, the cast an INSERT through the attached
+//! catalog does (an interval excepted, written in DuckLake's own form); strings are N literals, so they reach the UTF-8
+//! column without the database's code page. The literals are what a FORCED-parameterized batch turns into parameters,
+//! so the run's plan is reused across commits (specs/012) - measured against mssql_exec_params, which puts the whole
+//! run inside sp_executesql, where forced parameterization does not apply and every commit compiled its run: 14 ms a
+//! commit against 4.
+bool RenderInlinedValue(DuckLakeMetadataManager &manager, ClientContext &context, const Value &value, string &out) {
+	if (value.IsNull()) {
+		out = "NULL";
+		return true;
+	}
+	auto &type = value.type();
+	if (type.HasAlias() || type.IsNested() || DuckLakeUtil::GetInlinedStorageType(manager, type) != type) {
+		return false;
+	}
+	auto n_literal = [&](const string &text) {
+		if (text.find('\0') != string::npos) {
+			return false;
+		}
+		out = "N'" + StringUtil::Replace(text, "'", "''") + "'";
+		return true;
+	};
+	if (!manager.TypeIsNativelySupported(type)) {
+		switch (type.id()) {
+		case LogicalTypeId::VARIANT:
+		case LogicalTypeId::GEOMETRY:
+		case LogicalTypeId::BIT:
+		case LogicalTypeId::ENUM:
+			return false;
+		case LogicalTypeId::INTERVAL: {
+			// DuckLake's canonical text for an interval, not DuckDB's (ToSQLString in ducklake_util)
+			auto interval = IntervalValue::Get(value);
+			return n_literal(StringUtil::Format("%d months %d days %lld microseconds", interval.months, interval.days,
+			                                    interval.micros));
+		}
+		default:
+			return n_literal(value.CastAs(context, LogicalType::VARCHAR).GetValue<string>());
+		}
+	}
+	switch (type.id()) {
+	case LogicalTypeId::BOOLEAN:
+		out = value.GetValue<bool>() ? "1" : "0";
+		return true;
+	case LogicalTypeId::TINYINT:
+	case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER:
+	case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UTINYINT:
+	case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER:
+	case LogicalTypeId::DECIMAL:
+		out = value.ToString();
+		return true;
+	case LogicalTypeId::VARCHAR:
+	case LogicalTypeId::UUID:
+		return n_literal(value.ToString());
+	case LogicalTypeId::BLOB: {
+		auto &bytes = StringValue::Get(value);
+		static constexpr const char *HEX = "0123456789ABCDEF";
+		out = "0x";
+		out.reserve(2 + bytes.size() * 2);
+		for (auto c : bytes) {
+			auto byte = static_cast<uint8_t>(c);
+			out += HEX[byte >> 4];
+			out += HEX[byte & 0x0F];
+		}
+		return true;
+	}
+	case LogicalTypeId::DATE:
+	case LogicalTypeId::TIMESTAMP:
+	case LogicalTypeId::TIMESTAMP_MS:
+	case LogicalTypeId::TIMESTAMP_SEC: {
+		// ISO text, which date and datetime2 read whatever the session's language; a year past four
+		// digits, a BC date and infinity are not theirs
+		auto text = value.ToString();
+		if (!HasFourDigitYear(text) || text.find('(') != string::npos) {
+			return false;
+		}
+		return n_literal(text);
+	}
+	case LogicalTypeId::TIMESTAMP_TZ: {
+		// the instant in UTC, whatever the session's time zone, as DuckDB prints it without one
+		auto text = Timestamp::ToString(value.GetValue<timestamp_t>());
+		if (!HasFourDigitYear(text) || text.find('(') != string::npos) {
+			return false;
+		}
+		return n_literal(text + "+00:00");
+	}
+	case LogicalTypeId::TIME: {
+		auto text = value.ToString();
+		if (StringUtil::StartsWith(text, "24")) {
+			return false;
+		}
+		return n_literal(text);
+	}
+	default:
+		return false;
+	}
+}
+
+} // namespace
+
+string MSSQLMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_snapshot,
+                                                 const vector<DuckLakeInlinedDataInfo> &new_data,
+                                                 const vector<DuckLakeTableInfo> &new_tables,
+                                                 const vector<DuckLakeTableInfo> &new_inlined_data_tables_result,
+                                                 vector<unique_ptr<SQLStatement>> &inlined_inserts) {
+	// a batch is built afresh on every attempt of the commit loop, and only the last one runs
+	inlined_rows_statements.clear();
+	if (InlinedRowsInRunDisabled() || !BatchRewriteEnabled()) {
+		return DuckLakeMetadataManager::WriteNewInlinedData(commit_snapshot, new_data, new_tables,
+		                                                    new_inlined_data_tables_result, inlined_inserts);
+	}
+	auto context = transaction.context.lock();
+	string batch;
+	for (auto &entry : new_data) {
+		// The rows first: rendered whole, or the row set is the base's
+		vector<pair<int64_t, string>> rows;
+		bool rendered = entry.data && entry.data->data;
+		if (rendered) {
+			auto &data = *entry.data;
+			const bool preserved = data.HasPreservedRowIds();
+			idx_t next_row_id = entry.row_id_start;
+			idx_t position = 0;
+			for (auto &chunk : data.data->Chunks()) {
+				for (idx_t r = 0; rendered && r < chunk.size(); r++, position++) {
+					int64_t row_id;
+					if (preserved && !DuckLakeConstants::IsTransactionLocalRowId(data.row_ids[position])) {
+						row_id = data.row_ids[position];
+					} else {
+						row_id = NumericCast<int64_t>(next_row_id++);
+					}
+					string values, literal;
+					for (idx_t c = 0; rendered && c < chunk.ColumnCount(); c++) {
+						rendered = RenderInlinedValue(*this, *context, chunk.GetValue(c, r), literal);
+						values += ", " + literal;
+					}
+					rows.emplace_back(row_id, std::move(values));
+				}
+				if (!rendered) {
+					break;
+				}
+			}
+		}
+		if (!rendered) {
+			// the base's own statement for this row set, which takes DuckDB's DML path in Execute
+			vector<DuckLakeInlinedDataInfo> one {entry};
+			batch += DuckLakeMetadataManager::WriteNewInlinedData(commit_snapshot, one, new_tables,
+			                                                      new_inlined_data_tables_result, inlined_inserts);
+			continue;
+		}
+
+		// The inlined table: the latest one of the lake table, or a new one - the base's
+		// WriteNewInlinedData step for step (re-audit at a ducklake bump), its name cache ours.
+		optional_ptr<const DuckLakeTableInfo> new_inlined_table;
+		for (auto &inlined_table : new_inlined_data_tables_result) {
+			if (inlined_table.id == entry.table_id) {
+				new_inlined_table = &inlined_table;
+				break;
+			}
+		}
+		string inlined_table_name;
+		auto known = inlined_table_names.find(entry.table_id.index);
+		if (known != inlined_table_names.end() && known->second.commit_snapshot_id == commit_snapshot.snapshot_id) {
+			inlined_table_name = known->second.name;
+		}
+		if (inlined_table_name.empty() && !new_inlined_table) {
+			auto lookup = LatestInlinedTableQuery(entry.table_id.index) + ";";
+			auto result = Query(commit_snapshot, lookup);
+			for (auto &row : *result) {
+				inlined_table_name = row.GetValue<string>(0);
+				inlined_table_names[entry.table_id.index] = {commit_snapshot.snapshot_id, inlined_table_name};
+			}
+		}
+		if (inlined_table_name.empty()) {
+			DuckLakeTableInfo table_info;
+			if (new_inlined_table) {
+				table_info = *new_inlined_table;
+			} else {
+				auto table_entry =
+				    transaction.GetCatalog().GetEntryById(transaction, transaction.GetSnapshot(), entry.table_id);
+				if (table_entry) {
+					auto &table = table_entry->Cast<DuckLakeTableEntry>();
+					table_info = table.GetTableInfo();
+					table_info.columns = table.GetTableColumns();
+				} else {
+					bool found = false;
+					for (auto &new_table : new_tables) {
+						if (new_table.id == entry.table_id) {
+							table_info = new_table;
+							found = true;
+						}
+					}
+					if (!found) {
+						throw InternalException("Writing inlined data for a table that cannot be found in the catalog");
+					}
+				}
+				commit_snapshot.schema_version++;
+			}
+			vector<string> inlined_tables;
+			string inlined_table_queries;
+			inlined_table_name =
+			    GetInlinedTableQueries(commit_snapshot, table_info, inlined_tables, inlined_table_queries);
+			batch += InsertValuesSql("ducklake_inlined_data_tables", inlined_tables);
+			batch += inlined_table_queries;
+		}
+
+		// The rows' statement, held here; the batch carries its marker
+		const auto head =
+		    StringUtil::Format("INSERT INTO %s.%s VALUES ", SchemaIdentifier(), SQLIdentifier(inlined_table_name));
+		for (idx_t start = 0; start < rows.size(); start += MAX_STATEMENT_ROWS) {
+			InlinedRowsStatement statement;
+			statement.head = head;
+			auto end = MinValue<idx_t>(start + MAX_STATEMENT_ROWS, rows.size());
+			for (idx_t i = start; i < end; i++) {
+				statement.rows.push_back(std::move(rows[i]));
+			}
+			batch += INLINED_ROWS_MARKER + to_string(inlined_rows_statements.size()) + ";";
+			inlined_rows_statements.push_back(std::move(statement));
+		}
+	}
+	return batch;
 }
 
 unique_ptr<QueryResult> MSSQLMetadataManager::TryRewriteWrite(DuckLakeSnapshot snapshot, const string &query) {
@@ -650,7 +1224,7 @@ unique_ptr<QueryResult> MSSQLMetadataManager::RewriteWriteStatement(string query
 	const string update_head = string("UPDATE ") + CATALOG_PREFIX;
 	const string delete_head = string("DELETE FROM ") + CATALOG_PREFIX;
 	const string drop_head = string("DROP TABLE IF EXISTS ") + CATALOG_PREFIX;
-	string run;
+	vector<string> pieces;
 	vector<string> dropped_in_run;
 	for (auto &statement : statements) {
 		// a CTE is a write only when an UPDATE follows it; DuckLake's stats reads are CTEs too
@@ -663,11 +1237,11 @@ unique_ptr<QueryResult> MSSQLMetadataManager::RewriteWriteStatement(string query
 		string tsql, dropped;
 		if (RewriteUpdate(statement, schema, tsql) || RewriteDelete(statement, schema, tsql) ||
 		    RewriteCteUpdate(statement, schema, tsql)) {
-			run += tsql + "\n";
+			pieces.push_back(tsql + "\n");
 			continue;
 		}
 		if (RewriteDropIfExists(statement, schema, tsql, dropped)) {
-			run += tsql + "\n";
+			pieces.push_back(tsql + "\n");
 			dropped_in_run.push_back(dropped);
 			continue;
 		}
@@ -679,7 +1253,32 @@ unique_ptr<QueryResult> MSSQLMetadataManager::RewriteWriteStatement(string query
 		}
 		return nullptr;
 	}
-	auto result = RunCommitBatch(run);
+	wrote_in_transaction = true;
+	// every statement recognised before any runs; then in calls of a bounded size
+	unique_ptr<QueryResult> result;
+	string run;
+	if (rewrite_as_one_transaction) {
+		// ExecuteInTransaction: all of it or none, in one call - a transaction of its own, or the one
+		// the connection is already in
+		string all;
+		for (auto &piece : pieces) {
+			all += piece;
+		}
+		result = RunCommitBatch("SET XACT_ABORT ON;\nDECLARE @own_tx BIT = CASE WHEN @@TRANCOUNT = 0 THEN 1 ELSE 0 "
+		                        "END;\nIF @own_tx = 1 BEGIN TRANSACTION;\n" +
+		                        all + "IF @own_tx = 1 COMMIT TRANSACTION;\nSET XACT_ABORT OFF;\n");
+		pieces.clear();
+	}
+	for (idx_t i = 0; i < pieces.size(); i++) {
+		run += pieces[i];
+		if (i + 1 == pieces.size() || run.size() + pieces[i + 1].size() > RunLimitBytes()) {
+			result = RunCommitBatch(run);
+			run.clear();
+			if (result->HasError()) {
+				return result;
+			}
+		}
+	}
 	if (!result->HasError()) {
 		for (auto &table : dropped_in_run) {
 			InvalidateTableCache(table);
@@ -689,17 +1288,25 @@ unique_ptr<QueryResult> MSSQLMetadataManager::RewriteWriteStatement(string query
 }
 
 unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot, string &query) {
+	wrote_in_transaction = true;
+	EnsureReady();
 	// The snapshot's numbers first, so that a literal is a literal; {METADATA_CATALOG} stays until
 	// each family decides what to do with it. The base substitutes again on what it is handed and
 	// finds nothing left to replace.
 	SubstituteSnapshotPlaceholders(snapshot, query);
 	const auto schema = SchemaIdentifier();
+	// The kinds come from the catalog's own format, so a 1.0 catalog keeps the T-SQL batch it has
+	// today and the strict guard holds at both formats. A future format that reports v1.1 metadata
+	// but writes wider tuples is declined by width - and named by the guard, which is the re-audit
+	// a ducklake bump asks for.
+	const bool v1_1 = transaction.GetCatalog().SupportsV1_1Metadata();
 	const bool strict = StrictBatchEnabled();
 	const bool rewrite = BatchRewriteEnabled();
 
 	string run;
 	vector<string> dropped_in_run;
 	unique_ptr<QueryResult> last;
+	bool failed = false;
 	auto flush = [&]() -> bool {
 		if (run.empty()) {
 			return true;
@@ -715,8 +1322,64 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 		dropped_in_run.clear();
 		return true;
 	};
+	// the run grows statement by statement and goes as a call of its own past the limit
+	auto append = [&](const string &tsql) {
+		if (!run.empty() && run.size() + tsql.size() > RunLimitBytes() && !flush()) {
+			failed = true;
+			return;
+		}
+		run += tsql;
+	};
 
+	// the per-column stats refreshes of one table, gathered while they come one after another
+	vector<ColumnStatsRefresh> refreshes;
+	auto close_refreshes = [&]() {
+		if (!refreshes.empty()) {
+			append(CoalescedColumnStatsRefresh(schema, refreshes));
+			refreshes.clear();
+		}
+	};
 	for (auto &stmt : SplitStatements(query)) {
+		ColumnStatsRefresh refresh;
+		if (rewrite && ReadColumnStatsRefresh(stmt, refresh)) {
+			BoundRefresh(refresh, stats_length);
+			bool joins = !refreshes.empty() && refreshes[0].table_id == refresh.table_id &&
+			             refreshes[0].exactness == refresh.exactness;
+			// a column twice is two updates in order, the later one winning: not one join
+			for (auto &earlier : refreshes) {
+				joins = joins && earlier.column_id != refresh.column_id;
+			}
+			if (!joins) {
+				close_refreshes();
+				if (failed) {
+					return last;
+				}
+			}
+			refreshes.push_back(std::move(refresh));
+			continue;
+		}
+		close_refreshes();
+		if (failed) {
+			return last;
+		}
+		// the user's inlined rows, rendered by our WriteNewInlinedData
+		if (StringUtil::StartsWith(stmt, INLINED_ROWS_MARKER)) {
+			auto index = std::stoull(stmt.substr(strlen(INLINED_ROWS_MARKER)));
+			if (index >= inlined_rows_statements.size()) {
+				throw InternalException("mssql_ducklake: inlined rows %llu written by no WriteNewInlinedData", index);
+			}
+			auto &statement = inlined_rows_statements[index];
+			string rows_sql = statement.head;
+			for (idx_t i = 0; i < statement.rows.size(); i++) {
+				rows_sql += StringUtil::Format("%s(%lld, %llu, NULL%s)", i == 0 ? "" : ", ", statement.rows[i].first,
+				                               snapshot.snapshot_id, statement.rows[i].second);
+			}
+			append(rows_sql + ";\n");
+			if (failed) {
+				return last;
+			}
+			continue;
+		}
 		// the one DDL in the batch: the inlined deletion table, created keyed and outside the
 		// transaction instead (specs/006 D5b); the loop writes it into every batch that deletes
 		// inline from the table, so the catalog-level cache says whether there is anything to do
@@ -735,13 +1398,20 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 			}
 		}
 		string tsql, dropped;
-		if (rewrite && (RewriteInsert(stmt, schema, tsql) || RewriteUpdate(stmt, schema, tsql) ||
+		if (rewrite && (RewriteInsert(stmt, schema, v1_1, stats_length, tsql) || RewriteUpdate(stmt, schema, tsql) ||
 		                RewriteDelete(stmt, schema, tsql) || RewriteCteUpdate(stmt, schema, tsql))) {
-			run += tsql + "\n";
+			append(tsql + "\n");
+			if (failed) {
+				return last;
+			}
 			continue;
 		}
 		if (rewrite && RewriteDropIfExists(stmt, schema, tsql, dropped)) {
-			run += tsql + "\n";
+			// appended first: a run cut here sends the earlier drops with their own invalidation
+			append(tsql + "\n");
+			if (failed) {
+				return last;
+			}
 			dropped_in_run.push_back(dropped);
 			continue;
 		}
@@ -761,12 +1431,13 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 			return last;
 		}
 	}
-	if (!flush()) {
+	close_refreshes();
+	if (failed || !flush()) {
 		return last;
 	}
 	if (!last) {
 		// nothing ran - every statement was the DDL above; the base would refuse an empty batch
-		last = transaction.GetConnection().Query("SELECT 1");
+		last = TracedQuery(transaction.GetConnection(), "SELECT 1");
 	}
 	return last;
 }

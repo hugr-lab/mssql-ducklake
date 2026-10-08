@@ -39,20 +39,25 @@ MSSQL_DUCKLAKE_IMAGE := $(call unquote,$(MSSQL_DUCKLAKE_IMAGE))
 # The metadata connection string, ADO form: the tests put it behind the `ducklake:mssql:` prefix,
 # and it is that `mssql:` (not `mssql://`, which duckdb deliberately leaves alone) that duckdb strips
 # to pick the mssql storage for the catalog ATTACH. The login is sa - the only one the container has.
-MSSQL_DUCKLAKE_TEST_DSN ?= Server=$(MSSQL_DUCKLAKE_HOST),$(MSSQL_DUCKLAKE_PORT);Database=$(MSSQL_DUCKLAKE_DB);User Id=sa;Password=$(MSSQL_DUCKLAKE_PASS)
+# TrustServerCertificate: the container serves its own self-signed certificate, and since mssql's
+# specs/074 a connection that cannot verify the certificate is refused instead of downgraded.
+MSSQL_DUCKLAKE_TEST_DSN ?= Server=$(MSSQL_DUCKLAKE_HOST),$(MSSQL_DUCKLAKE_PORT);Database=$(MSSQL_DUCKLAKE_DB);User Id=sa;Password=$(MSSQL_DUCKLAKE_PASS);TrustServerCertificate=yes
 
 DOCKER_COMPOSE := docker compose -f $(PROJ_DIR)docker/docker-compose.yml
 
-.PHONY: docker-up docker-down docker-status test-integration
+.PHONY: docker-up docker-down docker-status test-integration bench-attach-probe
 # only the docker goals see the variables (the password stays out of every build process's
 # environment); the assignment form is the one make 3.81 (macOS) accepts for target-specific exports
 docker-up docker-down docker-status: export MSSQL_DUCKLAKE_PORT := $(MSSQL_DUCKLAKE_PORT)
 docker-up docker-down docker-status: export MSSQL_DUCKLAKE_PASS := $(MSSQL_DUCKLAKE_PASS)
 docker-up docker-down docker-status: export MSSQL_DUCKLAKE_DB := $(MSSQL_DUCKLAKE_DB)
 docker-up docker-down docker-status: export MSSQL_DUCKLAKE_IMAGE := $(MSSQL_DUCKLAKE_IMAGE)
+docker-up docker-down docker-status: export MSSQL_DUCKLAKE_MEMORY_MB := $(MSSQL_DUCKLAKE_MEMORY_MB)
 # `run --rm` starts sqlserver, waits for its health check (depends_on), streams the init's output,
 # propagates its exit code and removes the one-shot container
+# `up` first, so a changed setting (MSSQL_DUCKLAKE_MEMORY_MB) recreates the server; its volume stays
 docker-up:
+	$(DOCKER_COMPOSE) up -d --wait sqlserver
 	$(DOCKER_COMPOSE) run --rm sqlserver-init
 
 docker-down:
@@ -95,6 +100,22 @@ bench-scale:
 	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
 	python3 scripts/bench/scale_catalog.py $(BENCH_SCALE_ARGS)
 
+# A one-off probe that needs the connection string without printing it (design/005 scratch).
+#   make bench-script SCRIPT=/path/to/probe.py
+bench-script: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
+bench-script: export MSSQL_DUCKLAKE_PG_DSN := $(MSSQL_DUCKLAKE_PG_DSN)
+bench-script:
+	python3 $(SCRIPT)
+
+# One ATTACH of an existing catalog, statement by statement, both pushdown arms (design/005): what
+# the 1.6-1.8x on attach is actually spent on. Needs only `make docker-up` and a catalog already
+# built by bench-scale.
+#   make bench-attach-probe PROBE_ARGS='--full --debug-counts'
+bench-attach-probe: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
+bench-attach-probe:
+	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
+	python3 scripts/bench/attach_probe.py $(PROBE_ARGS)
+
 # The comparison specs/005 is about: the same workload committed by DuckLake's own loop and by the
 # server-side apply, differing only by MSSQL_DUCKLAKE_SERVER_COMMIT. No postgres, so it needs only
 # `make docker-up`.
@@ -108,14 +129,17 @@ bench-paths:
 test-integration: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
 # specs/014: a commit statement the T-SQL batch does not recognise fails the suite, naming it
 test-integration: export MSSQL_DUCKLAKE_STRICT_BATCH := 1
+# One file while working on it: make test-integration INTEGRATION_TESTS=test/sql/integration/migrate_v11.test
+INTEGRATION_TESTS ?= $(PROJ_DIR)test/sql/integration/*
 test-integration:
 	@test -x build/release/test/unittest || { echo "build first: GEN=ninja make"; exit 1; }
-	build/release/test/unittest '$(PROJ_DIR)test/sql/integration/*' 2>&1 | tee build/integration.log
+	build/release/test/unittest '$(INTEGRATION_TESTS)' 2>&1 | tee build/integration.log
 	scripts/ci/assert_ran.sh build/integration.log 1 1 'require-env MSSQL_DUCKLAKE_TEST_DSN'
 
 # Every metadata query DuckLake issued over a workload, by shape, with cost and path (specs/008).
 # WORKLOAD is a SQL file that starts with its own ATTACH; the two extensions are loaded for it.
 .PHONY: metadata-log
+metadata-log: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
 metadata-log:
 	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
 	@test -n "$(WORKLOAD)" || { echo "usage: make metadata-log WORKLOAD=path/to/workload.sql"; exit 1; }
@@ -129,6 +153,16 @@ test-concurrent: export MSSQL_DUCKLAKE_PG_DSN := $(MSSQL_DUCKLAKE_PG_DSN)
 test-concurrent:
 	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
 	python3 scripts/bench/concurrent_writers.py $(CONCURRENT_ARGS)
+
+.PHONY: bench-concurrent
+# Many writers and readers through ONE DuckDB, a connection per thread (specs/016): the shape the
+# serial scale bench cannot show. Needs both servers, like bench-scale.
+#   make bench-concurrent CONC_ARGS='--backends mssql --threads 1,4,16'
+bench-concurrent: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
+bench-concurrent: export MSSQL_DUCKLAKE_PG_DSN := $(MSSQL_DUCKLAKE_PG_DSN)
+bench-concurrent:
+	@test -x build/release/duckdb || { echo "build first: GEN=ninja make"; exit 1; }
+	python3 scripts/bench/concurrent_bench.py $(CONC_ARGS)
 
 .PHONY: test-integration-fast-path
 # The same suite with phase 2's server-side apply armed (specs/005). It is off by default, so

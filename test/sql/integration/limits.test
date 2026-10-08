@@ -1,0 +1,249 @@
+# name: test/sql/integration/limits.test
+# description: META_LIMITS - a catalog's string columns bounded at its creation or its migration from 1.0 (specs/018)
+# group: [integration]
+
+require-env MSSQL_DUCKLAKE_TEST_DSN
+
+require parquet
+
+statement ok
+SET autoload_known_extensions = false;
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
+
+statement ok
+ATTACH '${MSSQL_DUCKLAKE_TEST_DSN}' AS srv (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name IN (''limits_a'', ''limits_b'', ''limits_m'');
+EXEC sp_executesql @sql;
+IF SCHEMA_ID(''limits_a'') IS NULL EXEC(''CREATE SCHEMA limits_a'');
+IF SCHEMA_ID(''limits_b'') IS NULL EXEC(''CREATE SCHEMA limits_b'');
+IF SCHEMA_ID(''limits_m'') IS NULL EXEC(''CREATE SCHEMA limits_m'');');
+
+# ---------------------------------------------------------------------------
+# A new catalog takes the defaults, records them, and declares its strings by them
+# ---------------------------------------------------------------------------
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/limits_a', METADATA_SCHEMA 'limits_a');
+
+statement ok
+CREATE TABLE lake.t(i INTEGER);
+
+query II
+SELECT name, value FROM mssql_ducklake_catalog_info('lake') WHERE kind = 'limit' ORDER BY name;
+----
+column_type_length	1024
+default_length	1024
+name_length	256
+path_length	1024
+stats_length	1024
+text_length	2048
+
+# by what each column holds - and changes_made, which grows with one commit's objects, stays MAX
+query II
+SELECT name, value FROM mssql_ducklake_catalog_info('lake') WHERE kind = 'column' AND name IN ('ducklake_column.column_name', 'ducklake_column.column_type', 'ducklake_column.default_value', 'ducklake_data_file.path', 'ducklake_data_file.file_format', 'ducklake_file_column_stats.max_value', 'ducklake_snapshot_changes.changes_made', 'ducklake_view.sql') ORDER BY name;
+----
+ducklake_column.column_name	VARCHAR(256)
+ducklake_column.column_type	VARCHAR(1024)
+ducklake_column.default_value	VARCHAR(1024)
+ducklake_data_file.file_format	VARCHAR(64)
+ducklake_data_file.path	VARCHAR(1024)
+ducklake_file_column_stats.max_value	VARCHAR(1024)
+ducklake_snapshot_changes.changes_made	VARCHAR(MAX)
+ducklake_view.sql	VARCHAR(2048)
+
+# the database options it reports, read committed snapshot among them (left to a DBA, specs/019)
+query I
+SELECT list(name ORDER BY name) FROM mssql_ducklake_catalog_info('lake') WHERE kind = 'database';
+----
+[auto_update_statistics_async, parameterization_forced, read_committed_snapshot]
+
+# no VARCHAR(MAX) left but the one meant to be
+query I
+SELECT list(name ORDER BY name) FROM mssql_ducklake_catalog_info('lake') WHERE kind = 'column' AND value = 'VARCHAR(MAX)';
+----
+[ducklake_snapshot_changes.changes_made]
+
+# and the metadata database reads them as plain VARCHAR, not the mssql extension's MSSQL_VARCHAR(n):
+# DuckLake reads every catalog row with GetValue<string>, a full cast per value for any other type
+query I
+SELECT column_type FROM (DESCRIBE __ducklake_metadata_lake.limits_a.ducklake_table) WHERE column_name = 'table_name';
+----
+VARCHAR
+
+statement ok
+DETACH lake;
+
+# META_NATIVE_TYPES given at the ATTACH wins
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/limits_a', METADATA_SCHEMA 'limits_a', META_NATIVE_TYPES true);
+
+query I
+SELECT column_type FROM (DESCRIBE __ducklake_metadata_lake.limits_a.ducklake_table) WHERE column_name = 'table_name';
+----
+MSSQL_VARCHAR(256)
+
+statement ok
+DETACH lake;
+
+# a key it does not know, or a length it cannot hold, fails the ATTACH naming it
+statement error
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/limits_a', METADATA_SCHEMA 'limits_a', META_LIMITS {'names': 256});
+----
+unknown key 'names'
+
+statement error
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/limits_a', METADATA_SCHEMA 'limits_a', META_LIMITS {'path_length': 9000});
+----
+'path_length' is 9000
+
+# ---------------------------------------------------------------------------
+# A new catalog with META_LIMITS: names to 16 bytes, statistics to 8
+# ---------------------------------------------------------------------------
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/limits_b', METADATA_SCHEMA 'limits_b', META_LIMITS {'name_length': 16, 'stats_length': 8});
+
+statement ok
+CREATE TABLE lake.short_name(v VARCHAR);
+
+# a name past its bound is refused by the server - loudly, never truncated
+statement error
+CREATE TABLE lake.a_name_past_sixteen_bytes(v VARCHAR);
+----
+truncated
+
+# A statistic past its bound is stored as NULL - unknown - and its exactness with it; one within it
+# stays. 100 rows, past the inlining limit: a data file, whose statistics the appender would write
+# past the batch, so this commit takes the batch instead.
+statement ok
+CREATE TABLE lake.s(id INTEGER, long_v VARCHAR, short_v VARCHAR);
+
+statement ok
+INSERT INTO lake.s SELECT i, 'value_number_' || lpad(i::VARCHAR, 4, '0'), 'v' || (i % 10) FROM range(100) r(i);
+
+query III
+SELECT name, min_v, max_v FROM mssql_scan('srv', 'SELECT CAST(c.column_name AS NVARCHAR(40)) AS name, CAST(s.min_value AS NVARCHAR(40)) AS min_v, CAST(s.max_value AS NVARCHAR(40)) AS max_v FROM limits_b.ducklake_file_column_stats s JOIN limits_b.ducklake_column c ON c.table_id = s.table_id AND c.column_id = s.column_id AND c.end_snapshot IS NULL WHERE c.column_name IN (''long_v'', ''short_v'')') ORDER BY name;
+----
+long_v	NULL	NULL
+short_v	v0	v9
+
+query III
+SELECT name, min_v, max_v FROM mssql_scan('srv', 'SELECT CAST(c.column_name AS NVARCHAR(40)) AS name, CAST(s.min_value AS NVARCHAR(40)) AS min_v, CAST(s.max_value AS NVARCHAR(40)) AS max_v FROM limits_b.ducklake_table_column_stats s JOIN limits_b.ducklake_column c ON c.table_id = s.table_id AND c.column_id = s.column_id AND c.end_snapshot IS NULL WHERE c.column_name IN (''long_v'', ''short_v'')') ORDER BY name;
+----
+long_v	NULL	NULL
+short_v	v0	v9
+
+# an unknown bound prunes nothing: the reads are right
+query I
+SELECT count(*) FROM lake.s WHERE long_v = 'value_number_0042';
+----
+1
+
+query I
+SELECT count(*) FROM lake.s WHERE long_v > 'value_number_0089';
+----
+10
+
+# and a merge never brings an unknown bound back: a second file, the table's long_v stays NULL
+statement ok
+INSERT INTO lake.s SELECT i, 'value_number_' || lpad(i::VARCHAR, 4, '0'), 'v' || (i % 10) FROM range(100, 200) r(i);
+
+query II
+SELECT min_v, max_v FROM mssql_scan('srv', 'SELECT CAST(s.min_value AS NVARCHAR(40)) AS min_v, CAST(s.max_value AS NVARCHAR(40)) AS max_v FROM limits_b.ducklake_table_column_stats s JOIN limits_b.ducklake_column c ON c.table_id = s.table_id AND c.column_id = s.column_id AND c.end_snapshot IS NULL WHERE c.column_name = ''long_v''');
+----
+NULL	NULL
+
+query I
+SELECT count(*) FROM lake.s WHERE long_v >= 'value_number_0150';
+----
+50
+
+statement ok
+DETACH lake;
+
+# the catalog lives with the limits it was created with: an ATTACH asking for others changes nothing
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/limits_b', METADATA_SCHEMA 'limits_b', META_LIMITS {'name_length': 200});
+
+query II
+SELECT name, value FROM mssql_ducklake_catalog_info('lake') WHERE name IN ('name_length', 'ducklake_table.table_name') ORDER BY name;
+----
+ducklake_table.table_name	VARCHAR(16)
+name_length	16
+
+statement ok
+DETACH lake;
+
+# ---------------------------------------------------------------------------
+# The migration from 1.0 narrows what META_LIMITS names - after checking what is stored
+# ---------------------------------------------------------------------------
+
+statement ok
+SET ducklake_default_version = '1.0';
+
+# a 1.0 catalog the way an older release left it: every string MAX
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/limits_m', METADATA_SCHEMA 'limits_m', META_LIMITS {'name_length': 'max', 'path_length': 'max', 'column_type_length': 'max', 'default_length': 'max', 'text_length': 'max', 'stats_length': 'max'});
+
+statement ok
+CREATE TABLE lake.a_table_named_twenty AS SELECT i FROM range(5) r(i);
+
+statement ok
+DETACH lake;
+
+statement ok
+RESET ducklake_default_version;
+
+# a bound shorter than a stored name fails the migration before it starts, naming the column
+statement error
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/limits_m', METADATA_SCHEMA 'limits_m', AUTOMATIC_MIGRATION TRUE, META_LIMITS {'name_length': 10});
+----
+ducklake_table.table_name: a value of 20 bytes, the bound 10
+
+# and nothing changed: still 1.0, still MAX
+query I
+SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM limits_m.ducklake_metadata WHERE [key] = ''version''');
+----
+1.0
+
+query I
+SELECT t FROM mssql_scan('srv', 'SELECT CAST(c.max_length AS INT) AS t FROM sys.columns c WHERE c.object_id = OBJECT_ID(''limits_m.ducklake_table'') AND c.name = ''table_name''');
+----
+-1
+
+# with room: narrowed, the rest left as it was, and recorded
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS lake (DATA_PATH '__TEST_DIR__/limits_m', METADATA_SCHEMA 'limits_m', AUTOMATIC_MIGRATION TRUE, META_LIMITS {'name_length': 64});
+
+query II
+SELECT name, value FROM mssql_ducklake_catalog_info('lake') WHERE name IN ('name_length', 'path_length', 'ducklake_table.table_name', 'ducklake_table.path') ORDER BY name;
+----
+ducklake_table.path	VARCHAR(MAX)
+ducklake_table.table_name	VARCHAR(64)
+name_length	64
+path_length	max
+
+query I
+SELECT count(*) FROM lake.a_table_named_twenty;
+----
+5
+
+statement ok
+DETACH lake;
+
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name IN (''limits_a'', ''limits_b'', ''limits_m'');
+EXEC sp_executesql @sql; DROP SCHEMA limits_a; DROP SCHEMA limits_b; DROP SCHEMA limits_m;');

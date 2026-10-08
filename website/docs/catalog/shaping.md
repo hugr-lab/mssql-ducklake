@@ -28,12 +28,46 @@ with.
 ### Strings and their collation
 
 DuckLake's catalog stores its strings — names, paths, and the per-file minimum and maximum values
-it prunes with — as `VARCHAR(MAX)` under **`Latin1_General_100_BIN2_UTF8`**, never `NVARCHAR`.
+it prunes with — as `VARCHAR` under **`Latin1_General_100_BIN2_UTF8`**, never `NVARCHAR`.
 Two reasons: UTF-8 is what DuckDB writes, so nothing is transcoded; and BIN2 is DuckDB's byte order,
 so a filter the server answers on a `min_value`/`max_value` column compares the way DuckDB computed
 the statistics. A linguistic collation would prune wrongly and drop rows from a result. The
 collation is explicit on every column because a database's own is usually a legacy `CI_AS` one.
 This is why the server needs the UTF-8 collations of SQL Server 2019 ([Requirements](./requirements.md)).
+
+### String lengths
+
+DuckLake declares its strings without a length, which in T-SQL means one character, so the
+catalog's are given one by what they hold. A `VARCHAR(MAX)` column travels as a large value, which
+the mssql extension reads value by value rather than in batches: reading `ducklake_column` whole —
+every catalog load reads it — costs 15–16 ms over 12,300 rows as `MAX` and 6–8 ms bounded.
+
+| `META_LIMITS` key | default | columns |
+| --- | ---: | --- |
+| `name_length` | 256 | schema, table, column, view, macro and parameter names |
+| `path_length` | 1024 | every `path` |
+| `column_type_length` | 1024 | column and parameter types (`STRUCT(...)` included) |
+| `default_length` | 1024 | default values and sort expressions |
+| `text_length` | 2048 | view and macro SQL, tag values, commit messages, extra statistics |
+| `stats_length` | 1024 | the min/max values in file and table statistics |
+
+The lengths are bytes of UTF-8, 1–8000, or `'max'`. Formats, dialects and other keywords take 64;
+`ducklake_snapshot_changes.changes_made` stays `MAX`, since it grows with the objects of one commit.
+
+- **A new catalog** takes `META_LIMITS`, over the defaults, at the `ATTACH` that creates it.
+- **A catalog migrated from format 1.0** (`AUTOMATIC_MIGRATION TRUE`) is narrowed to what
+  `META_LIMITS` names, and only that, after checking what it holds: a stored value longer than its
+  new bound fails the attach before anything changes, naming the column, the value's length and the
+  bound.
+- **Any other catalog** keeps what it has — one created before this, `MAX` throughout. A
+  `META_LIMITS` given to it is ignored with a warning.
+
+The chosen lengths are recorded on the catalog (an extended property, `mssql_ducklake_limits`) and
+shown, with every column's declared type, by `mssql_ducklake_catalog_info('lake')`
+([Settings](../reference/settings.md#functions)). A name or path longer than its bound fails the
+commit that writes it — the server refuses it, it is never truncated. A **statistic** longer than its
+bound is stored as NULL instead: DuckLake reads that as unknown and prunes nothing on it, so the
+file is read and the answer stays right. A min or max past a kilobyte prunes almost nothing anyway.
 
 ### Indexes
 
@@ -60,7 +94,7 @@ that the mssql extension's metadata cache can see it before the first `INSERT` n
 
 ### Forced parameterization
 
-The last step is one statement outside the catalog's own tables:
+The last steps are two statements outside the catalog's own tables, database options. The first:
 
 ```sql
 ALTER DATABASE CURRENT SET PARAMETERIZATION FORCED;
@@ -78,6 +112,46 @@ before the attach that shapes the catalog — and it is best-effort: a login all
 catalog's tables but not to alter the database gets a working catalog without it, and a warning in
 `duckdb_logs()` naming the statement for someone who may run it. It is applied when the catalog is
 shaped, not on every attach: set it back and it stays back.
+
+### Asynchronous statistics
+
+And one more, the same way:
+
+```sql
+ALTER DATABASE CURRENT SET AUTO_UPDATE_STATISTICS_ASYNC ON;
+```
+
+A catalog grows by thousands of rows with every few hundred commits, so SQL Server's statistics on
+its tables go stale often — and by default the query that finds them stale recomputes them before
+it runs. After 1000 commits into one table, the first read of it waited 1.2 s for six statistics of
+`ducklake_file_column_stats` to be rebuilt, for a statement that then took 9 ms. With the option
+that query runs on the statistics it has and the update happens beside it: the same first read took
+90 ms. PostgreSQL behaves this way already, its `ANALYZE` being a background job.
+
+The opt-out is `SET mssql_ducklake_async_statistics = false`; like forced parameterization it is
+best-effort, applied when the catalog is shaped, and left alone afterwards.
+
+### Read committed snapshot — recommended for many concurrent writers
+
+One database option the extension does **not** set, because setting it needs the database to
+itself:
+
+```sql
+ALTER DATABASE <catalog database> SET READ_COMMITTED_SNAPSHOT ON;
+-- refused while other sessions use the database; WITH ROLLBACK IMMEDIATE ends them
+```
+
+Under SQL Server's default `READ COMMITTED` a read takes shared locks, so a commit that reads every
+table's statistics can meet another commit's writes in a deadlock. The extension already handles
+that — its conflict check runs at a higher deadlock priority and a commit chosen as a deadlock victim
+is retried — so this option is not needed for correctness. With it, reads see the last committed
+row versions and take no locks at all, which is how PostgreSQL reads. Measured on the 1000-table
+benchmark: with 16 writers into their own tables, 32 → 52 commits/s and p95 2.9 → 1.0 s; with
+4 writers and 4 readers, 24 → 34 operations/s. The price is the row versions SQL Server keeps in
+`tempdb` for every change: a single writer's commits were 3–10% slower, the serial benchmark 8%.
+So: worth it for a lake with many concurrent writers, not for a single loader.
+
+`mssql_ducklake_catalog_info('lake')` reports it as `read_committed_snapshot`.
 
 ### The shape stamp
 

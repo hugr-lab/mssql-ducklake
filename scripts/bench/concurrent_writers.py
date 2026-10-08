@@ -28,6 +28,7 @@ loses writers reliably. To check that for yourself:
 """
 
 import argparse
+import re
 import os
 import subprocess
 import sys
@@ -90,7 +91,10 @@ def writer(backend: str, args, data_path: str, schema: str, n: int) -> tuple:
     script = (loads(backend) + attach(backend, args, data_path, schema) + body
               + f"SELECT count(*) FROM lake.w{n};\n")
     proc = run_duckdb(args.duckdb, script)
-    lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
+    # the mssql extension on the duckdb 2.0 line prints warnings into the CLI's own output, coloured,
+    # so a bare last-line comparison sees "\x1b[00m500" and calls a finished writer lost (design/005)
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", proc.stdout)
+    lines = [ln.strip() for ln in plain.splitlines() if ln.strip()]
     got = lines[-1] if lines else ""
     want = str(args.rows * args.commits)
     if got == want:

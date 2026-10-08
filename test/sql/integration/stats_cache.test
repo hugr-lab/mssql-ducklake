@@ -1,0 +1,191 @@
+# name: test/sql/integration/stats_cache.test
+# description: the catalog-wide stats cache stays true when another node writes (specs/019)
+# group: [integration]
+
+require-env MSSQL_DUCKLAKE_TEST_DSN
+
+require parquet
+
+statement ok
+SET autoload_known_extensions = false;
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
+
+statement ok
+ATTACH '${MSSQL_DUCKLAKE_TEST_DSN}' AS srv (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''stats_cache'';
+EXEC sp_executesql @sql;
+IF SCHEMA_ID(''stats_cache'') IS NULL EXEC(''CREATE SCHEMA stats_cache'');');
+
+# two attaches of one lake: two oids, two caches - what two nodes are to each other
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS a (DATA_PATH '__TEST_DIR__/stats_cache', METADATA_SCHEMA 'stats_cache');
+
+statement ok
+CREATE TABLE a.t(i BIGINT, v VARCHAR);
+
+statement ok
+CREATE TABLE a.u(i BIGINT);
+
+# the second node attaches the catalog the first one created and shaped
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS b (DATA_PATH '__TEST_DIR__/stats_cache', METADATA_SCHEMA 'stats_cache');
+
+statement ok
+INSERT INTO a.t SELECT r, 'x' || r FROM range(100) t(r);
+
+statement ok
+INSERT INTO a.u SELECT r FROM range(50) t(r);
+
+# b reads: its cache now holds both tables
+query II
+SELECT (SELECT count(*) FROM b.t), (SELECT count(*) FROM b.u);
+----
+100	50
+
+# a writes behind b's back - files and inlined rows
+statement ok
+INSERT INTO a.t SELECT r, 'y' || r FROM range(100, 300) t(r);
+
+statement ok
+INSERT INTO a.t VALUES (1000, 'inlined');
+
+# b writes next: a stale cache would give it a's old next_row_id, and the row ids would collide
+statement ok
+INSERT INTO b.t SELECT r, 'z' || r FROM range(2000, 2100) t(r);
+
+query III
+SELECT count(*), count(DISTINCT rowid), max(rowid) + 1 FROM b.t;
+----
+401	401	401
+
+query III
+SELECT count(*), count(DISTINCT rowid), max(rowid) + 1 FROM a.t;
+----
+401	401	401
+
+# a deletes and alters; b writes after both
+statement ok
+DELETE FROM a.t WHERE i < 10;
+
+statement ok
+ALTER TABLE a.t ADD COLUMN w INTEGER;
+
+statement ok
+INSERT INTO b.t SELECT r, 'w' || r, 7 FROM range(3000, 3010) t(r);
+
+query IIII
+SELECT count(*), count(DISTINCT rowid), count(w), sum(CASE WHEN i < 10 THEN 1 ELSE 0 END) FROM b.t;
+----
+401	401	10	0
+
+# the stats each node reports agree: record counts as the catalog keeps them
+query I
+SELECT (SELECT count(*) FROM a.t) = (SELECT count(*) FROM b.t);
+----
+true
+
+# a drops and re-creates a table b had cached
+statement ok
+DROP TABLE a.u;
+
+statement ok
+CREATE TABLE a.u(i BIGINT);
+
+statement ok
+INSERT INTO b.u SELECT r FROM range(7) t(r);
+
+query II
+SELECT count(*), count(DISTINCT rowid) FROM a.u;
+----
+7	7
+
+# ---------------------------------------------------------------------------
+# Two different lakes on one node: their table ids are the same numbers, their caches must not be
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''stats_cache2'';
+EXEC sp_executesql @sql;
+IF SCHEMA_ID(''stats_cache2'') IS NULL EXEC(''CREATE SCHEMA stats_cache2'');');
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS other (DATA_PATH '__TEST_DIR__/stats_cache2', METADATA_SCHEMA 'stats_cache2');
+
+statement ok
+CREATE TABLE other.t(i BIGINT, v VARCHAR);
+
+statement ok
+CREATE TABLE other.u(i BIGINT);
+
+# the same table ids in both lakes: t is the first table of each
+query I
+SELECT (SELECT table_id FROM ducklake_table_info('a') WHERE table_name = 't') = (SELECT table_id FROM ducklake_table_info('other') WHERE table_name = 't');
+----
+true
+
+statement ok
+INSERT INTO other.t SELECT r, 'o' || r FROM range(1000) t(r);
+
+# both read, both caches filled
+query II
+SELECT (SELECT count(*) FROM a.t), (SELECT count(*) FROM other.t);
+----
+401	1000
+
+# each writes again; a shared cache would hand one lake the other's next_row_id and record count
+statement ok
+INSERT INTO a.t SELECT r, 'a' || r, 1 FROM range(5000, 5003) t(r);
+
+statement ok
+INSERT INTO other.t SELECT r, 'p' || r FROM range(5000, 5005) t(r);
+
+query II
+SELECT count(*), count(DISTINCT rowid) FROM a.t;
+----
+404	404
+
+query III
+SELECT count(*), count(DISTINCT rowid), max(rowid) + 1 FROM other.t;
+----
+1005	1005	1005
+
+query II
+SELECT (SELECT count(*) FROM b.t), (SELECT count(*) FROM other.t);
+----
+404	1005
+
+statement ok
+DETACH other;
+
+statement ok
+DETACH a;
+
+statement ok
+DETACH b;
+
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''stats_cache'';
+EXEC sp_executesql @sql; DROP SCHEMA stats_cache;');
+
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''stats_cache2'';
+EXEC sp_executesql @sql; DROP SCHEMA stats_cache2;');

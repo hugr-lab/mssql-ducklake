@@ -64,16 +64,34 @@ PHASES = [
 ]
 
 LOAD = (
+    # both extensions are loaded by path, so autoloading is not needed - and on the duckdb 2.0 line
+    # something asks for `ducklake` by NAME, whose autoload then fails against the build's own
+    # repository and leaves the CLI with a non-zero exit, which the run check below reads as a failed
+    # run (design/005)
+    "SET autoload_known_extensions = false;\n"
+    "SET autoinstall_known_extensions = false;\n"
     "LOAD 'build/release/extension/mssql/mssql.duckdb_extension';\n"
     "LOAD 'build/release/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';\n"
 )
+
+
+#! The catalog lives in a schema of its own. The integration suite resets `dbo` (attach_mssql.test),
+#! so a bench catalog there did not survive a test run - three rebuilds in one session (specs/015 R6)
+#! - and this reset used to drop `ducklake%` in EVERY schema, the suite's included.
+BENCH_SCHEMA = os.environ.get("MSSQL_DUCKLAKE_BENCH_SCHEMA", "bench").strip() or "bench"
+
+
+#! The postgres extension: the build's own when there is one (a dev duckdb has no published
+#! postgres_scanner to INSTALL - specs/015 builds it from source), otherwise the released one.
+_PG_BUILD = "build/release/extension/postgres_scanner/postgres_scanner.duckdb_extension"
+PG_LOAD = (f"LOAD '{_PG_BUILD}';" if os.path.exists(_PG_BUILD) else "INSTALL postgres; LOAD postgres;")
 
 
 def reset_sql(backend: str, mssql_dsn: str, pg_dsn: str) -> str:
     """Drop whatever the last run left, so the build below starts from nothing."""
     if backend == "postgres":
         return (
-            "INSTALL postgres; LOAD postgres;\n"
+            f"{PG_LOAD}\n"
             f"ATTACH '{pg_dsn}' AS pg (TYPE postgres);\n"
             "USE pg;\nDROP SCHEMA public CASCADE;\nCREATE SCHEMA public;\nUSE memory;\nDETACH pg;\n"
         )
@@ -82,7 +100,8 @@ def reset_sql(backend: str, mssql_dsn: str, pg_dsn: str) -> str:
         "SELECT mssql_exec('srv', 'DECLARE @s NVARCHAR(MAX)=N''''; "
         "SELECT @s += N''DROP TABLE ''+QUOTENAME(s.name)+N''.''+QUOTENAME(t.name)+N'';'' "
         "FROM sys.tables t JOIN sys.schemas s ON s.schema_id=t.schema_id "
-        "WHERE t.name LIKE ''ducklake%''; EXEC sp_executesql @s;');\n"
+        f"WHERE s.name = ''{BENCH_SCHEMA}'' AND t.name LIKE ''ducklake%''; EXEC sp_executesql @s; "
+        f"IF SCHEMA_ID(''{BENCH_SCHEMA}'') IS NULL EXEC(''CREATE SCHEMA {BENCH_SCHEMA}'');');\n"
         "DETACH srv;\n"
     )
 
@@ -96,17 +115,31 @@ def warmup_sql(backend: str, mssql_dsn: str, pg_dsn: str) -> str:
     measurement time and the other does not is not a comparison.
     """
     if backend == "postgres":
-        return f"INSTALL postgres; LOAD postgres;\nATTACH '{pg_dsn}' AS warm (TYPE postgres);\nSELECT 1;\n"
+        return f"{PG_LOAD}\nATTACH '{pg_dsn}' AS warm (TYPE postgres);\nSELECT 1;\n"
     return (
         f"ATTACH '{mssql_dsn}' AS warm (TYPE mssql);\n"
         "SELECT count(*) FROM mssql_scan('warm', 'SELECT 1 AS x');\n"
     )
 
 
+#! RECON (design/005): the mssql extension's remote pushdown is set per catalog through the ATTACH
+#! option `remote_pushdown`, which METADATA_PARAMETERS carries into the metadata attach - so one arm
+#! of a run can have it on and the other off on the same build. Empty means "say nothing", the
+#! extension's own default.
+PUSHDOWN = os.environ.get("MSSQL_DUCKLAKE_BENCH_PUSHDOWN", "").strip()
+
+
+def metadata_parameters() -> str:
+    if not PUSHDOWN:
+        return ""
+    return f", METADATA_PARAMETERS MAP {{'remote_pushdown': '{PUSHDOWN}'}}"
+
+
 def attach_sql(backend: str, mssql_dsn: str, pg_dsn: str, data_path: str) -> str:
     if backend == "postgres":
         return f"ATTACH 'ducklake:postgres:{pg_dsn}' AS lake (DATA_PATH '{data_path}');"
-    return f"ATTACH 'ducklake:mssql:{mssql_dsn}' AS lake (DATA_PATH '{data_path}');"
+    return (f"ATTACH 'ducklake:mssql:{mssql_dsn}' AS lake (DATA_PATH '{data_path}', "
+            f"METADATA_SCHEMA '{BENCH_SCHEMA}'{metadata_parameters()});")
 
 
 def build_and_measure_sql(tables: int, rows: int, schemas: int, columns: int, deep_tables: int,
@@ -307,8 +340,13 @@ def run(duckdb: str, script: str, expected_rows: int) -> dict:
     The check is not ceremony: an attach that fails costs almost nothing and would read as the best
     result in the table. That mistake has been made here twice.
     """
+    # `.log stderr` keeps DuckDB 2.0's own WARNING entries out of the result stream: its CLI registers
+    # a shell log storage at WARNING level writing to stdout WITH highlighting, even when stdout is a
+    # pipe - so one warning puts an ANSI escape in front of a value and the check below reads a
+    # finished run as a failed one (design/005; the same bite cost the concurrency harness sixty
+    # "lost" writers)
     proc = subprocess.run(
-        [duckdb, "-unsigned", "-csv", "-noheader", "-cmd", ".timer on"],
+        [duckdb, "-unsigned", "-csv", "-noheader", "-cmd", ".log stderr", "-cmd", ".timer on"],
         input=script, capture_output=True, text=True, timeout=14400,
     )
     # `.timer on` prints its line AFTER the result, so the last line of stdout is a timing, not the
@@ -316,10 +354,23 @@ def run(duckdb: str, script: str, expected_rows: int) -> dict:
     values = [ln.strip() for ln in proc.stdout.splitlines()
               if ln.strip() and not TIMING.search(ln) and not PHASE.match(ln.strip())]
     tail = values[-1] if values else ""
-    if proc.returncode != 0 or tail != str(expected_rows):
-        errors = [ln for ln in (proc.stdout + proc.stderr).splitlines() if "Error" in ln]
+    # RECON (design/005): keep the whole stream, so a failure does not throw away the timings with it
+    stream_path = os.environ.get("MSSQL_DUCKLAKE_BENCH_STREAM")
+    if stream_path:
+        with open(stream_path, "w") as fh:
+            fh.write(proc.stdout)
+            fh.write("\n--- stderr ---\n")
+            fh.write(proc.stderr)
+    errors = [ln for ln in (proc.stdout + proc.stderr).splitlines() if "Error" in ln]
+    if tail != str(expected_rows):
         sys.exit(f"run failed (last line {tail!r}, wanted {expected_rows}):\n" +
                  "\n".join(errors[:5]) + f"\n{proc.stdout[-1500:]}")
+    if errors:
+        # the workload finished and the row count is right, but something errored on the way - the
+        # numbers are still the numbers, so report them AND say what went wrong
+        print(f"!! {len(errors)} error line(s) during the run, first three:")
+        for line in errors[:3]:
+            print(f"!!   {line[:200]}")
     phases, current = {}, None
     for line in proc.stdout.splitlines():
         marker = PHASE.match(line.strip())
