@@ -74,6 +74,13 @@ inline bool HasFourDigitYear(const string &text) {
 }
 
 //! Off switch for the catalog load's column filter moved into its join (specs/015), for measuring.
+//! the catalog-wide incremental cache of the global table stats off (specs/019): every call reads
+//! every table's stats, as the base does
+inline bool StatsCacheDisabled() {
+	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_STATS_CACHE") != nullptr;
+	return disabled;
+}
+
 inline bool LoadRewriteDisabled() {
 	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_LOAD_REWRITE") != nullptr;
 	return disabled;

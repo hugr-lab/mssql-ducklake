@@ -1,6 +1,8 @@
 #include "mssql_metadata_manager.hpp"
 
 #include <regex>
+#include <mutex>
+#include "duckdb/storage/object_cache.hpp"
 #include "mssql_metadata_internal.hpp"
 
 #include "common/ducklake_types.hpp"
@@ -118,11 +120,18 @@ string DuckLakeConflictCheckQuery(bool exactness) {
 //! A stats row whose sizes are NULL is returned as the base returns it: FillMissingTableSizes asks
 //! for those after.
 //!
+//! It reads every table's stats inside a writing transaction, so with concurrent writers it can meet
+//! one in a deadlock (error 1205) - and DuckLake runs it before a retry attempt counts as retryable,
+//! so its losing would fail the commit. It runs at HIGH deadlock priority: the other side, a commit
+//! batch (back at NORMAL, RunCommitBatch), loses instead, and its 1205 is retried
+//! (IsRetryableCommitError).
+//!
 //! The inner text travels inside a DuckDB string literal, so each of its own quotes is doubled once.
 string MSSQLConflictCheckQuery(bool exactness) {
 	return StringUtil::Format(
 	    R"(
 FROM mssql_scan_unsafe({METADATA_CATALOG_NAME_LITERAL}, '
+SET DEADLOCK_PRIORITY HIGH;
 SELECT s.snapshot_id, s.schema_version, s.next_catalog_id, s.next_file_id,
        COALESCE((SELECT STRING_AGG(changes_made, '','')
                  FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot_changes c
@@ -644,6 +653,156 @@ string MSSQLMetadataManager::GetLatestSnapshotQuery() const {
 	       R"(schema_version, next_catalog_id, next_file_id FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot )"
 	       R"(ORDER BY snapshot_id DESC', columns := {'snapshot_id': 'BIGINT', 'schema_version': 'BIGINT', )"
 	       R"('next_catalog_id': 'BIGINT', 'next_file_id': 'BIGINT'}))";
+}
+
+} // namespace duckdb
+
+//===--------------------------------------------------------------------===//
+// The global table stats, cached per catalog (specs/019)
+//===--------------------------------------------------------------------===//
+
+namespace duckdb {
+
+namespace {
+
+//! Every table's global stats as of `as_of`, the last snapshot whose changes they include. Kept in the
+//! instance's object cache under the attached database's oid (never reused within an instance), and
+//! shared by its transactions - under `lock`, since one brings it up to date for all.
+class MSSQLGlobalStatsEntry : public ObjectCacheEntry {
+public:
+	static string ObjectType() {
+		return "mssql_ducklake_global_stats";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx();
+	}
+	std::mutex lock;
+	bool loaded = false;
+	idx_t as_of = 0;
+	map<TableIndex, DuckLakeGlobalStatsInfo> tables;
+};
+
+//! A commit since the cached state touched more tables than this: read everything instead.
+constexpr idx_t STATS_CACHE_MAX_REREADS = 64;
+
+} // namespace
+
+vector<DuckLakeGlobalStatsInfo> MSSQLMetadataManager::GetGlobalTableStats(DuckLakeSnapshot snapshot) {
+	// DuckLake asks for every table's stats once per snapshot (174a6f56), and a commit into one table
+	// is a new snapshot - so each commit read all of them: 1000 tables x 41 columns, 15-30 ms on the
+	// server, plus the S locks it takes on every other writer's rows inside a writing transaction
+	// (deadlocks, error 1205, with eight concurrent writers). A transaction that has written may be
+	// reading its own uncommitted state: it reads past the cache, as the base does.
+	auto client_context = transaction.context.lock();
+	if (StatsCacheDisabled() || wrote_in_transaction || !client_context) {
+		return DuckLakeMetadataManager::GetGlobalTableStats(snapshot);
+	}
+	auto &cache = ObjectCache::GetObjectCache(*client_context);
+	auto key = StringUtil::Format("mssql_ducklake:global_stats:%llu", transaction.GetCatalog().GetAttached().oid);
+	auto entry = cache.Get<MSSQLGlobalStatsEntry>(key);
+	if (!entry) {
+		entry = make_shared_ptr<MSSQLGlobalStatsEntry>();
+		cache.Put(key, entry);
+		entry = cache.Get<MSSQLGlobalStatsEntry>(key);
+	}
+	std::lock_guard<std::mutex> guard(entry->lock);
+	const bool v1_1 = transaction.GetCatalog().SupportsV1_1Metadata();
+
+	// The snapshots committed since the cached state, by any node: their changes say which tables'
+	// stats moved. A gap in the ids (expired changes), a change this build cannot read, or too many
+	// tables, and the answer is to read everything - which is what the base does every time.
+	bool full = !entry->loaded;
+	set<TableIndex> reread;
+	set<TableIndex> dropped;
+	idx_t last = entry->as_of;
+	if (!full) {
+		string changes_query = StringUtil::Format(
+		    "FROM mssql_scan_unsafe({METADATA_CATALOG_NAME_LITERAL}, 'SELECT snapshot_id, CAST(changes_made AS "
+		    "VARCHAR(MAX)) AS changes_made FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot_changes WHERE snapshot_id "
+		    "> %llu ORDER BY snapshot_id', columns := {'snapshot_id': 'BIGINT', 'changes_made': 'VARCHAR'})",
+		    entry->as_of);
+		auto changes = Query(snapshot, changes_query);
+		if (changes->HasError()) {
+			changes->GetErrorObject().Throw("Failed to read the DuckLake snapshot changes for the stats cache: ");
+		}
+		while (!full) {
+			auto chunk = changes->Fetch();
+			if (!chunk || chunk->size() == 0) {
+				break;
+			}
+			for (idx_t row = 0; row < chunk->size() && !full; row++) {
+				auto id = chunk->GetValue(0, row).GetValue<int64_t>();
+				if (idx_t(id) != last + 1) {
+					full = true;
+					break;
+				}
+				last = idx_t(id);
+				auto text = chunk->GetValue(1, row);
+				if (text.IsNull()) {
+					continue;
+				}
+				try {
+					auto info = SnapshotChangeInformation::ParseChangesMade(text.ToString());
+					for (auto *tables :
+					     {&info.inserted_tables, &info.tables_deleted_from, &info.altered_tables,
+					      &info.tables_compacted, &info.tables_merge_adjacent, &info.tables_rewrite_delete,
+					      &info.tables_inserted_inlined, &info.tables_deleted_inlined, &info.tables_flushed_inlined}) {
+						reread.insert(tables->begin(), tables->end());
+					}
+					dropped.insert(info.dropped_tables.begin(), info.dropped_tables.end());
+				} catch (std::exception &) {
+					full = true;
+				}
+			}
+		}
+		full = full || reread.size() > STATS_CACHE_MAX_REREADS;
+	}
+
+	if (full) {
+		// the last snapshot first: a commit landing between this and the read below is read again next
+		// time, which costs one table, where reading it after could miss one for good
+		string latest_query =
+		    "FROM mssql_scan_unsafe({METADATA_CATALOG_NAME_LITERAL}, 'SELECT ISNULL(MAX(snapshot_id), 0) "
+		    "AS s FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot_changes', columns := {'s': 'BIGINT'})";
+		auto latest = Query(snapshot, latest_query);
+		if (latest->HasError()) {
+			latest->GetErrorObject().Throw("Failed to read the latest DuckLake snapshot for the stats cache: ");
+		}
+		auto chunk = latest->Fetch();
+		auto as_of = chunk && chunk->size() > 0 ? idx_t(chunk->GetValue(0, 0).GetValue<int64_t>()) : 0;
+		auto all = DuckLakeMetadataManager::GetGlobalTableStats(snapshot);
+		entry->tables.clear();
+		for (auto &table : all) {
+			entry->tables[table.table_id] = table;
+		}
+		entry->as_of = as_of;
+		entry->loaded = true;
+		return all;
+	}
+
+	for (auto &table_id : dropped) {
+		entry->tables.erase(table_id);
+	}
+	for (auto &table_id : reread) {
+		auto stats_query = GlobalTableStatsQuery(v1_1, table_id.index);
+		auto result = Query(snapshot, stats_query);
+		auto stats = ParseGlobalTableStats(*result);
+		FillMissingTableSizes(stats, [&](string query) { return Query(snapshot, query); });
+		entry->tables.erase(table_id);
+		for (auto &table : stats) {
+			entry->tables[table.table_id] = table;
+		}
+	}
+	entry->as_of = last;
+	vector<DuckLakeGlobalStatsInfo> out;
+	out.reserve(entry->tables.size());
+	for (auto &table : entry->tables) {
+		out.push_back(table.second);
+	}
+	return out;
 }
 
 } // namespace duckdb

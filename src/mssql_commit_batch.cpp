@@ -913,7 +913,16 @@ bool InlinedDeletionDdlIsDuckLakes(DuckLakeMetadataManager &manager) {
 
 unique_ptr<QueryResult> MSSQLMetadataManager::RunCommitBatch(const string &tsql) {
 	auto &connection = transaction.GetConnection();
-	return TracedQuery(connection, StringUtil::Format("SELECT mssql_exec(%s, %s)", CatalogLiteral(), SQLString(tsql)));
+	// back at NORMAL after the conflict check's HIGH (MSSQLConflictCheckQuery): a deadlock between the
+	// two is this batch's to lose, and it is retried
+	return TracedQuery(connection, StringUtil::Format("SELECT mssql_exec(%s, %s)", CatalogLiteral(),
+	                                                  SQLString("SET DEADLOCK_PRIORITY NORMAL;\n" + tsql)));
+}
+
+bool MSSQLMetadataManager::IsRetryableCommitError(const string &message) const {
+	// SQL Server's deadlock victim (1205): its transaction is rolled back whole, which is exactly what
+	// DuckLake's retry starts from
+	return StringUtil::Contains(message, "[1205,") || StringUtil::Contains(message, "deadlock victim");
 }
 
 //===--------------------------------------------------------------------===//
@@ -1238,6 +1247,7 @@ unique_ptr<QueryResult> MSSQLMetadataManager::RewriteWriteStatement(string query
 }
 
 unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot, string &query) {
+	wrote_in_transaction = true;
 	EnsureReady();
 	// The snapshot's numbers first, so that a literal is a literal; {METADATA_CATALOG} stays until
 	// each family decides what to do with it. The base substitutes again on what it is handed and

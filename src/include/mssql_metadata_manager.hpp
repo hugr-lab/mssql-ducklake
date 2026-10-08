@@ -135,6 +135,14 @@ public:
 	//! inlined deletion table, which the manager creates keyed and outside the transaction instead
 	//! (specs/006 D5b). Everything else in the batch goes to the base as it is.
 	unique_ptr<QueryResult> Execute(DuckLakeSnapshot snapshot, string &query) override;
+	//! Every table's global stats, from a cache kept per attached catalog and brought up to date from
+	//! ducklake_snapshot_changes - the tables a commit since the cached state touched, read again;
+	//! the rest as they were (specs/019). The server is the truth: a commit of any node is in the
+	//! changes, and anything the cache cannot account for reads everything again.
+	vector<DuckLakeGlobalStatsInfo> GetGlobalTableStats(DuckLakeSnapshot snapshot) override;
+	//! this transaction has written to the catalog: what it reads may be its own uncommitted state,
+	//! which the shared stats cache must neither serve nor keep
+	bool wrote_in_transaction = false;
 
 	bool CanSkipSnapshotFetch(const TransactionChangeInformation &changes) const override;
 	//! The client merge's statistics for the commit being applied, read under the apply's lock.
@@ -171,6 +179,8 @@ private:
 	//! error the way the base's Execute does, so the commit loop's retry and rollback see the same
 	//! thing (specs/014 D3).
 	unique_ptr<QueryResult> RunCommitBatch(const string &tsql);
+	//! a deadlock victim's commit is retried (error 1205)
+	bool IsRetryableCommitError(const string &message) const override;
 	//! connection.Query, reported to the catalog's query callback when one is set - the statements
 	//! this manager sends past DuckLake's ExecuteRaw, which mssql_ducklake_trace would otherwise miss
 	unique_ptr<QueryResult> TracedQuery(Connection &connection, const string &query);
