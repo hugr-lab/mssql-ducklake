@@ -21,11 +21,14 @@ model, the full manager plan §7: transpiler, keys + filtered indexes, server-si
 
   | Piece | Where | Pin |
   | --- | --- | --- |
-  | duckdb | submodule `duckdb/` | tag `v1.5.6` |
-  | ducklake | submodule `ducklake/` (EMBEDDED — compiled into the extension) | branch `v1.5-variegata` (SHA in the submodule) |
-  | mssql | `extension_config.cmake` (runtime pair, test loadable) | tag `v0.2.5` |
-  | extension-ci-tools | submodule `extension-ci-tools/` | branch `v1.5.6` |
-  | CI reusable workflows | `.github/workflows/distribution.yml` | `@v1.5.6`, `duckdb_version: v1.5.6` |
+  | duckdb | submodule `duckdb/` | `4fbae437b22`, the v2.0-cyanoptera line (tag `v2.0.0` once released) |
+  | ducklake | submodule `ducklake/` (EMBEDDED — compiled into the extension) | branch `main` (SHA in the submodule) |
+  | mssql | `extension_config.cmake` (runtime pair, test loadable) | main `ed7cb2e` (a release tag once one is cut for 2.0) |
+  | extension-ci-tools | submodule `extension-ci-tools/` | branch `main` (its v2.0 branch once it exists) |
+  | CI reusable workflows | `.github/workflows/distribution.yml`, `release.yml` | `@main`, `duckdb_version: <the duckdb SHA>` |
+
+  The 1.5.6 line lives on in the `v1.5` branch (duckdb v1.5.6, ducklake v1.5-variegata, mssql
+  v0.2.5) for fixes until DuckDB 2.0 is released.
 
   **Vendoring rule**: the ducklake submodule bumps on OUR schedule (manager work never waits for a
   ducklake release), and ducklake fixes reach users only with our bump — so bumps stay cheap and
@@ -200,7 +203,8 @@ constant to the next version with `-dev`.
 
 ## Distribution
 
-Experimental, through the **community extensions repository** on released DuckDB (v1.5.6);
+Experimental, through the **community extensions repository** on released DuckDB — v1.5.6 from the
+`v1.5` branch until DuckDB 2.0 is released, then 2.0 from `main`;
 the GitHub release of each tag carries the same binaries. The
 description is honest: embeds ducklake at a named pin, mutually exclusive with the stock ducklake
 extension. The upstream track — a PR contributing the manager in-tree to ducklake (postgres-manager

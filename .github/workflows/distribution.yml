@@ -2,8 +2,10 @@
 # same inputs. Full platform coverage (Windows MSVC/MinGW, musl, linux_arm64, ...) lives here; the
 # PR loop stays on ci.yml's Linux job.
 #
-# Everything is pinned to the v1.5.6 release line, matching the submodules - a red run means our
-# code or a deliberate pin bump.
+# Everything is pinned to the DuckDB 2.0 line, matching the submodules: duckdb at the
+# v2.0-cyanoptera commit the submodule names (2.0 is not released yet - move to the v2.0.0 tag and
+# extension-ci-tools' v2.0 branch when it is), extension-ci-tools main. A red run means our code or a
+# deliberate pin bump.
 name: Distribution build
 
 on:
@@ -21,20 +23,20 @@ concurrency:
 jobs:
   build:
     name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.6
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       extension_name: mssql_ducklake
-      duckdb_version: v1.5.6
-      ci_tools_version: v1.5.6
+      duckdb_version: 4fbae437b223047ba34e15222f269a2f6b364afc
+      ci_tools_version: main
       # wasm is out: mssql (raw TDS sockets) does not exist there, and the manager is nothing
       # without it
       exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v1.5.6
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
     with:
       extension_name: mssql_ducklake
-      duckdb_version: v1.5.6
-      ci_tools_version: v1.5.6
+      duckdb_version: 4fbae437b223047ba34e15222f269a2f6b364afc
+      ci_tools_version: main
       format_checks: 'format;tidy'
