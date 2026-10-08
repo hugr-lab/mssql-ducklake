@@ -131,6 +131,28 @@ that query runs on the statistics it has and the update happens beside it: the s
 The opt-out is `SET mssql_ducklake_async_statistics = false`; like forced parameterization it is
 best-effort, applied when the catalog is shaped, and left alone afterwards.
 
+### Read committed snapshot — recommended for many concurrent writers
+
+One database option the extension does **not** set, because setting it needs the database to
+itself:
+
+```sql
+ALTER DATABASE <catalog database> SET READ_COMMITTED_SNAPSHOT ON;
+-- refused while other sessions use the database; WITH ROLLBACK IMMEDIATE ends them
+```
+
+Under SQL Server's default `READ COMMITTED` a read takes shared locks, so a commit that reads every
+table's statistics can meet another commit's writes in a deadlock. The extension already handles
+that — its conflict check runs at a higher deadlock priority and a commit chosen as a deadlock victim
+is retried — so this option is not needed for correctness. With it, reads see the last committed
+row versions and take no locks at all, which is how PostgreSQL reads. Measured on the 1000-table
+benchmark: with 16 writers into their own tables, 32 → 52 commits/s and p95 2.9 → 1.0 s; with
+4 writers and 4 readers, 24 → 34 operations/s. The price is the row versions SQL Server keeps in
+`tempdb` for every change: a single writer's commits were 3–10% slower, the serial benchmark 8%.
+So: worth it for a lake with many concurrent writers, not for a single loader.
+
+`mssql_ducklake_catalog_info('lake')` reports it as `read_committed_snapshot`.
+
 ### The shape stamp
 
 The version of all of the above is recorded as an extended property (`mssql_ducklake_shape`) on the

@@ -446,6 +446,7 @@ FROM sys.extended_properties p
 WHERE p.class = 1 AND p.major_id = OBJECT_ID(QUOTENAME(N'%s') + N'.ducklake_metadata') AND p.minor_id = 0 AND p.name LIKE N'mssql[_]ducklake[_]%%'
 UNION ALL SELECT N'database', N'parameterization_forced', CAST(d.is_parameterization_forced AS NVARCHAR(400)) FROM sys.databases d WHERE d.database_id = DB_ID()
 UNION ALL SELECT N'database', N'auto_update_statistics_async', CAST(d.is_auto_update_stats_async_on AS NVARCHAR(400)) FROM sys.databases d WHERE d.database_id = DB_ID()
+UNION ALL SELECT N'database', N'read_committed_snapshot', CAST(d.is_read_committed_snapshot_on AS NVARCHAR(400)) FROM sys.databases d WHERE d.database_id = DB_ID()
 UNION ALL SELECT N'column', CAST(t.name + N'.' + c.name AS NVARCHAR(256)),
        CAST(UPPER(ty.name) + N'(' + CASE WHEN c.max_length = -1 THEN N'MAX' WHEN ty.name LIKE N'n%%' THEN CAST(c.max_length / 2 AS NVARCHAR(10)) ELSE CAST(c.max_length AS NVARCHAR(10)) END + N')' AS NVARCHAR(400))
 FROM sys.columns c JOIN sys.tables t ON t.object_id = c.object_id JOIN sys.types ty ON ty.user_type_id = c.user_type_id

@@ -61,6 +61,12 @@ ducklake_file_column_stats.max_value	VARCHAR(1024)
 ducklake_snapshot_changes.changes_made	VARCHAR(MAX)
 ducklake_view.sql	VARCHAR(2048)
 
+# the database options it reports, read committed snapshot among them (left to a DBA, specs/019)
+query I
+SELECT list(name ORDER BY name) FROM mssql_ducklake_catalog_info('lake') WHERE kind = 'database';
+----
+[auto_update_statistics_async, parameterization_forced, read_committed_snapshot]
+
 # no VARCHAR(MAX) left but the one meant to be
 query I
 SELECT list(name ORDER BY name) FROM mssql_ducklake_catalog_info('lake') WHERE kind = 'column' AND value = 'VARCHAR(MAX)';

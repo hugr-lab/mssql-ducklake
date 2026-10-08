@@ -68,6 +68,23 @@ batch's to lose - and `IsRetryableCommitError` makes its 1205 retryable.
 own_inlined with eight writers: 3/6 runs failed (1205) without the cache, 1/6 with it, 0/10 with
 the priority and the retry.
 
+### Read committed snapshot, measured
+
+`READ_COMMITTED_SNAPSHOT ON` on the catalog's database, the same build, the full benches before and
+after (machine load median 8.7):
+
+| | off | on |
+| --- | ---: | ---: |
+| scale bench total | 628.8 s | 676.5 s (+8%; first/second commits +3%, flush +7%) |
+| own_inlined, 16 writers | 32 ops/s, p95 2947 ms | 52 ops/s, p95 1040 ms |
+| mixed, 4 writers + 4 readers | 24 ops/s, p95 448 ms | 34 ops/s, p95 68 ms |
+| read, 16 readers | 344 ops/s, p95 170 ms | 354 ops/s, p95 98 ms |
+
+No failure either way: the priority and the retry above hold without it. Its price is the row
+versions in tempdb on every change, which a single writer pays and gains nothing for. Left to a
+DBA (it needs the database to itself), recommended in the docs for many concurrent writers, and
+reported by `mssql_ducklake_catalog_info` as `read_committed_snapshot`.
+
 ## Enforcement & security
 
 Fail-closed in the sense that matters: anything the cache cannot account for reads everything. The
@@ -89,7 +106,7 @@ lake keeps its own counts and row ids. The integration suite (666 assertions) an
   would lose their stats, and a commit merging into them would write wrong ones.
 - **A different isolation level for the stats reads.** `READ_COMMITTED_SNAPSHOT ON` on the
   catalog's database removes reader locks altogether, the postgres semantics - but setting it needs
-  exclusive access to the database, so it is a DBA step: measured and recommended in the docs, not
-  set by the extension. `SNAPSHOT` transactions refuse the `ALTER TABLE` / `CREATE INDEX` the
+  exclusive access to the database, so it is a DBA step, and it costs a serial writer ~8% (measured
+  above): recommended in the docs for many concurrent writers, not set by the extension. `SNAPSHOT` transactions refuse the `ALTER TABLE` / `CREATE INDEX` the
   shaping and the migrations run inside a transaction. `NOLOCK` would let the conflict check see a
   snapshot that is then rolled back.
