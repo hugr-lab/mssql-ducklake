@@ -1,6 +1,7 @@
 #include "mssql_metadata_manager.hpp"
 
 #include <regex>
+#include <atomic>
 #include <mutex>
 #include "duckdb/storage/object_cache.hpp"
 #include "mssql_metadata_internal.hpp"
@@ -122,9 +123,10 @@ string DuckLakeConflictCheckQuery(bool exactness) {
 //!
 //! It reads every table's stats inside a writing transaction, so with concurrent writers it can meet
 //! one in a deadlock (error 1205) - and DuckLake runs it before a retry attempt counts as retryable,
-//! so its losing would fail the commit. It runs at HIGH deadlock priority: the other side, a commit
-//! batch (back at NORMAL, RunCommitBatch), loses instead, and its 1205 is retried
-//! (IsRetryableCommitError).
+//! so its losing would fail the commit. Its SELECT runs at HIGH deadlock priority, and the batch puts
+//! the session back at NORMAL right after it (the setting is the session's, and the writes that
+//! follow - the appender, the commit batch - must stay losable): the other side, a commit batch,
+//! loses instead, and its 1205 is retried (IsRetryableCommitError).
 //!
 //! The inner text travels inside a DuckDB string literal, so each of its own quotes is doubled once.
 string MSSQLConflictCheckQuery(bool exactness) {
@@ -153,7 +155,8 @@ SELECT NULL, NULL, NULL, NULL, NULL,
        cs.contains_null, cs.contains_nan, cs.min_value, cs.max_value, cs.extra_stats%s
 FROM {METADATA_SCHEMA_ESCAPED}.ducklake_table_stats ts
 LEFT JOIN {METADATA_SCHEMA_ESCAPED}.ducklake_table_column_stats cs ON cs.table_id = ts.table_id
-ORDER BY table_id', columns := {
+ORDER BY table_id;
+SET DEADLOCK_PRIORITY NORMAL;', columns := {
     'snapshot_id': 'BIGINT', 'schema_version': 'BIGINT', 'next_catalog_id': 'BIGINT',
     'next_file_id': 'BIGINT', 'changes': 'VARCHAR', 'table_id': 'BIGINT', 'column_id': 'BIGINT',
     'record_count': 'BIGINT', 'next_row_id': 'BIGINT', 'file_size_bytes': 'BIGINT',
@@ -676,14 +679,25 @@ public:
 	string GetObjectType() override {
 		return ObjectType();
 	}
+	//! evictable, at a rough size: an evicted entry costs one full read, and an ATTACH/DETACH cycle
+	//! must not leave a map behind for the life of the instance
 	optional_idx GetEstimatedCacheMemory() const override {
-		return optional_idx();
+		return optional_idx(estimated_bytes.load());
 	}
 	std::mutex lock;
 	bool loaded = false;
 	idx_t as_of = 0;
 	map<TableIndex, DuckLakeGlobalStatsInfo> tables;
+	std::atomic<idx_t> estimated_bytes {1024};
 };
+
+idx_t EstimateStatsBytes(const map<TableIndex, DuckLakeGlobalStatsInfo> &tables) {
+	idx_t bytes = 1024;
+	for (auto &table : tables) {
+		bytes += 128 + table.second.column_stats.size() * 160;
+	}
+	return bytes;
+}
 
 //! A commit since the cached state touched more tables than this: read everything instead.
 constexpr idx_t STATS_CACHE_MAX_REREADS = 64;
@@ -702,28 +716,36 @@ vector<DuckLakeGlobalStatsInfo> MSSQLMetadataManager::GetGlobalTableStats(DuckLa
 	}
 	auto &cache = ObjectCache::GetObjectCache(*client_context);
 	auto key = StringUtil::Format("mssql_ducklake:global_stats:%llu", transaction.GetCatalog().GetAttached().oid);
-	auto entry = cache.Get<MSSQLGlobalStatsEntry>(key);
-	if (!entry) {
-		entry = make_shared_ptr<MSSQLGlobalStatsEntry>();
-		cache.Put(key, entry);
-		entry = cache.Get<MSSQLGlobalStatsEntry>(key);
-	}
-	std::lock_guard<std::mutex> guard(entry->lock);
+	auto entry = cache.GetOrCreate<MSSQLGlobalStatsEntry>(key);
 	const bool v1_1 = transaction.GetCatalog().SupportsV1_1Metadata();
+
+	// The cached state, copied out: the round trips below run without the lock, so a transaction
+	// waiting on another's uncommitted rows never holds every other transaction of the process up.
+	bool loaded;
+	idx_t base_as_of;
+	map<TableIndex, DuckLakeGlobalStatsInfo> tables;
+	{
+		std::lock_guard<std::mutex> guard(entry->lock);
+		loaded = entry->loaded;
+		base_as_of = entry->as_of;
+		if (loaded) {
+			tables = entry->tables;
+		}
+	}
 
 	// The snapshots committed since the cached state, by any node: their changes say which tables'
 	// stats moved. A gap in the ids (expired changes), a change this build cannot read, or too many
 	// tables, and the answer is to read everything - which is what the base does every time.
-	bool full = !entry->loaded;
+	bool full = !loaded;
 	set<TableIndex> reread;
 	set<TableIndex> dropped;
-	idx_t last = entry->as_of;
+	idx_t last = base_as_of;
 	if (!full) {
 		string changes_query = StringUtil::Format(
 		    "FROM mssql_scan_unsafe({METADATA_CATALOG_NAME_LITERAL}, 'SELECT snapshot_id, CAST(changes_made AS "
 		    "VARCHAR(MAX)) AS changes_made FROM {METADATA_SCHEMA_ESCAPED}.ducklake_snapshot_changes WHERE snapshot_id "
 		    "> %llu ORDER BY snapshot_id', columns := {'snapshot_id': 'BIGINT', 'changes_made': 'VARCHAR'})",
-		    entry->as_of);
+		    base_as_of);
 		auto changes = Query(snapshot, changes_query);
 		if (changes->HasError()) {
 			changes->GetErrorObject().Throw("Failed to read the DuckLake snapshot changes for the stats cache: ");
@@ -746,11 +768,11 @@ vector<DuckLakeGlobalStatsInfo> MSSQLMetadataManager::GetGlobalTableStats(DuckLa
 				}
 				try {
 					auto info = SnapshotChangeInformation::ParseChangesMade(text.ToString());
-					for (auto *tables :
+					for (auto *changed :
 					     {&info.inserted_tables, &info.tables_deleted_from, &info.altered_tables,
 					      &info.tables_compacted, &info.tables_merge_adjacent, &info.tables_rewrite_delete,
 					      &info.tables_inserted_inlined, &info.tables_deleted_inlined, &info.tables_flushed_inlined}) {
-						reread.insert(tables->begin(), tables->end());
+						reread.insert(changed->begin(), changed->end());
 					}
 					dropped.insert(info.dropped_tables.begin(), info.dropped_tables.end());
 				} catch (std::exception &) {
@@ -772,35 +794,43 @@ vector<DuckLakeGlobalStatsInfo> MSSQLMetadataManager::GetGlobalTableStats(DuckLa
 			latest->GetErrorObject().Throw("Failed to read the latest DuckLake snapshot for the stats cache: ");
 		}
 		auto chunk = latest->Fetch();
-		auto as_of = chunk && chunk->size() > 0 ? idx_t(chunk->GetValue(0, 0).GetValue<int64_t>()) : 0;
+		last = chunk && chunk->size() > 0 ? idx_t(chunk->GetValue(0, 0).GetValue<int64_t>()) : 0;
 		auto all = DuckLakeMetadataManager::GetGlobalTableStats(snapshot);
-		entry->tables.clear();
+		tables.clear();
 		for (auto &table : all) {
-			entry->tables[table.table_id] = table;
+			tables[table.table_id] = table;
 		}
-		entry->as_of = as_of;
-		entry->loaded = true;
-		return all;
+	} else {
+		for (auto &table_id : dropped) {
+			tables.erase(table_id);
+		}
+		for (auto &table_id : reread) {
+			auto stats_query = GlobalTableStatsQuery(v1_1, table_id.index);
+			auto result = Query(snapshot, stats_query);
+			auto stats = ParseGlobalTableStats(*result);
+			FillMissingTableSizes(stats, [&](string query) { return Query(snapshot, query); });
+			tables.erase(table_id);
+			for (auto &table : stats) {
+				tables[table.table_id] = table;
+			}
+		}
 	}
 
-	for (auto &table_id : dropped) {
-		entry->tables.erase(table_id);
-	}
-	for (auto &table_id : reread) {
-		auto stats_query = GlobalTableStatsQuery(v1_1, table_id.index);
-		auto result = Query(snapshot, stats_query);
-		auto stats = ParseGlobalTableStats(*result);
-		FillMissingTableSizes(stats, [&](string query) { return Query(snapshot, query); });
-		entry->tables.erase(table_id);
-		for (auto &table : stats) {
-			entry->tables[table.table_id] = table;
-		}
-	}
-	entry->as_of = last;
 	vector<DuckLakeGlobalStatsInfo> out;
-	out.reserve(entry->tables.size());
-	for (auto &table : entry->tables) {
+	out.reserve(tables.size());
+	for (auto &table : tables) {
 		out.push_back(table.second);
+	}
+	// Kept only if nobody moved the cache meanwhile: this answer is right for this transaction either
+	// way, and of two updates from the same state the later one is as good as the first.
+	{
+		std::lock_guard<std::mutex> guard(entry->lock);
+		if (entry->loaded == loaded && entry->as_of == base_as_of && last >= entry->as_of) {
+			entry->tables = std::move(tables);
+			entry->as_of = last;
+			entry->loaded = true;
+			entry->estimated_bytes = EstimateStatsBytes(entry->tables);
+		}
 	}
 	return out;
 }

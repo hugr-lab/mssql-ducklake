@@ -921,8 +921,36 @@ unique_ptr<QueryResult> MSSQLMetadataManager::RunCommitBatch(const string &tsql)
 
 bool MSSQLMetadataManager::IsRetryableCommitError(const string &message) const {
 	// SQL Server's deadlock victim (1205): its transaction is rolled back whole, which is exactly what
-	// DuckLake's retry starts from
-	return StringUtil::Contains(message, "[1205,") || StringUtil::Contains(message, "deadlock victim");
+	// DuckLake's retry starts from. By number, in both of the mssql extension's forms - mssql_exec's
+	// "SQL Server error 1205: ..." and a scan's "SQL Server error [1205, severity 13]: ..." - since the
+	// text is in the login's language
+	return StringUtil::Contains(message, "SQL Server error 1205:") || StringUtil::Contains(message, "[1205,");
+}
+
+unique_ptr<QueryResult> MSSQLMetadataManager::ExecuteInTransaction(string &query) {
+	// ducklake main sends the drop of an empty superseded inlined table here - a DELETE from the
+	// registry and the DROP, all or none. The base wraps them in BEGIN/COMMIT for Query, where the
+	// BEGIN makes the whole string a read to our rewrite; the statements are the rewrite's own
+	// families, so they take its path, as one transaction.
+	wrote_in_transaction = true;
+	rewrite_as_one_transaction = true;
+	unique_ptr<QueryResult> result;
+	try {
+		result = BatchRewriteEnabled() ? RewriteWriteStatement(query) : nullptr;
+	} catch (...) {
+		rewrite_as_one_transaction = false;
+		throw;
+	}
+	rewrite_as_one_transaction = false;
+	if (result) {
+		return result;
+	}
+	if (StrictBatchEnabled()) {
+		throw InvalidInputException("mssql_ducklake: a transaction DuckLake sent through ExecuteInTransaction that the "
+		                            "T-SQL rewrite does not recognise (specs/014): %s",
+		                            query);
+	}
+	return DuckLakeMetadataManager::ExecuteInTransaction(query);
 }
 
 //===--------------------------------------------------------------------===//
@@ -1225,9 +1253,22 @@ unique_ptr<QueryResult> MSSQLMetadataManager::RewriteWriteStatement(string query
 		}
 		return nullptr;
 	}
+	wrote_in_transaction = true;
 	// every statement recognised before any runs; then in calls of a bounded size
 	unique_ptr<QueryResult> result;
 	string run;
+	if (rewrite_as_one_transaction) {
+		// ExecuteInTransaction: all of it or none, in one call - a transaction of its own, or the one
+		// the connection is already in
+		string all;
+		for (auto &piece : pieces) {
+			all += piece;
+		}
+		result = RunCommitBatch("SET XACT_ABORT ON;\nDECLARE @own_tx BIT = CASE WHEN @@TRANCOUNT = 0 THEN 1 ELSE 0 "
+		                        "END;\nIF @own_tx = 1 BEGIN TRANSACTION;\n" +
+		                        all + "IF @own_tx = 1 COMMIT TRANSACTION;\nSET XACT_ABORT OFF;\n");
+		pieces.clear();
+	}
 	for (idx_t i = 0; i < pieces.size(); i++) {
 		run += pieces[i];
 		if (i + 1 == pieces.size() || run.size() + pieces[i + 1].size() > RunLimitBytes()) {

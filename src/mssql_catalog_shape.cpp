@@ -634,6 +634,18 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	// them at ~33 ms each made shaping a new catalog 1.2 s, against 0.3 s for postgres's whole first
 	// phase. A table one format added is not in a catalog of an older one, and the attach that
 	// migrates shapes on the same pass: the server says what is there, the version only what should.
+	//
+	// Two nodes attaching one older-shaped catalog at once would both read "missing" and both add it;
+	// the guards that used to make that harmless are gone with the compiles they cost. An exclusive
+	// application lock on the schema, held to the end of this transaction, makes the second wait and
+	// then read the state the first committed - and find nothing to do.
+	RunServerSide(StringUtil::Format("DECLARE @r INT; EXEC @r = sp_getapplock @Resource = N'mssql_ducklake_shape:%s', "
+	                                 "@LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = 120000; "
+	                                 "IF @r < 0 THROW 50000, 'mssql_ducklake: timed out waiting for another node "
+	                                 "shaping this catalog', 1;",
+	                                 StringUtil::Replace(
+	                                     transaction.GetCatalog().MetadataSchemaName().GetIdentifierName(), "'", "''")),
+	              "Failed to take the shaping lock on the DuckLake catalog: ");
 	auto state = ReadShapeState();
 	auto has_table = [&](const string &table) {
 		return state.tables.count(table) > 0;
@@ -644,6 +656,9 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 	// a column given an explicit ALTER below, which the string sweep must then leave alone - the sweep
 	// used to read sys.columns after those ALTERs had run, and now reads the state from before them
 	std::set<pair<string, string>> altered;
+	// the tables this shaping changes: the metadata database is preloaded at its ATTACH (specs/015),
+	// so their cached entries - keys, column types - are stale once it has run, and only theirs
+	std::set<string> touched;
 
 	string columns_ddl;
 	string constraints_ddl;
@@ -689,6 +704,7 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 		}
 		constraints_ddl += StringUtil::Format("ALTER TABLE %s.%s ADD CONSTRAINT %s PRIMARY KEY (%s);\n", schema,
 		                                      entry.first, key_name, entry.second);
+		touched.insert(entry.first);
 	}
 
 	// A string column as this build declares it: VARCHAR at its length under the UTF-8 BIN2 collation.
@@ -718,6 +734,7 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 		columns_ddl += StringUtil::Format("ALTER TABLE %s.%s ALTER COLUMN %s %s COLLATE %s;\n", schema, entry.first,
 		                                  entry.second, VarcharOf(stats_length), VARCHAR_COLLATION);
 		altered.insert(entry);
+		touched.insert(entry.first);
 	}
 
 	// A partition value is bounded so it can be an index key. DuckLake declares it an unbounded
@@ -731,6 +748,7 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 		                                  "partition_value VARCHAR(200) COLLATE %s NULL;\n",
 		                                  schema, VARCHAR_COLLATION);
 		altered.insert({"ducklake_file_partition_value", "partition_value"});
+		touched.insert("ducklake_file_partition_value");
 	}
 
 	// Everything else DuckLake declared as a string. mssql maps DuckDB's VARCHAR to NVARCHAR, which
@@ -765,6 +783,7 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 		                       QuoteName(entry.first.first), QuoteName(entry.first.second),
 		                       VarcharOf(length == declared_lengths.end() ? CatalogLengths::MAX : length->second),
 		                       VARCHAR_COLLATION, c.nullable ? "NULL" : "NOT NULL");
+		touched.insert(entry.first.first);
 	}
 
 	// The inlined deletion tables an older build created keyless, through the base's DDL (the
@@ -775,11 +794,16 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 			continue;
 		}
 		auto name = QuoteName(table);
-		constraints_ddl += StringUtil::Format(
-		    "ALTER TABLE %s.%s ALTER COLUMN file_id BIGINT NOT NULL; ALTER TABLE %s.%s ALTER COLUMN row_id BIGINT NOT "
-		    "NULL; ALTER TABLE %s.%s ALTER COLUMN begin_snapshot BIGINT NOT NULL; ALTER TABLE %s.%s ADD CONSTRAINT %s "
-		    "PRIMARY KEY (file_id, row_id, begin_snapshot);\n",
-		    schema, name, schema, name, schema, name, schema, name, QuoteName("pk_" + table));
+		// NOT NULL in the first batch, the key in the second: inside one batch the constraint does not
+		// see the new nullability (see below)
+		columns_ddl += StringUtil::Format("ALTER TABLE %s.%s ALTER COLUMN file_id BIGINT NOT NULL; ALTER TABLE %s.%s "
+		                                  "ALTER COLUMN row_id BIGINT NOT NULL; ALTER TABLE %s.%s ALTER COLUMN "
+		                                  "begin_snapshot BIGINT NOT NULL;\n",
+		                                  schema, name, schema, name, schema, name);
+		constraints_ddl += StringUtil::Format("ALTER TABLE %s.%s ADD CONSTRAINT %s PRIMARY KEY (file_id, row_id, "
+		                                      "begin_snapshot);\n",
+		                                      schema, name, QuoteName("pk_" + table));
+		touched.insert(table);
 	}
 
 	// Indexes on the condition almost every DuckLake read carries. Neither the postgres nor the
@@ -889,6 +913,11 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 		RunServerSide(columns_ddl, "Failed to prepare the DuckLake catalog columns for SQL Server: ");
 	}
 	RunServerSide(constraints_ddl, "Failed to key and index the DuckLake catalog for SQL Server: ");
+	// what the preloaded cache holds of these tables predates their keys and column types; the next
+	// use reads them again, on this transaction's connection (the invalidation itself is in-process)
+	for (auto &table : touched) {
+		InvalidateTableCache(table);
+	}
 
 	ApplyDatabaseOptions();
 }

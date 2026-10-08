@@ -330,6 +330,7 @@ void MSSQLMetadataManager::FlushChangesServerSide(DuckLakeTransaction &flush_tra
                                                   DuckLakeSnapshot transaction_snapshot,
                                                   const TransactionChangeInformation &transaction_changes,
                                                   const DuckLakeRetryConfig &retry_config) {
+	wrote_in_transaction = true;
 	// Decided here, BEFORE anything is staged. Staging a commit the apply cannot finish means paying
 	// for both paths - the staging, its bulk loads, and then the whole client loop from scratch -
 	// which was the worst shape in the benchmark (specs/005 D7). This is also exactly what

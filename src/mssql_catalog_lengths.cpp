@@ -318,7 +318,8 @@ unique_ptr<Catalog> AttachWithLimits(optional_ptr<StorageExtensionInfo> storage_
 	bool native_types_given = false;
 	bool min_connections_given = false;
 	bool preload_given = false;
-	string metadata_schema = "dbo";
+	bool lazy_validation = false;
+	string metadata_schema;
 	for (auto it = options.options.begin(); it != options.options.end();) {
 		auto key = StringUtil::Lower(it->first);
 		if (key == "meta_type") {
@@ -329,6 +330,8 @@ unique_ptr<Catalog> AttachWithLimits(optional_ptr<StorageExtensionInfo> storage_
 			min_connections_given = true;
 		} else if (key == "meta_preload" || key == "meta_schema_filter") {
 			preload_given = true;
+		} else if (key == "meta_lazy_validation" || key == "meta_lazyvalidation") {
+			lazy_validation = true;
 		} else if (key == "metadata_schema") {
 			metadata_schema = it->second.ToString();
 		} else if (key == "metadata_parameters" && it->second.type().id() == LogicalTypeId::MAP) {
@@ -338,6 +341,7 @@ unique_ptr<Catalog> AttachWithLimits(optional_ptr<StorageExtensionInfo> storage_
 				native_types_given = native_types_given || parameter == "native_types";
 				min_connections_given = min_connections_given || parameter == "min_connections";
 				preload_given = preload_given || parameter == "preload" || parameter == "schema_filter";
+				lazy_validation = lazy_validation || parameter == "lazy_validation" || parameter == "lazyvalidation";
 				if (parameter == "type") {
 					on_mssql = StringUtil::Lower(key_value[1].ToString()) == "mssql";
 				}
@@ -362,22 +366,29 @@ unique_ptr<Catalog> AttachWithLimits(optional_ptr<StorageExtensionInfo> storage_
 	// and keeps them past its idle timeout. A connection opened on demand is a TLS login, ~200 ms
 	// here, paid by the first metadata query that needs one (specs/015); 4 covers the
 	// transaction's pinned connection and a few concurrent autocommit reads.
-	if (on_mssql && !min_connections_given) {
+	// (not with lazy_validation, which the extension refuses beside it: it defers every connection)
+	if (on_mssql && !min_connections_given && !lazy_validation) {
 		options.options["meta_min_connections"] = Value::BIGINT(4);
 	}
 	// The catalog's metadata loaded at the metadata ATTACH, in one pass and outside any transaction,
 	// instead of table by table on first use: the first scan of an inlined table 3.1 -> 1.1 ms, 20
 	// first reads of a fresh session 891-1382 -> 837-864 ms (specs/015). Filtered to the lake's
 	// schema - the metadata database sees no other - so the pass reads only it: the ATTACH costs the
-	// same as without it (514-528 ms against 898-1168 for the whole database).
-	if (on_mssql && !preload_given) {
+	// same as without it (514-528 ms against 898-1168 for the whole database). Only where all of it is
+	// known to hold: the schema named at this ATTACH (without METADATA_SCHEMA the catalog lands in
+	// whatever default schema the connection or its secret names, which a guessed filter would hide),
+	// no lazy_validation (which the extension refuses beside a preload), and not inside an explicit
+	// transaction (where it refuses to preload a catalog that transaction may have used).
+	if (on_mssql && !preload_given && !metadata_schema.empty() && !lazy_validation &&
+	    context.transaction.IsAutoCommit()) {
+		// the regex's metacharacters escaped and nothing else, so the extension can still turn the
+		// filter into a LIKE on the server
 		string pattern = "^";
 		for (auto c : metadata_schema) {
-			if (StringUtil::CharacterIsAlphaNumeric(c) || c == '_') {
-				pattern += c;
-			} else {
-				pattern += string("\\") + c;
+			if (strchr("\\^$.|?*+()[]{}", c)) {
+				pattern += '\\';
 			}
+			pattern += c;
 		}
 		pattern += "$";
 		options.options["meta_preload"] = Value::BOOLEAN(true);

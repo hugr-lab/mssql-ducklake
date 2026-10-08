@@ -181,6 +181,10 @@ private:
 	unique_ptr<QueryResult> RunCommitBatch(const string &tsql);
 	//! a deadlock victim's commit is retried (error 1205)
 	bool IsRetryableCommitError(const string &message) const override;
+	//! the drop of a superseded inlined table, through the rewrite as one T-SQL transaction
+	unique_ptr<QueryResult> ExecuteInTransaction(string &query) override;
+	//! RewriteWriteStatement runs everything it recognised as one transaction, in one call
+	bool rewrite_as_one_transaction = false;
 	//! connection.Query, reported to the catalog's query callback when one is set - the statements
 	//! this manager sends past DuckLake's ExecuteRaw, which mssql_ducklake_trace would otherwise miss
 	unique_ptr<QueryResult> TracedQuery(Connection &connection, const string &query);

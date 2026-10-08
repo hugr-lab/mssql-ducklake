@@ -167,6 +167,48 @@ SELECT count(*), max(v) FILTER (WHERE id = 3) FROM lake.t WHERE id < 100;
 ----
 7	updated
 
+# ---------------------------------------------------------------------------
+# A superseded inlined table, empty, dropped after the commit: ducklake main sends the registry
+# DELETE and the DROP through ExecuteInTransaction, which the manager runs as one T-SQL transaction
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE lake.sup(i INTEGER);
+
+statement ok
+INSERT INTO lake.sup VALUES (1), (2);
+
+statement ok
+CREATE TEMP TABLE sup_before AS SELECT name FROM mssql_scan('srv', 'SELECT CAST(t.name AS NVARCHAR(128)) AS name FROM sys.tables t WHERE t.schema_id = SCHEMA_ID(''inlined_rows'')') WHERE name LIKE 'ducklake_inlined_data_' || (SELECT table_id FROM ducklake_table_info('lake') WHERE table_name = 'sup') || '_%';
+
+query I
+SELECT count(*) FROM sup_before;
+----
+1
+
+# a new schema version, and rows in its own inlined table: the first one is superseded
+statement ok
+ALTER TABLE lake.sup ADD COLUMN j INTEGER;
+
+statement ok
+INSERT INTO lake.sup VALUES (3, 30);
+
+# the flush empties both, and after its commit DuckLake drops the superseded, empty one
+statement ok
+SELECT count(*) FROM ducklake_flush_inlined_data('lake', table_name := 'sup');
+
+query III
+SELECT count(*), sum(i), sum(j) FROM lake.sup;
+----
+3	6	30
+
+# the superseded one is gone from the server and from the registry; the new version's is there
+query II
+SELECT (SELECT count(*) FROM mssql_scan('srv', 'SELECT CAST(t.name AS NVARCHAR(128)) AS name FROM sys.tables t WHERE t.schema_id = SCHEMA_ID(''inlined_rows'')') WHERE name IN (SELECT name FROM sup_before)),
+       (SELECT count(*) FROM mssql_scan('srv', 'SELECT CAST(table_name AS NVARCHAR(128)) AS name FROM inlined_rows.ducklake_inlined_data_tables') WHERE name IN (SELECT name FROM sup_before));
+----
+0	0
+
 statement ok
 DETACH lake;
 
