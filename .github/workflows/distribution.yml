@@ -2,10 +2,13 @@
 # same inputs. Full platform coverage (Windows MSVC/MinGW, musl, linux_arm64, ...) lives here; the
 # PR loop stays on ci.yml's Linux job.
 #
-# Everything is pinned to the DuckDB 2.0 line, matching the submodules: duckdb at the
-# v2.0-cyanoptera commit the submodule names (2.0 is not released yet - move to the v2.0.0 tag and
-# extension-ci-tools' v2.0 branch when it is), extension-ci-tools main. A red run means our code or a
-# deliberate pin bump.
+# On the DuckDB 2.0 line, pinned to the duckdb submodule's commit. Until v2.0.0 is tagged this is a
+# build check across the platforms, without the tests: the reusable workflow turns duckdb_version
+# into the build's version string, and an extension's metadata keeps 32 bytes of a 40-character SHA,
+# so the loadables refuse to LOAD in a test ("built specifically for DuckDB version '4fbae437...'").
+# A branch name would fit but floats past our pin (v2.0-cyanoptera's head already changed an API the
+# embedded ducklake uses). The tests run in ci.yml, on the pinned submodule. At the release:
+# duckdb_version v2.0.0, extension-ci-tools' v2.0 branch, and skip_tests goes.
 name: Distribution build
 
 on:
@@ -31,6 +34,8 @@ jobs:
       # wasm is out: mssql (raw TDS sockets) does not exist there, and the manager is nothing
       # without it
       exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
+      # until v2.0.0: see the header
+      skip_tests: true
 
   code-quality-check:
     name: Code Quality Check

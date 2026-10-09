@@ -27,8 +27,13 @@ duckdb_extension_load(mssql
 # published postgres_scanner, so it is built from source like mssql - a loadable, loaded by build
 # path. Not part of the release build. Pinned to duckdb-postgres main, which carries the v2.0-cyanoptera
 # patches (Parser's expression list is no longer static there).
-duckdb_extension_load(postgres_scanner
-    GIT_URL https://github.com/duckdb/duckdb-postgres
-    GIT_TAG a0fcfdece407d3450dae7ce19baa1251f11fd356
-    SUBMODULES database-connector
-)
+# The distribution and release builds (extension-ci-tools' reusable workflow, which sets
+# DUCKDB_PLATFORM) leave it out: they ship mssql_ducklake, and postgres_scanner does not even link
+# on every platform there (MinGW).
+if(NOT DEFINED ENV{DUCKDB_PLATFORM})
+  duckdb_extension_load(postgres_scanner
+      GIT_URL https://github.com/duckdb/duckdb-postgres
+      GIT_TAG a0fcfdece407d3450dae7ce19baa1251f11fd356
+      SUBMODULES database-connector
+  )
+endif()
