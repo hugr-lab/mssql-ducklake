@@ -482,9 +482,9 @@ bool RewriteInsert(const string &stmt, const string &schema, bool v1_1, int64_t 
 }
 
 //! The predicate and assignment text of an UPDATE or DELETE, checked against what those families
-//! carry: names, numbers, punctuation, keywords - no strings, and no call other than IN (...) and
-//! EXISTS (...). What passes is T-SQL already. `{METADATA_CATALOG}.` inside (a NOT EXISTS subquery)
-//! is swapped for the schema.
+//! carry: names, numbers, punctuation, keywords - no strings, and no call other than IN (...),
+//! EXISTS (...), CAST, COALESCE and SUM. What passes is T-SQL already. `{METADATA_CATALOG}.` inside (a NOT EXISTS
+//! subquery) is swapped for the schema.
 bool NumericBody(const string &body, const string &schema, string &out) {
 	string result;
 	idx_t pos = 0;
@@ -544,10 +544,12 @@ bool NumericBody(const string &body, const string &schema, string &out) {
 				// the calls these families carry: IN (...), NOT EXISTS (...), and the CTE updates'
 				// CAST(x AS BIT), already rewritten from BOOLEAN by the caller - and a parenthesised
 				// condition after a connective, as the flush's delete of its inlined rows writes since
-				// ducklake main: `... <= N AND (_ducklake_end_snapshot IS NULL OR ... <= N)`
+				// ducklake main: `... <= N AND (_ducklake_end_snapshot IS NULL OR ... <= N)`; and the
+				// table size refresh after a merge (RefreshTableSizesSql), a subquery over the live files:
+				// `SET file_size_bytes = (SELECT COALESCE(SUM(data.file_size_bytes), 0) FROM ...)`
 				auto upper = StringUtil::Upper(word);
 				if (upper != "IN" && upper != "EXISTS" && upper != "CAST" && upper != "AND" && upper != "OR" &&
-				    upper != "NOT") {
+				    upper != "NOT" && upper != "COALESCE" && upper != "SUM") {
 					return false;
 				}
 			}
