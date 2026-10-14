@@ -46,15 +46,32 @@ MSSQLMetadataManager::CatalogMarkers MSSQLMetadataManager::ReadCatalogMarkers() 
 		                          "WHERE class = 1 AND major_id = %s AND minor_id = 0 AND name = ''%s'')",
 		                          type, anchor, name);
 	};
+	// Under the shaping lock, shared, for this one statement. Reading the markers takes locks on the
+	// extended properties and then on ducklake_metadata; a migration or a shaping on another
+	// connection takes them the other way round, and SQL Server chose this read as the deadlock
+	// victim (1205) when several nodes attached a new catalog at once - inside the attach
+	// transaction, where it cannot be retried. Both writers hold the lock exclusively, so the read
+	// waits for them instead of meeting them halfway. Owned by the session and released here: held
+	// by the transaction it would make this attach's own shaping a conversion two attaches deadlock
+	// on. The same session holding it exclusively (the re-read after a shaping) is granted at once.
+	auto applock = [&](bool take) {
+		return StringUtil::Format(
+		    take ? "EXEC @lock = sp_getapplock @Resource = N''mssql_ducklake_shape:%s'', @LockMode = ''Shared'', "
+		           "@LockOwner = ''Session'', @LockTimeout = 120000; "
+		         : "IF @lock >= 0 EXEC sp_releaseapplock @Resource = N''mssql_ducklake_shape:%s'', "
+		           "@LockOwner = ''Session''; ",
+		    schema_name);
+	};
 	auto result = TracedQuery(
 	    connection,
 	    StringUtil::Format(
-	        "SELECT present, shape, migration, limits FROM mssql_scan_unsafe(%s, 'SELECT "
-	        "CAST(CASE WHEN %s IS NULL THEN 0 ELSE 1 END AS BIGINT) AS present, %s AS shape, %s AS migration, "
-	        "%s AS limits', columns := {'present': 'BIGINT', 'shape': 'BIGINT', 'migration': 'VARCHAR', 'limits': "
-	        "'VARCHAR'})",
-	        CatalogLiteral(), anchor, property(SHAPE_VERSION_PROPERTY, "BIGINT"),
-	        property(MIGRATION_MARKER_PROPERTY, "NVARCHAR(64)"), property(LIMITS_PROPERTY, "NVARCHAR(400)")));
+	        "SELECT present, shape, migration, limits FROM mssql_scan_unsafe(%s, 'DECLARE @lock INT; %sBEGIN TRY "
+	        "SELECT CAST(CASE WHEN %s IS NULL THEN 0 ELSE 1 END AS BIGINT) AS present, %s AS shape, %s AS migration, "
+	        "%s AS limits; END TRY BEGIN CATCH %sTHROW; END CATCH; %s', columns := {'present': 'BIGINT', "
+	        "'shape': 'BIGINT', 'migration': 'VARCHAR', 'limits': 'VARCHAR'})",
+	        CatalogLiteral(), applock(true), anchor, property(SHAPE_VERSION_PROPERTY, "BIGINT"),
+	        property(MIGRATION_MARKER_PROPERTY, "NVARCHAR(64)"), property(LIMITS_PROPERTY, "NVARCHAR(400)"),
+	        applock(false), applock(false)));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to inspect the DuckLake catalog on SQL Server: ");
 	}
@@ -116,6 +133,18 @@ void MSSQLMetadataManager::RequireUtf8Collation() {
 //! re-run is a no-op instead of an error. The pre-1.0 migrations have the same problem and are
 //! left alone: every catalog a release of this extension created is at 1.0 or later, because 1.0 was
 //! the latest format on the line it shipped on.
+//! The columns 1.1-dev1 adds, in this catalog's types rather than DuckLake's spelling: BOOLEAN is
+//! BIT here. Beside them the migration adds one table, ducklake_view_column_tag.
+static const vector<pair<string, string>> &MigrationAddedColumns() {
+	static const vector<pair<string, string>> added_columns = {
+	    {"ducklake_data_file", "row_group_count BIGINT"},    {"ducklake_delete_file", "row_group_count BIGINT"},
+	    {"ducklake_file_column_stats", "min_is_exact BIT"},  {"ducklake_file_column_stats", "max_is_exact BIT"},
+	    {"ducklake_table_column_stats", "min_is_exact BIT"}, {"ducklake_table_column_stats", "max_is_exact BIT"},
+	    {"ducklake_schema", "parent_schema_id BIGINT"},
+	};
+	return added_columns;
+}
+
 void MSSQLMetadataManager::MigrateToV1_1Dev1() {
 	// META_LIMITS narrows a catalog only on its way from 1.0 (specs/018): DuckLake re-runs this for a
 	// dev format on every writable attach, and a catalog already at 1.1 lives with the limits it has.
@@ -133,14 +162,7 @@ void MSSQLMetadataManager::MigrateToV1_1Dev1() {
 	const string schema = SchemaIdentifier();
 	const string schema_literal = SchemaLiteral();
 
-	// the columns 1.1-dev1 adds, in this catalog's types rather than DuckLake's spelling: BOOLEAN is
-	// BIT here
-	const vector<pair<string, string>> added_columns = {
-	    {"ducklake_data_file", "row_group_count BIGINT"},    {"ducklake_delete_file", "row_group_count BIGINT"},
-	    {"ducklake_file_column_stats", "min_is_exact BIT"},  {"ducklake_file_column_stats", "max_is_exact BIT"},
-	    {"ducklake_table_column_stats", "min_is_exact BIT"}, {"ducklake_table_column_stats", "max_is_exact BIT"},
-	    {"ducklake_schema", "parent_schema_id BIGINT"},
-	};
+	const auto &added_columns = MigrationAddedColumns();
 	// @changed records whether this run added anything. A catalog created at 1.1 already has it all,
 	// and its first attach would otherwise pay a whole re-shaping for nothing (specs/015 R3).
 	string ddl = "DECLARE @changed BIT = 0;\n";
@@ -180,7 +202,22 @@ void MSSQLMetadataManager::MigrateToV1_1Dev1() {
 	    "@level1type = N'TABLE', @level1name = N'ducklake_metadata';\n",
 	    schema_literal, SHAPE_VERSION_PROPERTY, SHAPE_VERSION_PROPERTY, schema_literal);
 
-	RunServerSideOutsideTransaction(ddl, "Failed to migrate the DuckLake catalog to v1.1-dev1: ");
+	// Several nodes attaching one catalog all come here until the marker is written, and their
+	// batches used to run side by side, each rewriting the marker - which deadlocked with the marker
+	// reads of the others. One at a time now, under the shaping lock, in a transaction of its own so
+	// the lock goes with it whatever happens; the ones that waited find the marker and do nothing.
+	const string schema_name =
+	    StringUtil::Replace(transaction.GetCatalog().MetadataSchemaName().GetIdentifierName(), "'", "''");
+	auto locked_ddl = StringUtil::Format(
+	    "SET XACT_ABORT ON;\nBEGIN TRANSACTION;\nDECLARE @lock INT;\n"
+	    "EXEC @lock = sp_getapplock @Resource = N'mssql_ducklake_shape:%s', @LockMode = 'Exclusive', "
+	    "@LockOwner = 'Transaction', @LockTimeout = 120000;\n"
+	    "IF @lock < 0 THROW 50000, 'mssql_ducklake: timed out waiting for another node migrating this catalog', 1;\n"
+	    "IF NOT EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 1 AND major_id = "
+	    "OBJECT_ID(QUOTENAME(%s) + '.ducklake_metadata') AND minor_id = 0 AND name = '%s' "
+	    "AND CAST(value AS NVARCHAR(64)) = N'%s')\nBEGIN\n%sEND;\nCOMMIT TRANSACTION;\n",
+	    schema_name, schema_literal, MIGRATION_MARKER_PROPERTY, MIGRATION_MARKER, ddl);
+	RunServerSideOutsideTransaction(locked_ddl, "Failed to migrate the DuckLake catalog to v1.1-dev1: ");
 	// the limits the ATTACH that migrates asks for (specs/018) - before the shaping, which reads them
 	if (from_v1_0) {
 		ApplyMigrationLimits();
@@ -905,6 +942,22 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 		constraints_ddl += StringUtil::Format(
 		    "EXEC sp_dropextendedproperty @name = N'%s', @level0type = N'SCHEMA', @level0name = %s;\n",
 		    SHAPE_VERSION_PROPERTY, schema_literal);
+	}
+	// and the migration marker, when the catalog already has everything the migration adds - one this
+	// build created at 1.1-dev1. Without it DuckLake's re-run of the migration on every writable
+	// attach found no marker and ran the whole batch, on every node attaching before the first was
+	// done; their batches and marker reads deadlocked (1205) when several nodes attached a new lake.
+	// Asked of the server as the batch runs: the state above holds only the string columns.
+	if (!state.properties.count(MIGRATION_MARKER_PROPERTY)) {
+		string migrated = StringUtil::Format(
+		    "OBJECT_ID(QUOTENAME(%s) + '.ducklake_view_column_tag') IS NOT NULL AND EXISTS (SELECT 1 FROM "
+		    "%s.ducklake_metadata WHERE [key] = N'version' AND value = N'1.1-dev1')",
+		    schema_literal, schema);
+		for (auto &entry : MigrationAddedColumns()) {
+			migrated += StringUtil::Format(" AND COL_LENGTH(QUOTENAME(%s) + '.%s', '%s') IS NOT NULL", schema_literal,
+			                               entry.first, StringUtil::Split(entry.second, ' ')[0]);
+		}
+		constraints_ddl += "IF " + migrated + "\n" + set_property(MIGRATION_MARKER_PROPERTY, MIGRATION_MARKER);
 	}
 
 	// Two batches: inside one, a column's new NOT NULL is not yet visible to the constraint that

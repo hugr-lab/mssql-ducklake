@@ -105,9 +105,13 @@ void RegisterTraceFunctions(ExtensionLoader &loader) {
 	ScalarFunction trace("mssql_ducklake_trace", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::VARCHAR,
 	                     TraceFun);
 	trace.SetStability(FunctionStability::VOLATILE);
+	// both throw - an unknown lake, a file that cannot be written - and DuckDB 2.0 turns the error of
+	// a function not marked fallible into an internal one, which invalidates the database
+	trace.SetFallible();
 	loader.RegisterFunction(trace);
 	ScalarFunction mark("mssql_ducklake_trace_mark", {LogicalType::VARCHAR}, LogicalType::VARCHAR, TraceMarkFun);
 	mark.SetStability(FunctionStability::VOLATILE);
+	mark.SetFallible();
 	loader.RegisterFunction(mark);
 }
 
