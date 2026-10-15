@@ -36,3 +36,7 @@ posts/
 # python bytecode from the bench scripts
 __pycache__/
 *.pyc
+
+# the Azure bench (specs/021): per-run secrets and downloaded results
+scripts/bench/azure/.state/
+scripts/bench/azure/results/

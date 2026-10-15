@@ -1,0 +1,28 @@
+#cloud-config
+# The SQL Server catalog VM (specs/021). up.sh fills the @...@ values into a copy in the state
+# directory; the template itself carries no secret. The server runs in the image the local compose
+# file uses, with the same memory budget as the postgres VM beside it.
+package_update: true
+packages:
+  - docker.io
+write_files:
+  - path: /etc/mssql-ducklake/server.env
+    permissions: "0600"
+    content: |
+      ACCEPT_EULA=Y
+      MSSQL_PID=Developer
+      MSSQL_SA_PASSWORD=@MSSQL_PASS@
+      MSSQL_MEMORY_LIMIT_MB=@MEMORY_MB@
+runcmd:
+  - systemctl enable --now docker
+  - mkdir -p /var/opt/mssql && chown 10001:0 /var/opt/mssql
+  - >-
+    docker run -d --name mssql-ducklake-sqlserver --restart unless-stopped
+    --env-file /etc/mssql-ducklake/server.env --memory @MEMORY_MB@m
+    -p 1433:1433 -v /var/opt/mssql:/var/opt/mssql @MSSQL_IMAGE@
+  - >-
+    for i in $(seq 1 60); do
+    docker exec mssql-ducklake-sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa
+    -P "$(grep MSSQL_SA_PASSWORD /etc/mssql-ducklake/server.env | cut -d= -f2-)" -C
+    -Q "IF DB_ID('lake_meta') IS NULL CREATE DATABASE lake_meta" && break; sleep 5; done
+  - touch /var/lib/mssql-ducklake-ready

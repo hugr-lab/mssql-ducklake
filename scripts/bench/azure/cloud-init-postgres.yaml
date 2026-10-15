@@ -1,0 +1,32 @@
+#cloud-config
+# The PostgreSQL catalog VM (specs/021). up.sh fills the @...@ values into a copy in the state
+# directory; the template itself carries no secret. The same memory budget as the SQL Server VM, and
+# the settings a 12 GB, 4 CPU server would be given (pgtune's OLTP profile) - SQL Server sizes its
+# own memory, so leaving postgres at its 128 MB defaults would compare a tuned server with an
+# untuned one.
+package_update: true
+packages:
+  - docker.io
+write_files:
+  - path: /etc/mssql-ducklake/server.env
+    permissions: "0600"
+    content: |
+      POSTGRES_USER=ducklake
+      POSTGRES_PASSWORD=@PG_PASS@
+      POSTGRES_DB=lake_meta
+runcmd:
+  - systemctl enable --now docker
+  - >-
+    docker run -d --name mssql-ducklake-postgres --restart unless-stopped
+    --env-file /etc/mssql-ducklake/server.env --memory @MEMORY_MB@m --shm-size 1g
+    -p 5432:5432 -v /var/lib/mssql-ducklake-pg:/var/lib/postgresql @PG_IMAGE@
+    -c max_connections=200 -c shared_buffers=3GB -c effective_cache_size=9GB
+    -c maintenance_work_mem=768MB -c work_mem=16MB -c wal_buffers=16MB
+    -c checkpoint_completion_target=0.9 -c min_wal_size=1GB -c max_wal_size=4GB
+    -c random_page_cost=1.1 -c effective_io_concurrency=200
+    -c max_worker_processes=4 -c max_parallel_workers=4 -c max_parallel_workers_per_gather=2
+    -c shared_preload_libraries=pg_stat_statements
+  - >-
+    for i in $(seq 1 60); do docker exec mssql-ducklake-postgres pg_isready -U ducklake -d lake_meta && break; sleep 5; done
+  - docker exec mssql-ducklake-postgres psql -U ducklake -d lake_meta -c "CREATE EXTENSION IF NOT EXISTS pg_stat_statements"
+  - touch /var/lib/mssql-ducklake-ready

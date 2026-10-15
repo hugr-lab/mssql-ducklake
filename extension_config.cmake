@@ -34,3 +34,13 @@ if(NOT DEFINED ENV{DUCKDB_PLATFORM})
       SUBMODULES database-connector
   )
 endif()
+
+# The Azure bench image (specs/021) keeps both lakes' parquet in blob storage (`abfss://`). The 2.0
+# line has no published azure extension, so the image builds it here - only when asked, never in a
+# test, distribution or release build. Pinned to duckdb-azure main, which follows the 2.0 line.
+if(DEFINED ENV{MSSQL_DUCKLAKE_BENCH_AZURE})
+  duckdb_extension_load(azure
+      GIT_URL https://github.com/duckdb/duckdb-azure
+      GIT_TAG bc5778ff4acb286b91544d158a50893cbd64db41
+  )
+endif()

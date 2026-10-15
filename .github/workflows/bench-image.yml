@@ -1,0 +1,103 @@
+# The Azure bench image (specs/021), built here rather than on a paid build agent: the same
+# linux_amd64 build ci.yml runs, with the azure extension added (MSSQL_DUCKLAKE_BENCH_AZURE), staged
+# into a runtime-only image and pushed to GHCR as ghcr.io/hugr-lab/mssql-ducklake-bench:<sha12>.
+# Before a bench: push a bench/ branch, or  gh workflow run bench-image.yml -f ref=<commit>
+name: Bench image
+
+on:
+  # a push to a bench/ branch builds its head: workflow_dispatch can only start a workflow the
+  # default branch already has, and this one arrives on a branch first
+  push:
+    branches: ['bench/**']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: commit, branch or tag to build
+        required: true
+        default: main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: Build and push (linux_amd64)
+    runs-on: ubuntu-24.04
+    env:
+      GEN: ninja
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
+      MSSQL_DUCKLAKE_BENCH_AZURE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache
+
+      - name: Setup vcpkg
+        run: make vcpkg-setup
+
+      # its own key: the azure extension brings the Azure SDK into the manifest
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v6
+        with:
+          path: vcpkg_bincache
+          key: vcpkg-bincache-bench-linux_amd64-${{ hashFiles('.gitmodules', 'extension_config.cmake') }}-${{ github.run_id }}
+          restore-keys: |
+            vcpkg-bincache-bench-linux_amd64-${{ hashFiles('.gitmodules', 'extension_config.cmake') }}-
+            vcpkg-bincache-bench-linux_amd64-
+            vcpkg-bincache-linux_amd64-
+
+      - name: Restore ccache
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: ccache-bench-linux_amd64-${{ hashFiles('.gitmodules') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-bench-linux_amd64-${{ hashFiles('.gitmodules') }}-
+            ccache-linux_amd64-${{ hashFiles('.gitmodules') }}-
+
+      - name: Build
+        run: |
+          EXT_FLAGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache" make
+          ccache -s
+
+      # the image's tree, laid out as the repository is, so the bench scripts' paths hold unchanged
+      - name: Stage the image
+        id: stage
+        run: |
+          set -euo pipefail
+          root=image/opt/mssql-ducklake
+          mkdir -p "$root/build/release/src" "$root/duckdb/src/include"
+          cp build/release/duckdb "$root/build/release/"
+          cp build/release/src/libduckdb.so "$root/build/release/src/"
+          for ext in mssql_ducklake mssql postgres_scanner azure; do
+            mkdir -p "$root/build/release/extension/$ext"
+            cp "build/release/extension/$ext/$ext.duckdb_extension" "$root/build/release/extension/$ext/"
+          done
+          cp duckdb/src/include/duckdb.h "$root/duckdb/src/include/"
+          mkdir -p "$root/scripts" && cp -r scripts/bench "$root/scripts/bench"
+          {
+            echo "mssql-ducklake $(git rev-parse HEAD)"
+            echo "duckdb $(git -C duckdb rev-parse HEAD)"
+            echo "ducklake $(git -C ducklake rev-parse HEAD)"
+            grep -A2 'duckdb_extension_load(mssql$' extension_config.cmake | grep GIT_TAG | sed 's/ *GIT_TAG/mssql/'
+          } >"$root/BUILD_INFO"
+          cat "$root/BUILD_INFO"
+          echo "tag=$(git rev-parse HEAD | cut -c1-12)" >>"$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push
+        run: |
+          image=ghcr.io/${{ github.repository_owner }}/mssql-ducklake-bench:${{ steps.stage.outputs.tag }}
+          docker build -f scripts/bench/azure/Dockerfile -t "$image" image
+          docker push "$image"
+          echo "pushed $image" >>"$GITHUB_STEP_SUMMARY"

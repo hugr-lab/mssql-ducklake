@@ -28,6 +28,8 @@ import re
 import subprocess
 import sys
 
+import bench_env
+
 PHASE = re.compile(r"^phase:(?P<name>[a-z_]+)$")
 TIMING = re.compile(r"Run Time \(s\): real (?P<real>[0-9.]+)")
 
@@ -143,7 +145,7 @@ def main() -> None:
     parser.add_argument("--duckdb", default="build/release/duckdb")
     parser.add_argument("--mssql-dsn", default=os.environ.get("MSSQL_DUCKLAKE_TEST_DSN", ""))
     parser.add_argument("--pg-dsn", default=os.environ.get("MSSQL_DUCKLAKE_PG_DSN", ""))
-    parser.add_argument("--data-path", default="/tmp/ducklake_bench")
+    parser.add_argument("--data-path", default=os.environ.get("MSSQL_DUCKLAKE_BENCH_DATA_ROOT", "/tmp/ducklake_bench"))
     parser.add_argument("--rows", type=int, default=200000)
     parser.add_argument("--commits", type=int, default=25)
     parser.add_argument("--file-commit-rows", type=int, default=100,
@@ -170,7 +172,7 @@ def main() -> None:
     load = (
         "LOAD 'build/release/extension/mssql/mssql.duckdb_extension';\n"
         "LOAD 'build/release/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';\n"
-    )
+    ) + bench_env.preamble()
     # a fresh catalog per backend, so initialization is measured rather than inherited
     reset_mssql = (
         f"ATTACH '{args.mssql_dsn}' AS srv (TYPE mssql);\n"
@@ -181,8 +183,8 @@ def main() -> None:
         "DETACH srv;\n"
     )
     reset_pg = (
-        "INSTALL postgres; LOAD postgres;\n"
-        f"ATTACH '{args.pg_dsn}' AS pg (TYPE postgres);\n"
+        bench_env.pg_load()
+        + f"ATTACH '{args.pg_dsn}' AS pg (TYPE postgres);\n"
         # the schema has to be named through the attached catalog, so switch into it first - the
         # same dance ducklake's own postgres test config does
         "USE pg;\n"

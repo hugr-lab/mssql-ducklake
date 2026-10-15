@@ -25,6 +25,8 @@ import subprocess
 import sys
 import tempfile
 
+import bench_env
+
 PHASE = re.compile(r"^phase:(?P<name>[a-z_]+)$")
 TIMING = re.compile(r"Run Time \(s\): real (?P<real>[0-9.]+)")
 
@@ -73,6 +75,7 @@ LOAD = (
     "LOAD 'build/release/extension/mssql/mssql.duckdb_extension';\n"
     "LOAD 'build/release/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';\n"
 )
+LOAD += bench_env.preamble()
 
 
 #! The catalog lives in a schema of its own. The integration suite resets `dbo` (attach_mssql.test),
@@ -419,7 +422,7 @@ def main() -> None:
 
     results = {}
     for backend in backends:
-        data_path = tempfile.mkdtemp(prefix=f"ducklake_scale_{backend}_")
+        data_path = bench_env.data_path(f"ducklake_scale_{backend}")
         attach = attach_sql(backend, args.mssql_dsn, args.pg_dsn, data_path)
         script = (LOAD
                   + reset_sql(backend, args.mssql_dsn, args.pg_dsn)

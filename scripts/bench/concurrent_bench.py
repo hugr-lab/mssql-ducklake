@@ -31,6 +31,8 @@ import subprocess
 import sys
 import tempfile
 
+import bench_env
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCHEMA = "bench_conc"
 COLUMNS = 40
@@ -57,6 +59,7 @@ def harness_for(build: str, scratch: str) -> str:
 def setup_sql(backend: str, build: str, data_path: str, scenario: str, threads: int) -> str:
     load = ("LOAD '{b}/extension/mssql/mssql.duckdb_extension';\n"
             "LOAD '{b}/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';\n").format(b=build)
+    load += bench_env.preamble()
     pg_build = f"{build}/extension/postgres_scanner/postgres_scanner.duckdb_extension"
     if backend == "postgres":
         load += f"LOAD '{pg_build}';\n" if os.path.exists(pg_build) else "INSTALL postgres; LOAD postgres;\n"
@@ -137,12 +140,14 @@ def redact(text: str) -> str:
 
 
 def run_one(harness: str, scratch: str, backend: str, build: str, scenario: str, threads: int, ops: int) -> dict:
-    data_path = tempfile.mkdtemp(prefix=f"conc_{backend}_{scenario}_{threads}_", dir=scratch)
+    # the SQL files stay local; the lake's own files go under the data root when there is one
+    sql_dir = tempfile.mkdtemp(prefix=f"conc_{backend}_{scenario}_{threads}_", dir=scratch)
+    data_path = bench_env.data_path(f"conc_{backend}_{scenario}_{threads}", scratch)
     files = {}
     for name, text in (("setup", setup_sql(backend, build, data_path, scenario, threads)),
                        ("writer", writer_sql(scenario)[0]), ("reader", READER_SQL),
                        ("check", check_sql(scenario, threads))):
-        path = os.path.join(data_path, f"{name}.sql")
+        path = os.path.join(sql_dir, f"{name}.sql")
         with open(path, "w") as f:
             f.write(text)
         files[name] = path
