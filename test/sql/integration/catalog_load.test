@@ -1,0 +1,202 @@
+# name: test/sql/integration/catalog_load.test
+# description: the catalog load in one T-SQL statement answers what DuckLake's own seven queries do (specs/020)
+# group: [integration]
+
+require-env MSSQL_DUCKLAKE_TEST_DSN
+
+require parquet
+
+# make test-integration runs with MSSQL_DUCKLAKE_VERIFY_CATALOG, so every load below - a fresh attach,
+# a second attach, a time travel - is answered both ways and fails on the first field that differs.
+# This file makes the catalog hold every kind of row the load reads.
+
+statement ok
+SET autoload_known_extensions = false;
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql/mssql.duckdb_extension';
+
+statement ok
+LOAD '__BUILD_DIRECTORY__/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';
+
+statement ok
+ATTACH '${MSSQL_DUCKLAKE_TEST_DSN}' AS srv (TYPE mssql);
+
+statement ok
+SELECT mssql_exec('srv', '
+DECLARE @sql NVARCHAR(MAX) = N'''';
+SELECT @sql += N''DROP TABLE '' + QUOTENAME(s.name) + N''.'' + QUOTENAME(t.name) + N'';''
+FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id WHERE s.name = ''catalog_load'';
+EXEC sp_executesql @sql;
+IF SCHEMA_ID(''catalog_load'') IS NULL EXEC(''CREATE SCHEMA catalog_load'');');
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS a (DATA_PATH '__TEST_DIR__/catalog_load', METADATA_SCHEMA 'catalog_load');
+
+# schemas, nested ones and one with a dot in its name
+statement ok
+CREATE SCHEMA a.s1;
+
+statement ok
+CREATE SCHEMA a.s1.child;
+
+statement ok
+CREATE SCHEMA a."s1.child";
+
+# nested types, defaults, NOT NULL, tags on the table and its columns
+statement ok
+CREATE TABLE a.s1.t(id BIGINT NOT NULL, name VARCHAR DEFAULT 'none', d DATE, s STRUCT(x INTEGER, y STRUCT(z VARCHAR)), l INTEGER[], m MAP(VARCHAR, DOUBLE));
+
+statement ok
+COMMENT ON TABLE a.s1.t IS 'the table';
+
+statement ok
+COMMENT ON COLUMN a.s1.t.name IS 'the name';
+
+statement ok
+INSERT INTO a.s1.t VALUES (1, 'one', DATE '2026-01-01', {'x': 1, 'y': {'z': 'a'}}, [1, 2], MAP {'k': 1.5});
+
+statement ok
+CREATE TABLE a.s1.child.t2 AS SELECT r AS i, r % 3 AS p, DATE '2026-01-01' + r::INTEGER AS d FROM range(30) t(r);
+
+statement ok
+CREATE TABLE a."s1.child".t3(i INTEGER);
+
+# partitioning with transforms, and a sort key
+statement ok
+ALTER TABLE a.s1.child.t2 SET PARTITIONED BY (p, year(d));
+
+statement ok
+ALTER TABLE a.s1.child.t2 SET SORTED BY (i DESC);
+
+statement ok
+INSERT INTO a.s1.child.t2 SELECT r, r % 3, DATE '2027-01-01' + r::INTEGER FROM range(30, 40) t(r);
+
+# views with column aliases and tags on the view and on a view column
+statement ok
+CREATE VIEW a.s1.v(a, b) AS SELECT id, name FROM a.s1.t;
+
+statement ok
+COMMENT ON VIEW a.s1.v IS 'the view';
+
+statement ok
+COMMENT ON COLUMN a.s1.v.a IS 'view column';
+
+# macros: scalar with a default parameter, overloaded, and a table macro
+statement ok
+CREATE MACRO a.s1.add_to(x, y := 2) AS x + y;
+
+statement ok
+CREATE MACRO a.s1.pick(x) AS x, (x, y) AS x + y;
+
+statement ok
+CREATE MACRO a.s1.rows_of(n) AS TABLE SELECT * FROM range(n);
+
+# then the schema keeps changing: a rename, an added and a dropped column, a dropped and re-created table
+statement ok
+ALTER TABLE a."s1.child".t3 RENAME TO t3_renamed;
+
+statement ok
+ALTER TABLE a.s1.t ADD COLUMN extra VARCHAR DEFAULT 'e';
+
+statement ok
+ALTER TABLE a.s1.t DROP COLUMN d;
+
+statement ok
+CREATE TABLE a.s1.gone(i INTEGER);
+
+statement ok
+DROP TABLE a.s1.gone;
+
+statement ok
+CREATE TABLE a.s1.gone(j VARCHAR);
+
+# an inlined insert after the change, so the table has inlined data at two schema versions
+statement ok
+INSERT INTO a.s1.t (id, name) VALUES (2, 'two');
+
+query IIII
+SELECT id, name, extra, s.y.z FROM a.s1.t ORDER BY id;
+----
+1	one	e	a
+2	two	e	NULL
+
+query I
+SELECT a.s1.add_to(1) + a.s1.pick(1, 2) + a.s1.pick(10);
+----
+16
+
+query I
+SELECT count(*) FROM a.s1.rows_of(4);
+----
+4
+
+query I
+SELECT count(*) FROM a.s1.child.t2;
+----
+40
+
+# a second attach of the same catalog loads it from nothing: what another node does
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS b (DATA_PATH '__TEST_DIR__/catalog_load', METADATA_SCHEMA 'catalog_load');
+
+query II
+SELECT a, b FROM b.s1.v ORDER BY a;
+----
+1	one
+2	two
+
+query I
+SELECT comment FROM duckdb_tables() WHERE database_name = 'b' AND table_name = 't';
+----
+the table
+
+query I
+SELECT comment FROM duckdb_columns() WHERE database_name = 'b' AND table_name = 't' AND column_name = 'name';
+----
+the name
+
+query I
+SELECT count(*) FROM b."s1.child".t3_renamed;
+----
+0
+
+query I
+SELECT column_name FROM duckdb_columns() WHERE database_name = 'b' AND table_name = 'gone';
+----
+j
+
+# time travel: the catalog at each of the first twenty snapshots, attached read-only at that version
+loop i 1 21
+
+statement ok
+ATTACH 'ducklake:mssql:${MSSQL_DUCKLAKE_TEST_DSN}' AS old (DATA_PATH '__TEST_DIR__/catalog_load', METADATA_SCHEMA 'catalog_load', SNAPSHOT_VERSION ${i});
+
+statement ok
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'old';
+
+statement ok
+DETACH old;
+
+endloop
+
+query I
+SELECT count(*) > 20 FROM ducklake_snapshots('b');
+----
+true
+
+# the flush reads each table at the schema version its inlined rows were written at
+statement ok
+SELECT count(*) FROM ducklake_flush_inlined_data('a');
+
+query II
+SELECT id, extra FROM b.s1.t ORDER BY id;
+----
+1	e
+2	e
+
+statement ok
+DETACH b;
+
+statement ok
+DETACH a;

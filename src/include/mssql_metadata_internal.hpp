@@ -81,6 +81,20 @@ inline bool StatsCacheDisabled() {
 	return disabled;
 }
 
+//! Off switch for the one-statement catalog load (specs/020): DuckLake's seven queries again, for
+//! measuring and for taking it out of a diagnosis.
+inline bool CatalogStatementDisabled() {
+	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_CATALOG_TSQL") != nullptr;
+	return disabled;
+}
+
+//! specs/020: every catalog load both ways, ours and DuckLake's, failing on the first field that
+//! differs. On in the integration suite; a ducklake bump that adds to the catalog fails it there.
+inline bool VerifyCatalogEnabled() {
+	static const bool enabled = getenv("MSSQL_DUCKLAKE_VERIFY_CATALOG") != nullptr;
+	return enabled;
+}
+
 inline bool LoadRewriteDisabled() {
 	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_LOAD_REWRITE") != nullptr;
 	return disabled;

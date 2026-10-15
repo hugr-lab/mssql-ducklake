@@ -140,6 +140,9 @@ public:
 	//! the rest as they were (specs/019). The server is the truth: a commit of any node is in the
 	//! changes, and anything the cache cannot account for reads everything again.
 	vector<DuckLakeGlobalStatsInfo> GetGlobalTableStats(DuckLakeSnapshot snapshot) override;
+	//! The catalog at a snapshot in one T-SQL statement the server answers alone, instead of DuckLake's
+	//! seven queries through the catalog path (specs/020). No state: every call reads committed rows.
+	DuckLakeCatalogInfo GetCatalogForSnapshot(DuckLakeSnapshot snapshot) override;
 	//! this transaction has written to the catalog: what it reads may be its own uncommitted state,
 	//! which the shared stats cache must neither serve nor keep
 	bool wrote_in_transaction = false;
@@ -188,6 +191,9 @@ private:
 	//! connection.Query, reported to the catalog's query callback when one is set - the statements
 	//! this manager sends past DuckLake's ExecuteRaw, which mssql_ducklake_trace would otherwise miss
 	unique_ptr<QueryResult> TracedQuery(Connection &connection, const string &query);
+	//! specs/020: the one statement, and the verify switch's comparison with the base
+	DuckLakeCatalogInfo LoadCatalogInOneStatement(DuckLakeSnapshot snapshot);
+	static string CatalogDifference(const DuckLakeCatalogInfo &base, const DuckLakeCatalogInfo &ours);
 
 	//! The user's inlined rows as T-SQL (specs/015), so they join the run instead of taking DuckDB's
 	//! DML path, a round trip of their own. A row set with a value we do not render goes to the base

@@ -129,6 +129,8 @@ bench-paths:
 test-integration: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
 # specs/014: a commit statement the T-SQL batch does not recognise fails the suite, naming it
 test-integration: export MSSQL_DUCKLAKE_STRICT_BATCH := 1
+# specs/020: every catalog load is checked against DuckLake's own, field by field
+test-integration: export MSSQL_DUCKLAKE_VERIFY_CATALOG := 1
 # One file while working on it: make test-integration INTEGRATION_TESTS=test/sql/integration/migrate_v11.test
 INTEGRATION_TESTS ?= $(PROJ_DIR)test/sql/integration/*
 test-integration:
@@ -172,6 +174,7 @@ bench-concurrent:
 test-integration-fast-path: export MSSQL_DUCKLAKE_TEST_DSN := $(MSSQL_DUCKLAKE_TEST_DSN)
 test-integration-fast-path: export MSSQL_DUCKLAKE_SERVER_COMMIT := 1
 test-integration-fast-path: export MSSQL_DUCKLAKE_STRICT_BATCH := 1
+test-integration-fast-path: export MSSQL_DUCKLAKE_VERIFY_CATALOG := 1
 test-integration-fast-path:
 	@test -x build/release/test/unittest || { echo "build first: GEN=ninja make"; exit 1; }
 	build/release/test/unittest '$(PROJ_DIR)test/sql/integration/*' 2>&1 | tee build/integration-fast-path.log

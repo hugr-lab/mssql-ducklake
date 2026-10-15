@@ -55,3 +55,4 @@ specs are the shareable distillation of that work.
 | [017](017-async-statistics/spec.md) | asynchronous statistics on the catalog's database | implemented |
 | [018](018-bounded-strings/spec.md) | bounded string columns, chosen at ATTACH (`META_LIMITS`) | implemented |
 | [019](019-global-stats-cache/spec.md) | the global table stats, cached per catalog; deadlocked commits retried | implemented (branch `recon/global-stats-cache`) |
+| [020](020-catalog-load/spec.md) | the catalog load in one T-SQL statement; a mirror behind it, caught up by one query | draft |
