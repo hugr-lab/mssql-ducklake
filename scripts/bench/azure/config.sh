@@ -2,11 +2,12 @@
 # overridden from the environment. Nothing secret lives here: the generated passwords are written to
 # the run's state directory (.state/, gitignored, mode 600) and never printed.
 
-: "${BENCH_LOCATION:=westeurope}"
+: "${BENCH_LOCATION:=swedencentral}"
 : "${BENCH_DATE:=$(date +%Y%m%d)}"
 : "${BENCH_RG:=mssql-ducklake-bench-${BENCH_DATE}}"
-# both catalog servers get this size: the equal hardware the comparison claims
-: "${BENCH_VM_SIZE:=Standard_D4s_v5}"
+# both catalog servers get this size: the equal hardware the comparison claims. 4 vCPU, 16 GiB;
+# v6 because a new subscription's quota has room for Dsv6 and none for Dsv5
+: "${BENCH_VM_SIZE:=Standard_D4s_v6}"
 # the memory each server may use, in MB, of the VM's 16 GiB
 : "${BENCH_SERVER_MEMORY_MB:=12288}"
 # the images: the ones docker/docker-compose.yml runs locally

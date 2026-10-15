@@ -16,22 +16,30 @@ bench_names
 [[ $# -ge 1 ]] || die "usage: run.sh <info|scale|compare|concurrent> [args...]"
 
 step "starting $* (target: ${BENCH_TARGET:-vm})"
-# An execution that overrides the command replaces the job's container spec whole, so the image,
-# resources and environment are passed again as the job holds them - the secrets as references
-# (secretref:<name>), whose values this script never reads.
-container="$(az containerapp job show -g "$BENCH_RG" -n "$BENCH_JOB" --query 'properties.template.containers[0]' -o json)"
-spec() { python3 -c "import json,sys; c=json.load(sys.stdin); print($1)" <<<"$container"; }
-image="$(spec "c['image']")"
-cpu="$(spec "c['resources']['cpu']")"
-memory="$(spec "c['resources']['memory']")"
-env_vars=()
-while IFS= read -r line; do
-	[[ -n "$line" && "$line" != BENCH_TARGET=* ]] && env_vars+=("$line")
-done < <(spec "'\\n'.join(e['name'] + '=' + ('secretref:' + e['secretRef'] if e.get('secretRef') else e.get('value', '')) for e in c.get('env', []))")
-env_vars+=("BENCH_TARGET=${BENCH_TARGET:-vm}")
-execution="$(az containerapp job start -g "$BENCH_RG" -n "$BENCH_JOB" --image "$image" --cpu "$cpu" --memory "$memory" \
-	--command /opt/mssql-ducklake/scripts/bench/azure/entrypoint.sh --args "$@" \
-	--env-vars "${env_vars[@]}" --query name -o tsv)"
+# The execution is started through the REST API with its container spelled out: `az containerapp
+# job start --args` reads any value that starts with a dash as its own option (`--tables` is not
+# one), and the spec it would send replaces the job's container whole anyway. So the job's own
+# container is read and sent back with the workload's command and arguments - its image, resources
+# and environment as the job holds them, the secrets as references, whose values are never read.
+job_id="$(az containerapp job show -g "$BENCH_RG" -n "$BENCH_JOB" --query id -o tsv)"
+body="$(az containerapp job show -g "$BENCH_RG" -n "$BENCH_JOB" --query 'properties.template.containers[0]' -o json |
+	python3 -c '
+import json, sys
+container = json.load(sys.stdin)
+target = sys.argv[1]
+env = [e for e in container.get("env", []) if e["name"] != "BENCH_TARGET"]
+env.append({"name": "BENCH_TARGET", "value": target})
+print(json.dumps({"containers": [{
+    "name": container["name"],
+    "image": container["image"],
+    "command": ["/opt/mssql-ducklake/scripts/bench/azure/entrypoint.sh"],
+    "args": sys.argv[2:],
+    "env": env,
+    "resources": container["resources"],
+}]}))
+' "${BENCH_TARGET:-vm}" "$@")"
+execution="$(az rest --method post --url "https://management.azure.com${job_id}/start?api-version=2024-03-01" \
+	--body "$body" --query name -o tsv)"
 echo "execution $execution" >&2
 
 while true; do

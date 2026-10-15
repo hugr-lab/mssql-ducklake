@@ -28,10 +28,11 @@ fi
 case "${BENCH_DATA:-blob}" in
 blob)
 	export MSSQL_DUCKLAKE_BENCH_DATA_ROOT="abfss://lakes@${account}.dfs.core.windows.net/${run_id}"
-	# the job's user-assigned identity: DefaultAzureCredential (CHAIN 'default') picks it by
-	# AZURE_CLIENT_ID, which up.sh sets; 'managed_identity' alone asks for a system-assigned one
+	# the job's user-assigned identity, named by its client id: the azure extension's managed_identity
+	# provider takes one, where its credential chain's DefaultAzureCredential reads no AZURE_CLIENT_ID
+	# and finds no token (measured: "Failed to get token from ChainedTokenCredential")
 	export MSSQL_DUCKLAKE_BENCH_PREAMBLE="LOAD 'build/release/extension/azure/azure.duckdb_extension';
-CREATE SECRET bench_azure (TYPE azure, PROVIDER credential_chain, CHAIN '${BENCH_AZURE_CHAIN:-default}', ACCOUNT_NAME '${account}');"
+CREATE SECRET bench_azure (TYPE azure, PROVIDER managed_identity, CLIENT_ID '${AZURE_CLIENT_ID:?up.sh sets AZURE_CLIENT_ID}', ACCOUNT_NAME '${account}');"
 	;;
 files)
 	export MSSQL_DUCKLAKE_BENCH_DATA_ROOT="/mnt/lakes/${run_id}"

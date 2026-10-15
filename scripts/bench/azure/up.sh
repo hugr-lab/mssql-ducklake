@@ -129,8 +129,11 @@ render() { # the cloud-init template with this run's values, kept in the state d
 [[ -f "$BENCH_STATE/vm_key" ]] || ssh-keygen -q -t ed25519 -N "" -C mssql-ducklake-bench -f "$BENCH_STATE/vm_key"
 for pair in "$BENCH_VM_MSSQL:cloud-init-sqlserver.yaml" "$BENCH_VM_PG:cloud-init-postgres.yaml"; do
 	vm="${pair%%:*}"
+	# the v6 sizes attach their disks through NVMe only
+	controller=()
+	[[ "$BENCH_VM_SIZE" == *_v6 ]] && controller=(--disk-controller-type NVMe)
 	if ! az vm show -g "$BENCH_RG" -n "$vm" -o none 2>/dev/null; then
-		az vm create -g "$BENCH_RG" -n "$vm" --image Ubuntu2404 --size "$BENCH_VM_SIZE" \
+		az vm create -g "$BENCH_RG" -n "$vm" --image Ubuntu2404 --size "$BENCH_VM_SIZE" "${controller[@]}" \
 			--vnet-name "$BENCH_VNET" --subnet servers --public-ip-address "" --nsg "" \
 			--os-disk-size-gb 128 --storage-sku Premium_LRS --admin-username bench \
 			--ssh-key-values "$BENCH_STATE/vm_key.pub" --custom-data "$(render "${pair#*:}")" --tags "${TAGS[@]}" -o none
