@@ -217,6 +217,22 @@ the repeated call return at once. When 1.1 is final, the repeated calls stop.
 - The prototype tied the two into one stamp (`SHAPE_VERSION` 6 meant "shaped and migrated"), which
   forced the rule "move `SHAPE_VERSION` when the migration changes". With two markers that rule is
   gone: the shaping and the migration move independently.
+- **Several nodes attaching a new catalog** (measured 2026-10-14, `make test-concurrent`, six
+  writer processes per round): 2-3 of 60 writers were lost in one run of three, 1205 in the marker
+  read at ATTACH - on the old pins and the new alike. The deadlock graph: the marker read held S on
+  a `sysxprops` row and waited for Sch-S on `ducklake_metadata`; another node's migration batch held
+  Sch-M there (rewriting the marker) and waited for X on that row. Two defects behind it:
+  - a catalog this build *created* carried no migration marker, so every writable attach until the
+    first migration finished ran the whole batch. The shaping now writes the marker too, when the
+    server says everything the migration adds is there and the version is `1.1-dev1` - which is
+    true of a new catalog;
+  - nothing ordered the three: the shaping took the `mssql_ducklake_shape:<schema>` applock, the
+    migration and the read did not. The migration now runs in a transaction of its own under that
+    lock, exclusive, and re-checks the marker under it - the nodes that waited do nothing; the read
+    takes it shared for its one statement (owned by the session and released in the same batch:
+    held by the attach transaction it would make the attach's own shaping a conversion two
+    attaches deadlock on; the same session holding it exclusively is granted at once, verified).
+  After: 0 of 60 in five runs.
 
 ### R4 — reads: the catalog load is the target
 

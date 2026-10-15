@@ -318,7 +318,7 @@ string MSSQLMetadataManager::ClientMergedStatsSql(DuckLakeTransaction &flush_tra
 			new_globals.initialized = true;
 		}
 		for (auto &file : changes.new_data_files) {
-			new_globals.stats.MergeFileStats(file);
+			new_globals.stats.MergeFileStats(file, file.column_stats);
 		}
 		sql += DuckLakeMetadataManager::UpdateGlobalTableStatsSql(
 		    DuckLakeTransaction::ConvertNewGlobalStats(table_id, new_globals), catalog.SupportsV1_1Metadata());

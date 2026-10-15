@@ -65,7 +65,7 @@ public:
 	//! miss makes the extension reload the whole schema's metadata - with one mssql_scan of
 	//! OBJECT_ID (specs/008 D1).
 	string GetInlinedDeletionTableName(TableIndex table_id, DuckLakeSnapshot snapshot,
-	                                   bool create_if_not_exists = false) override;
+	                                   bool create_if_not_exists = false, bool include_local_changes = true) override;
 
 	//! The inlined table's DDL is ours: its column types are T-SQL, which the duckdb-parsed commit
 	//! batch could not carry, so it is executed separately (specs/004 D2).

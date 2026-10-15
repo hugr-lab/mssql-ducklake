@@ -51,3 +51,13 @@ true
 
 statement ok
 DETACH lake;
+
+# a function that throws is marked fallible: the error is the user's, not an internal one that
+# would invalidate the database (DuckDB 2.0)
+statement error
+SELECT mssql_ducklake_trace('lake', '{TEST_DIR}/trace.log');
+----
+is not an attached DuckLake catalog
+
+statement ok
+SELECT 1;

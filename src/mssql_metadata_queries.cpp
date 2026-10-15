@@ -282,8 +282,12 @@ static idx_t ScalarOf(QueryResult &result, const string &context, idx_t absent) 
 // nothing is warmed and the batch pays the load itself. So they stay on the catalog path.
 
 string MSSQLMetadataManager::GetInlinedDeletionTableName(TableIndex table_id, DuckLakeSnapshot snapshot,
-                                                         bool create_if_not_exists) {
+                                                         bool create_if_not_exists, bool include_local_changes) {
 	auto table_name = InlinedFileDeletionTableName(table_id);
+	// as the base: a reader of local changes reads the flushed deletions from local delete files
+	if (!create_if_not_exists && include_local_changes && transaction.InlinedFileDeletionsFlushed(table_id)) {
+		return string();
+	}
 	if (create_if_not_exists) {
 		// Reached only by a pin whose commit loop asks the virtual WriteNewInlinedFileDeletes; this
 		// one calls the static batch builder and the Execute seam catches the DDL instead. Either
@@ -423,8 +427,10 @@ enum class FileListOutcome { TSQL, KNOWN_LIMIT, UNKNOWN };
 //! The closed list of rewrites that turn DuckLake's file-list query into T-SQL, and the check that
 //! nothing else is left.
 FileListOutcome FileListToTSQL(string &query) {
-	// `col_N_stats.contains_nan` stands alone as a predicate in DuckDB SQL; a BIT is not one in T-SQL
-	query = std::regex_replace(query, std::regex(R"((\bcol_\d+_stats\.contains_nan)\b(?!\s*(=|<>|IS\b)))"), "($1 = 1)");
+	// `col_N_stats.contains_nan` stands alone as a predicate in DuckDB SQL; a BIT is not one in T-SQL.
+	// Selected (`... AS col_N_stats_contains_nan`, the runtime stats) it stays the BIT it is.
+	query = std::regex_replace(query, std::regex(R"((\bcol_\d+_stats\.contains_nan)\b(?!\s*(=|<>|IS\b|AS\b)))"),
+	                           "($1 = 1)");
 	// the bucket-partition clause's `IS DISTINCT FROM n` (SQL Server has it only from 2022)
 	query = std::regex_replace(query, std::regex(R"((\bdata\.partition_id) IS DISTINCT FROM (\d+))"),
 	                           "($1 IS NULL OR $1 <> $2)");
@@ -604,7 +610,7 @@ string MSSQLMetadataManager::GenerateFileListQuery(DuckLakeTableEntry &table, co
 		declarations += ", @" + parameter.name + " " + parameter.declaration;
 	}
 
-	// The shape, given: it follows from the same inputs the select list does (GetFileSelectList,
+	// The shape, given: it follows from the same inputs the select list does (GetDataFileSelectList,
 	// GetDeleteFileSelectList, GenerateFileListQuery), so the bind sends nothing to the server. A
 	// ducklake bump that changes the select list makes the stream disagree, and that is an error
 	// naming the statement - never a misread column.
@@ -621,16 +627,20 @@ string MSSQLMetadataManager::GenerateFileListQuery(DuckLakeTableEntry &table, co
 	string columns;
 	if (file_list_type == FileListType::EXTENDED) {
 		columns = "'data_file_id': 'BIGINT', 'delete_file_id': 'BIGINT', 'record_count': 'BIGINT', " +
-		          file_columns("data") + ", 'row_id_start': 'BIGINT', 'mapping_id': 'BIGINT', " + file_columns("del") +
-		          ", 'del_format': 'VARCHAR', 'begin_snapshot': 'BIGINT'";
+		          file_columns("data") +
+		          ", 'data_unsupported_format': 'VARCHAR', 'row_id_start': 'BIGINT', 'mapping_id': 'BIGINT', " +
+		          file_columns("del") + ", 'del_format': 'VARCHAR', 'begin_snapshot': 'BIGINT'";
 	} else {
 		columns = "'data_file_id': 'BIGINT', " + file_columns("data") +
-		          ", 'row_id_start': 'BIGINT', 'begin_snapshot': 'BIGINT', 'partial_max': 'BIGINT', "
+		          ", 'data_unsupported_format': 'VARCHAR', 'row_id_start': 'BIGINT', 'begin_snapshot': 'BIGINT', "
+		          "'partial_max': 'BIGINT', "
 		          "'mapping_id': 'BIGINT', " +
 		          file_columns("del") + ", 'del_format': 'VARCHAR'";
 		for (auto &column : runtime_filter_stats_columns) {
-			columns += StringUtil::Format(
-			    ", 'col_%llu_stats_min_value': 'VARCHAR', 'col_%llu_stats_max_value': 'VARCHAR'", column, column);
+			columns +=
+			    StringUtil::Format(", 'col_%llu_stats_min_value': 'VARCHAR', 'col_%llu_stats_max_value': 'VARCHAR', "
+			                       "'col_%llu_stats_contains_nan': 'BOOLEAN'",
+			                       column, column, column);
 		}
 	}
 	return StringUtil::Format("SELECT * FROM mssql_scan_params_unsafe({METADATA_CATALOG_NAME_LITERAL}, %s, {%s}, %s, "
