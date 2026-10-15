@@ -170,6 +170,10 @@ def main() -> None:
 
     body = workload(args.rows, args.commits, args.file_commit_rows, args.partitions)
     load = (
+        # loaded by path, so no autoload is needed - and on the duckdb 2.0 line something asks for
+        # `ducklake` by NAME, whose autoload fails against the build's repository (as scale_catalog.py)
+        "SET autoload_known_extensions = false;\n"
+        "SET autoinstall_known_extensions = false;\n"
         "LOAD 'build/release/extension/mssql/mssql.duckdb_extension';\n"
         "LOAD 'build/release/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';\n"
     ) + bench_env.preamble()

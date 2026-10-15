@@ -44,6 +44,15 @@ files)
 	;;
 esac
 
+# DuckDB sizes itself from the node's memory, not the container's: on a 16 GiB node it took 80%
+# of 16 GiB inside a 12 GiB container and was OOM-killed in the first flush. The cgroup's limit,
+# less a margin for the CLI's own allocations, is what it may use.
+limit_bytes="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)"
+if [[ "$limit_bytes" =~ ^[0-9]+$ ]]; then
+	export MSSQL_DUCKLAKE_BENCH_PREAMBLE="SET memory_limit = '$((limit_bytes * 7 / 10 / 1048576))MB';
+${MSSQL_DUCKLAKE_BENCH_PREAMBLE:-}"
+fi
+
 out="/tmp/${workload}-${replica}.txt"
 {
 	echo "# workload: ${workload} $*"
@@ -66,19 +75,29 @@ SELECT * FROM postgres_query('pg', 'SELECT version(), current_setting(''shared_b
 SQL
 }
 
+# the bench's output to the result file and, filtered, to the console: Log Analytics then shows a
+# run in progress rather than only its end. The status is the bench's, not the filter's.
+run_bench() {
+	set +e
+	python3 "$@" 2>&1 | tee -a "$out" | grep --line-buffered -E "^(building|phase |total|run failed)"
+	local codes=("${PIPESTATUS[@]}")
+	set -e
+	status=${codes[0]}
+}
+
 status=0
 case "$workload" in
 info)
 	info_sql | build/release/duckdb -unsigned -box >>"$out" 2>&1 || status=$?
 	;;
 scale)
-	python3 scripts/bench/scale_catalog.py "$@" >>"$out" 2>&1 || status=$?
+	run_bench scripts/bench/scale_catalog.py "$@"
 	;;
 compare)
-	python3 scripts/bench/compare_backends.py "$@" >>"$out" 2>&1 || status=$?
+	run_bench scripts/bench/compare_backends.py "$@"
 	;;
 concurrent)
-	python3 scripts/bench/concurrent_bench.py "$@" >>"$out" 2>&1 || status=$?
+	run_bench scripts/bench/concurrent_bench.py "$@"
 	;;
 *)
 	echo "unknown workload: ${workload} (info, scale, compare, concurrent)" >>"$out"

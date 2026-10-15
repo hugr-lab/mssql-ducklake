@@ -1,6 +1,6 @@
 # Spec 021: postgres and SQL Server catalogs, side by side in Azure
 
-- **Status**: draft
+- **Status**: implemented; first run 2026-10-15 (results below)
 - **Date**: 2026-10-15
 - **Author**: vgsml, with Claude
 
@@ -28,11 +28,13 @@ uses: object storage, not a local disk.
 
 ### D1: what is compared
 
-The main arm uses equal hardware: two identical VMs (Linux, `Standard_D4s_v5`, 4 vCPU, 16 GiB,
+The main arm uses equal hardware: two identical VMs (Linux, `Standard_D4s_v6`, 4 vCPU, 16 GiB,
 Premium SSD).
-- One runs SQL Server 2022 (Developer edition, free license) in the pinned image from
+- One runs SQL Server 2025 (Developer edition, free license) in the pinned image from
   `docker/docker-compose.yml`.
-- The other runs PostgreSQL 17.
+- The other runs PostgreSQL 18, given the settings a 12 GB, 4 CPU server would get (pgtune's OLTP
+  profile). SQL Server sizes its own memory, so leaving postgres at its 128 MB defaults would
+  compare a tuned server with an untuned one.
 - Both run in containers with the same memory limit.
 - The server settings are the ones the repository's compose file uses, with nothing tuned for one
   side only.
@@ -53,7 +55,8 @@ The owner decides whether the managed arm is run. It costs more.
 
 ### D2: one storage, one region
 
-- **One region** (westeurope unless the subscription says otherwise) for every resource. Metadata
+- **One region** for every resource (swedencentral: westeurope refused new resources for this
+  subscription, and a new subscription's vCPU quota there has room for Dsv6 but none for Dsv5). Metadata
   round trips dominate the metadata path, so the client and the servers must be close.
 - **One storage account**, StorageV2 with the hierarchical namespace (ADLS Gen2), Standard LRS.
 - **One container, `lakes`**, with a folder per job execution and per backend inside it. The two
@@ -140,6 +143,83 @@ The draft lives beside this spec. It is published by the owner and covers:
 - the caveats: dev DuckDB, ducklake at a main commit, one region, Developer edition rather than a
   licensed one, the managed arm not equal in memory;
 - how to reproduce the run.
+
+## Results (2026-10-15)
+
+**Setup as run.**
+- Region: swedencentral.
+- Catalog servers: two `Standard_D4s_v6` VMs (4 vCPU, 16 GiB, NVMe Premium SSD):
+  - SQL Server 2025 CU8, `MSSQL_MEMORY_LIMIT_MB=12288`;
+  - PostgreSQL 18.6 with `shared_buffers=3GB` and `effective_cache_size=9GB`.
+- Runner: a Container Apps job on a D4 workload profile (3.5 vCPU, 14 GiB).
+- Lake data: an Azure Files share in the same storage account (`BENCH_DATA=files`; see the
+  findings for why not blob).
+- Build: mssql-ducklake 9e308d2 (specs/020 phases A and B), duckdb bde1b27, ducklake b0d3643a,
+  mssql 412c63f (the same code as 0.3.0's ef1a807).
+
+**`scale --tables 500`, three runs** (backend order mssql/postgres, postgres/mssql, mssql/postgres).
+Median, with min-max:
+
+| phase | SQL Server | PostgreSQL | ratio |
+| --- | ---: | ---: | ---: |
+| `create_tables` | 71.9 s (70-73) | 115.0 s (114-124) | 0.63x |
+| `first_commits` | 26.4 s (26-28) | 33.8 s (33-35) | 0.78x |
+| `second_commits` | 46.1 s (46-49) | 76.5 s (76-82) | 0.60x |
+| `flush_inlined` | 32.5 s (32-33) | 80.5 s (80-84) | 0.40x |
+| `merge_adjacent` | 30.3 s (29-32) | 31.9 s (31-35) | 0.95x |
+| `partitioned_commits` | 60.6 s (59-65) | 67.7 s (63-72) | 0.90x |
+| `partitioned_merge_adjacent` | 30.9 s (30-32) | 66.9 s (66-71) | 0.46x |
+| `deep_history` | 385.7 s (361-431) | 598.9 s (565-608) | 0.64x |
+| `evolution` | 54.0 s (51-54) | 97.0 s (90-98) | 0.56x |
+| `evolution_read_latest` | 7.6 s (7-8) | 17.3 s (17-19) | 0.44x |
+| reads, time travel, reattach | | | 0.8-1.2x |
+| **total** | **759.6 s (724-817)** | **1199.6 s (1157-1242)** | **0.63x** |
+
+The order of the backends does not move the result. The phases where SQL Server wins by the most
+are the catalog's own work: the commits, the flush, the compactions and the schema evolution,
+where specs/014's commit batch and specs/020's catalog load do their part. Where the parquet writes
+dominate, as in `merge_adjacent` and `partitioned_commits`, the two are even.
+
+**`concurrent`** (20 operations per thread; `own_inlined`, `shared_file` and `mixed` at 1, 4 and
+16 threads):
+- SQL Server finished all 12 configurations.
+- PostgreSQL failed 2 of them, both at 16 writers: `own_inlined` and `shared_file`, each ending in
+  "Failed to commit DuckLake". Its retries ran out.
+- With 16 threads on `mixed`, SQL Server ran 19.9 operations a second against 15.7.
+
+**`compare`** did not run: `compare_backends.py` lacked the autoload switch-off that
+`scale_catalog.py` has, and the 2.0 line ends that session. Fixed afterwards. `scale` covers the
+same ground at more scale.
+
+**Cost.** About four and a half hours of resources, roughly $7 at list prices.
+
+## Findings on the way
+
+- **DuckLake's flush needs memory that grows about quadratically with the number of tables.**
+  Measured locally as the peak RSS of a flush:
+
+  | tables | peak RSS |
+  | ---: | ---: |
+  | 150 | 973 MB |
+  | 300 | 3024 MB |
+
+  It is the same with the mirror of specs/020 as without (3024 against 3019 MB). The likely
+  mechanism: the flush transaction pins a full catalog, every table in it, for each schema version
+  it flushes. Extrapolated, 1000 tables needs 20-30 GB. That is why the runner, at 14 GiB, was
+  OOM-killed in the 1000-table flush on blob and on Azure Files alike, and why the bench ran at 500.
+  Postgres catalogs pay it the same way. An upstream issue, still to be raised.
+- **The azure extension's credential chain does not find a user-assigned identity.** Its `default`
+  chain builds `DefaultAzureCredential` with default options, which reads no `AZURE_CLIENT_ID`.
+  `PROVIDER managed_identity` with `CLIENT_ID` does find it.
+- **Blob is slower than Azure Files for this bench's writes.** The bench writes thousands of small
+  files, one per commit, and `deep_history` alone took 370 s at 200 tables on blob.
+- **`az containerapp job start --args` reads any value that starts with a dash as its own
+  option.** `run.sh` therefore starts executions through the REST API, with the container spelled
+  out (image, environment with secret references, resources, volume mounts).
+- **Running unattended.** The tail of the run was one job execution: a shell queue that waited for
+  the running execution through the job's identity and the ARM API, ran the remaining workloads,
+  copied the results to a storage account in a separate resource group, and deleted the bench's
+  resource group itself (the identity held Contributor on that group only). No laptop was needed.
 
 ## Enforcement & security
 

@@ -22,9 +22,9 @@ resource group, created for the run and deleted after it.
 ## A run
 
 ```sh
-BENCH_REF=<commit> scripts/bench/azure/up.sh       # ~15 min; prints nothing secret
+BENCH_REF=<commit> scripts/bench/azure/up.sh       # ~25 min; prints nothing secret
 scripts/bench/azure/run.sh info                     # the parity check: both servers' versions, CPUs, memory
-scripts/bench/azure/run.sh scale --tables 1000      # repeat 3x; the backends' order alternates by run
+scripts/bench/azure/run.sh scale --tables 500       # 3x, alternating --backends mssql,postgres / postgres,mssql
 scripts/bench/azure/run.sh compare --repeat 3
 scripts/bench/azure/run.sh concurrent --threads 1,2,4,8,16
 scripts/bench/azure/down.sh                         # deletes the resource group, then the local secrets
@@ -35,12 +35,28 @@ Each `run.sh` waits for its execution and downloads the result to
 and PostgreSQL Flexible Server, ~$1.1/h more) is `BENCH_MANAGED=1 up.sh`, and then
 `BENCH_TARGET=managed run.sh ...`.
 
+## What the first run taught (specs/021, Results and Findings)
+
+- **Quota and region.** A new subscription may have no quota for a VM family, and a region may
+  refuse new resources: swedencentral and `Standard_D4s_v6` are the defaults for that reason. Check
+  with `az vm list-usage -l <region>`.
+- **The 1000-table flush** needs 20-30 GB on the runner (DuckLake's flush pins a full catalog per
+  schema version), past what a D4 profile has. 500 tables fit. That is DuckLake's, and postgres
+  pays it too.
+- **`BENCH_DATA=files`** was what the run used. Blob works (`abfss://`, the identity by client id)
+  but is slow for a bench that writes thousands of one-row files.
+- **Unattended.** With no laptop online, the rest of a run can be one execution: a shell queue that
+  waits for the running execution through the identity's ARM token, runs the workloads, copies the
+  results to a storage account in another resource group, and deletes the bench's group. The
+  identity then needs Contributor on that group and Storage Blob Data Contributor on the results
+  account.
+
 ## Settings
 
 All of them are in `config.sh`, and every one can be overridden from the environment:
 
-- `BENCH_LOCATION` (westeurope);
-- `BENCH_VM_SIZE` (Standard_D4s_v5);
+- `BENCH_LOCATION` (swedencentral);
+- `BENCH_VM_SIZE` (Standard_D4s_v6);
 - `BENCH_SERVER_MEMORY_MB` (12288 for both servers);
 - `BENCH_DATA`: `blob` uses `abfss://` and the azure extension; `files` mounts an Azure Files share,
   for when the azure extension does not build on the pinned duckdb;
@@ -48,7 +64,7 @@ All of them are in `config.sh`, and every one can be overridden from the environ
 
 ## What it costs, and the guard rails
 
-About $1.5 an hour for the main arm (two D4s_v5 VMs, a 4 vCPU Container Apps profile, a NAT gateway,
+About $1.5 an hour for the main arm (two D4s_v6 VMs, a 4 vCPU Container Apps profile, a NAT gateway,
 storage), so an evening of runs comes to about $6. specs/021 D5 has the table.
 
 - **Budget alert.** The resource group has one at `BENCH_BUDGET_USD`, mailed to the signed-in

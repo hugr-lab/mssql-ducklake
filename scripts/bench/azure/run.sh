@@ -36,6 +36,7 @@ print(json.dumps({"containers": [{
     "args": sys.argv[2:],
     "env": env,
     "resources": container["resources"],
+    **({"volumeMounts": container["volumeMounts"]} if container.get("volumeMounts") else {}),
 }]}))
 ' "${BENCH_TARGET:-vm}" "$@")"
 execution="$(az rest --method post --url "https://management.azure.com${job_id}/start?api-version=2024-03-01" \

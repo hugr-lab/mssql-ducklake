@@ -53,8 +53,12 @@ az rest --method put -o none \
 		\"actual100\":{\"enabled\":true,\"operator\":\"GreaterThan\",\"threshold\":100,\"contactEmails\":[\"${ME}\"]}}}}"
 
 step "network: VNet, the servers' NSG, a NAT gateway for outbound"
-az network vnet create -g "$BENCH_RG" -n "$BENCH_VNET" --address-prefixes 10.42.0.0/16 \
-	--subnet-name servers --subnet-prefixes 10.42.1.0/24 --tags "${TAGS[@]}" -o none
+# created once: a second create re-PUTs the VNet with its first subnet only and tries to delete
+# the others, which Azure refuses for the one Container Apps occupies
+if ! az network vnet show -g "$BENCH_RG" -n "$BENCH_VNET" -o none 2>/dev/null; then
+	az network vnet create -g "$BENCH_RG" -n "$BENCH_VNET" --address-prefixes 10.42.0.0/16 \
+		--subnet-name servers --subnet-prefixes 10.42.1.0/24 --tags "${TAGS[@]}" -o none
+fi
 az network vnet subnet create -g "$BENCH_RG" --vnet-name "$BENCH_VNET" -n aca \
 	--address-prefixes 10.42.4.0/23 --delegations Microsoft.App/environments -o none 2>/dev/null ||
 	az network vnet subnet update -g "$BENCH_RG" --vnet-name "$BENCH_VNET" -n aca \
@@ -213,18 +217,20 @@ else
 	az containerapp job update -g "$BENCH_RG" -n "$BENCH_JOB" --image "$IMAGE" --set-env-vars "${ENV_ARGS[@]}" -o none
 fi
 if [[ "$BENCH_DATA" == files ]]; then
-	# mount the share at /mnt/lakes: the job's YAML is the only place a volume can be declared
-	az containerapp job show -g "$BENCH_RG" -n "$BENCH_JOB" -o yaml >"$BENCH_STATE/job.yaml"
-	python3 - "$BENCH_STATE/job.yaml" <<'PY'
-import sys, re
+	# mount the share at /mnt/lakes: a volume can only be declared in the job's template, so the job
+	# is read as JSON (which is YAML), given the volume and the mount, and written back
+	az containerapp job show -g "$BENCH_RG" -n "$BENCH_JOB" -o json >"$BENCH_STATE/job.json"
+	python3 - "$BENCH_STATE/job.json" <<'PY'
+import json, sys
 path = sys.argv[1]
-text = open(path).read()
-if "volumeMounts" not in text:
-    text = re.sub(r"(\n(\s+)image: .*\n)", r"\1\2volumeMounts:\n\2- mountPath: /mnt/lakes\n\2  volumeName: lakes\n", text, count=1)
-    text = re.sub(r"(\n(\s+)containers:\n)", r"\n\2volumes:\n\2- name: lakes\n\2  storageName: lakes\n\2  storageType: AzureFile\1", text, count=1)
-open(path, "w").write(text)
+job = json.load(open(path))
+template = job["properties"]["template"]
+template["volumes"] = [{"name": "lakes", "storageName": "lakes", "storageType": "AzureFile"}]
+for container in template["containers"]:
+    container["volumeMounts"] = [{"mountPath": "/mnt/lakes", "volumeName": "lakes"}]
+json.dump(job, open(path, "w"))
 PY
-	az containerapp job update -g "$BENCH_RG" -n "$BENCH_JOB" --yaml "$BENCH_STATE/job.yaml" -o none
+	az containerapp job update -g "$BENCH_RG" -n "$BENCH_JOB" --yaml "$BENCH_STATE/job.json" -o none
 fi
 
 cat >"$BENCH_STATE/outputs.env" <<EOF
