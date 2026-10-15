@@ -2,8 +2,11 @@
 #include "mssql_metadata_internal.hpp"
 
 #include <algorithm>
+#include <mutex>
+#include <unordered_map>
 
 #include "common/ducklake_util.hpp"
+#include "duckdb/storage/object_cache.hpp"
 #include "storage/ducklake_catalog.hpp"
 #include "storage/ducklake_transaction.hpp"
 
@@ -11,172 +14,332 @@ namespace duckdb {
 
 // The catalog load (specs/020). DuckLake rebuilds its catalog at a snapshot from fifteen tables in
 // seven queries (BuildCatalogForSnapshot); through the catalog path every one of them is several
-// scans joined on the client, each a round trip. Here it is one statement the server answers
-// alone: a UNION ALL of one branch per kind of row, tagged by `k`, in one fixed shape. DuckDB orders
-// the rows by `k` and the order keys o1-o4, which encode the base's own ORDER BYs, so they are
-// built in the order the base builds them. Nothing is cached - every load is a
-// fresh read of committed rows, which is why another node writing the same catalog cannot make it
-// wrong.
+// scans joined on the client, each a round trip. Here the catalog's rows come from one statement
+// the server answers alone - a UNION ALL of one branch per table, in one tagged shape, each
+// versioned row with its begin and end snapshot - and the client joins, filters and orders them
+// into the structure the base builds (phase A).
+//
+// The same rows are kept per attached catalog (phase B, the mirror): every row of the catalog's
+// history once, then only what changed since, in one small statement. A rebuild at a snapshot the
+// mirror has caught up to reads nothing - which is every rebuild a flush or a compaction makes, one
+// per table, each at the schema version that table was written at. Committed history does not
+// change: a row's begin_snapshot is written by the commit that inserts it, its end_snapshot once by
+// the commit that ends it. So a mirror is never wrong, only behind, and behind costs one catch-up.
 
 namespace {
 
 enum CatalogRowKind : int64_t {
 	SCHEMA_ROW = 1,
 	TABLE_ROW = 2,
-	TAG_ROW = 3,
-	COLUMN_TAG_ROW = 4,
-	INLINED_TABLE_ROW = 5,
-	VIEW_ROW = 6,
-	VIEW_COLUMN_TAG_ROW = 7,
-	MACRO_ROW = 8,
-	MACRO_IMPL_ROW = 9,
-	MACRO_PARAMETER_ROW = 10,
-	PARTITION_ROW = 11,
-	SORT_ROW = 12
+	COLUMN_ROW = 3,
+	TAG_ROW = 4,
+	COLUMN_TAG_ROW = 5,
+	INLINED_TABLE_ROW = 6,
+	VIEW_ROW = 7,
+	VIEW_COLUMN_TAG_ROW = 8,
+	MACRO_ROW = 9,
+	MACRO_IMPL_ROW = 10,
+	MACRO_PARAMETER_ROW = 11,
+	PARTITION_ROW = 12,
+	PARTITION_COLUMN_ROW = 13,
+	SORT_ROW = 14,
+	SORT_EXPRESSION_ROW = 15,
+	META_ROW = 16
 };
 
-// the columns of every row: k, the order keys o1-o4, ids i1-i4, one uuid, strings s1-s7, flags b1-b2
-const char *const CATALOG_COLUMNS =
-    "'k': 'BIGINT', 'o1': 'BIGINT', 'o2': 'BIGINT', 'o3': 'BIGINT', 'o4': 'BIGINT', 'i1': 'BIGINT', 'i2': 'BIGINT', "
-    "'i3': 'BIGINT', 'i4': 'BIGINT', 'u': 'UUID', 's1': 'VARCHAR', 's2': 'VARCHAR', 's3': 'VARCHAR', 's4': 'VARCHAR', "
-    "'s5': 'VARCHAR', 's6': 'VARCHAR', 's7': 'VARCHAR', 'b1': 'BOOLEAN', 'b2': 'BOOLEAN'";
-enum CatalogColumn : idx_t { K, O1, O2, O3, O4, I1, I2, I3, I4, U, S1, S2, S3, S4, S5, S6, S7, B1, B2 };
-
-//! One branch: `select` lists the nineteen columns in order, NULL where the kind has nothing.
-string Branch(const string &select, const string &from) {
-	return "SELECT " + select + " FROM " + from;
-}
-
-string Visible(const string &alias) {
-	return StringUtil::Format("%s.begin_snapshot <= @s AND (@s < %s.end_snapshot OR %s.end_snapshot IS NULL)", alias,
-	                          alias, alias);
-}
-
-//! The statement. `uuid`, strings and flags are typed per column so the branches agree without a
-//! conversion the server would have to guess; the strings are the catalog's own columns, which the
-//! shaping gave one collation (specs/006), so the UNION never has two to reconcile. The NULL
-//! placeholders are VARCHAR(1): a column of the UNION takes the widest branch, and a MAX placeholder
-//! made every string column MAX - 26 ms of server CPU a load for 300 tables, against 14.
-string CatalogStatement(const string &schema, bool v1_1) {
-	const string n = "CAST(NULL AS BIGINT)";
-	const string nu = "CAST(NULL AS UNIQUEIDENTIFIER)";
-	const string ns = "CAST(NULL AS VARCHAR(1))";
-	const string nb = "CAST(NULL AS BIT)";
-	auto t = [&](const string &name) {
-		return schema + "." + name;
-	};
-	vector<string> branches;
-	// schemas, by id
-	branches.push_back(
-	    Branch(StringUtil::Format("CAST(%d AS BIGINT), sch.schema_id, 0, 0, 0, sch.schema_id, %s, %s, %s, "
-	                              "sch.schema_uuid, sch.schema_name, sch.path, %s, %s, %s, %s, %s, "
-	                              "sch.path_is_relative, %s",
-	                              SCHEMA_ROW, v1_1 ? "sch.parent_schema_id" : n, n, n, ns, ns, ns, ns, ns, nb),
-	           t("ducklake_schema") + " sch WHERE " + Visible("sch")));
-	// tables with their visible columns: table_id, parent_column NULLS FIRST, column_order - the base's
-	// ORDER BY. The column filter sits in the join (as the load rewrite of specs/015 puts it): a table
-	// keeps its row when it has no visible column, and the client refuses it as the base does.
-	branches.push_back(Branch(
-	    StringUtil::Format("CAST(%d AS BIGINT), tbl.table_id, CASE WHEN col.parent_column IS NULL THEN 0 ELSE 1 END, "
-	                       "ISNULL(col.parent_column, 0), ISNULL(col.column_order, 0), tbl.table_id, tbl.schema_id, "
-	                       "col.column_id, col.parent_column, tbl.table_uuid, tbl.table_name, tbl.path, "
-	                       "col.column_name, col.column_type, col.initial_default, col.default_value, "
-	                       "col.default_value_type, tbl.path_is_relative, col.nulls_allowed",
-	                       TABLE_ROW),
-	    t("ducklake_table") + " tbl LEFT JOIN " + t("ducklake_column") + " col ON col.table_id = tbl.table_id AND " +
-	        Visible("col") + " WHERE " + Visible("tbl")));
-	// the tags of tables and views alike: object ids are catalog ids, shared by both
-	branches.push_back(
-	    Branch(StringUtil::Format("CAST(%d AS BIGINT), tag.object_id, 0, 0, 0, tag.object_id, %s, %s, %s, %s, "
-	                              "tag.[key], tag.[value], %s, %s, %s, %s, %s, %s, %s",
-	                              TAG_ROW, n, n, n, nu, ns, ns, ns, ns, ns, nb, nb),
-	           t("ducklake_tag") + " tag WHERE " + Visible("tag")));
-	branches.push_back(
-	    Branch(StringUtil::Format("CAST(%d AS BIGINT), ct.table_id, ct.column_id, 0, 0, ct.table_id, ct.column_id, "
-	                              "%s, %s, %s, ct.[key], ct.[value], %s, %s, %s, %s, %s, %s, %s",
-	                              COLUMN_TAG_ROW, n, n, nu, ns, ns, ns, ns, ns, nb, nb),
-	           t("ducklake_column_tag") + " ct WHERE " + Visible("ct")));
-	// every inlined data table, with no snapshot filter - as the base reads them
-	branches.push_back(
-	    Branch(StringUtil::Format("CAST(%d AS BIGINT), idt.table_id, idt.schema_version, 0, 0, idt.table_id, "
-	                              "idt.schema_version, %s, %s, %s, idt.table_name, %s, %s, %s, %s, %s, "
-	                              "%s, %s, %s",
-	                              INLINED_TABLE_ROW, n, n, nu, ns, ns, ns, ns, ns, ns, nb, nb),
-	           t("ducklake_inlined_data_tables") + " idt"));
-	branches.push_back(
-	    Branch(StringUtil::Format("CAST(%d AS BIGINT), vw.view_id, 0, 0, 0, vw.view_id, vw.schema_id, %s, %s, "
-	                              "vw.view_uuid, vw.view_name, vw.dialect, vw.[sql], vw.column_aliases, "
-	                              "%s, %s, %s, %s, %s",
-	                              VIEW_ROW, n, n, ns, ns, ns, nb, nb),
-	           t("ducklake_view") + " vw WHERE " + Visible("vw")));
-	if (v1_1) {
-		branches.push_back(
-		    Branch(StringUtil::Format("CAST(%d AS BIGINT), vct.view_id, 0, 0, 0, vct.view_id, %s, %s, %s, %s, "
-		                              "vct.column_name, vct.[key], vct.[value], %s, %s, %s, %s, %s, %s",
-		                              VIEW_COLUMN_TAG_ROW, n, n, n, nu, ns, ns, ns, ns, nb, nb),
-		           t("ducklake_view_column_tag") + " vct WHERE " + Visible("vct")));
+//! the kinds that carry begin_snapshot/end_snapshot; the rest belong to a versioned parent
+bool IsVersioned(int64_t kind) {
+	switch (kind) {
+	case SCHEMA_ROW:
+	case TABLE_ROW:
+	case COLUMN_ROW:
+	case TAG_ROW:
+	case COLUMN_TAG_ROW:
+	case VIEW_ROW:
+	case VIEW_COLUMN_TAG_ROW:
+	case MACRO_ROW:
+	case PARTITION_ROW:
+	case SORT_ROW:
+		return true;
+	default:
+		return false;
 	}
-	branches.push_back(
-	    Branch(StringUtil::Format("CAST(%d AS BIGINT), mac.macro_id, 0, 0, 0, mac.schema_id, mac.macro_id, %s, %s, "
-	                              "%s, mac.macro_name, %s, %s, %s, %s, %s, %s, %s, %s",
-	                              MACRO_ROW, n, n, nu, ns, ns, ns, ns, ns, ns, nb, nb),
-	           t("ducklake_macro") + " mac WHERE " + Visible("mac")));
-	// the implementations and parameters of the visible macros
-	auto visible_macro = [&](const string &alias) {
-		return StringUtil::Format("EXISTS (SELECT 1 FROM %s mac WHERE mac.macro_id = %s.macro_id AND %s)",
-		                          t("ducklake_macro"), alias, Visible("mac"));
+}
+
+// the shape of every row: the kind, five ids, begin/end snapshot, one uuid, six strings, two flags
+const char *const CATALOG_COLUMNS =
+    "'k': 'BIGINT', 'i1': 'BIGINT', 'i2': 'BIGINT', 'i3': 'BIGINT', 'i4': 'BIGINT', 'i5': 'BIGINT', 'bs': 'BIGINT', "
+    "'es': 'BIGINT', 'u': 'UUID', 's1': 'VARCHAR', 's2': 'VARCHAR', 's3': 'VARCHAR', 's4': 'VARCHAR', 's5': 'VARCHAR', "
+    "'s6': 'VARCHAR', 'f1': 'BOOLEAN', 'f2': 'BOOLEAN'";
+const vector<string> SLOTS = {"i1", "i2", "i3", "i4", "i5", "bs", "es", "u",
+                              "s1", "s2", "s3", "s4", "s5", "s6", "f1", "f2"};
+
+//! One row of the catalog, copied out of its chunk.
+struct CatalogRow {
+	int64_t kind = 0;
+	int64_t ids[5] = {0, 0, 0, 0, 0};
+	bool id_null[5] = {true, true, true, true, true};
+	int64_t begin = 0;
+	bool begin_null = true;
+	int64_t end = 0;
+	bool end_null = true;
+	string uuid;
+	string strings[6];
+	bool string_null[6] = {true, true, true, true, true, true};
+	bool flags[2] = {false, false};
+
+	uint64_t Id(idx_t i) const {
+		return static_cast<uint64_t>(ids[i]);
+	}
+	bool VisibleAt(idx_t snapshot) const {
+		if (!IsVersioned(kind)) {
+			return true;
+		}
+		auto s = static_cast<int64_t>(snapshot);
+		return !begin_null && begin <= s && (end_null || s < end);
+	}
+	//! what makes this row this row: its key columns and, for a version, the snapshot it began at
+	string Key() const {
+		string key = to_string(kind);
+		idx_t key_ids = 0;
+		switch (kind) {
+		case COLUMN_ROW:
+		case COLUMN_TAG_ROW:
+		case INLINED_TABLE_ROW:
+		case MACRO_IMPL_ROW:
+		case PARTITION_COLUMN_ROW:
+		case SORT_EXPRESSION_ROW:
+			key_ids = 2;
+			break;
+		case MACRO_PARAMETER_ROW:
+			key_ids = 3;
+			break;
+		default:
+			key_ids = 1;
+		}
+		for (idx_t i = 0; i < key_ids; i++) {
+			key += "|" + to_string(ids[i]);
+		}
+		if (IsVersioned(kind)) {
+			key += "|" + to_string(begin);
+		}
+		if (kind == TAG_ROW || kind == COLUMN_TAG_ROW) {
+			key += "|" + strings[0];
+		} else if (kind == VIEW_COLUMN_TAG_ROW) {
+			key += "|" + strings[0] + "|" + strings[1];
+		}
+		return key;
+	}
+};
+
+CatalogRow ReadRow(DataChunk &chunk, idx_t row) {
+	CatalogRow out;
+	auto number = [&](idx_t column, int64_t &value, bool &is_null) {
+		is_null = FlatVector::IsNull(chunk.data[column], row);
+		value = is_null ? 0 : FlatVector::GetData<int64_t>(chunk.data[column])[row];
 	};
-	branches.push_back(
-	    Branch(StringUtil::Format("CAST(%d AS BIGINT), imp.macro_id, imp.impl_id, 0, 0, imp.macro_id, imp.impl_id, "
-	                              "%s, %s, %s, imp.dialect, imp.[sql], imp.[type], %s, %s, %s, %s, %s, %s",
-	                              MACRO_IMPL_ROW, n, n, nu, ns, ns, ns, ns, nb, nb),
-	           t("ducklake_macro_impl") + " imp WHERE " + visible_macro("imp")));
-	branches.push_back(
-	    Branch(StringUtil::Format("CAST(%d AS BIGINT), par.macro_id, par.impl_id, par.column_id, 0, par.macro_id, "
-	                              "par.impl_id, par.column_id, %s, %s, par.parameter_name, "
-	                              "par.parameter_type, par.default_value, par.default_value_type, %s, %s, "
-	                              "%s, %s, %s",
-	                              MACRO_PARAMETER_ROW, n, nu, ns, ns, ns, nb, nb),
-	           t("ducklake_macro_parameters") + " par WHERE " + visible_macro("par")));
-	// partitions and sorts: table_id, then the spec's id, then the key - the base's ORDER BY
-	branches.push_back(
-	    Branch(StringUtil::Format("CAST(%d AS BIGINT), part.table_id, part.partition_id, pc.partition_key_index, 0, "
-	                              "part.partition_id, part.table_id, pc.partition_key_index, "
-	                              "pc.column_id, %s, pc.transform, %s, %s, %s, %s, %s, %s, %s, %s",
-	                              PARTITION_ROW, nu, ns, ns, ns, ns, ns, ns, nb, nb),
-	           t("ducklake_partition_info") + " part JOIN " + t("ducklake_partition_column") +
-	               " pc ON pc.partition_id = part.partition_id WHERE " + Visible("part")));
-	branches.push_back(
-	    Branch(StringUtil::Format("CAST(%d AS BIGINT), srt.table_id, srt.sort_id, se.sort_key_index, 0, srt.sort_id, "
-	                              "srt.table_id, se.sort_key_index, %s, %s, se.expression, se.dialect, "
-	                              "se.sort_direction, se.null_order, %s, %s, %s, %s, %s",
-	                              SORT_ROW, n, nu, ns, ns, ns, nb, nb),
-	           t("ducklake_sort_info") + " srt JOIN " + t("ducklake_sort_expression") +
-	               " se ON se.sort_id = srt.sort_id WHERE " + Visible("srt")));
-	// No ORDER BY here: sorting every row, wide strings and all, was most of the statement's cost on the
-	// server (14 ms of CPU a load for 300 tables, against 9 without). DuckDB orders them on arrival.
-	return StringUtil::Join(branches, "\nUNION ALL\n");
+	bool kind_null;
+	number(0, out.kind, kind_null);
+	for (idx_t i = 0; i < 5; i++) {
+		number(1 + i, out.ids[i], out.id_null[i]);
+	}
+	number(6, out.begin, out.begin_null);
+	number(7, out.end, out.end_null);
+	if (!FlatVector::IsNull(chunk.data[8], row)) {
+		out.uuid = chunk.GetValue(8, row).ToString();
+	}
+	for (idx_t i = 0; i < 6; i++) {
+		out.string_null[i] = FlatVector::IsNull(chunk.data[9 + i], row);
+		if (!out.string_null[i]) {
+			out.strings[i] = FlatVector::GetData<string_t>(chunk.data[9 + i])[row].GetString();
+		}
+	}
+	for (idx_t i = 0; i < 2; i++) {
+		out.flags[i] =
+		    !FlatVector::IsNull(chunk.data[15 + i], row) && FlatVector::GetData<bool>(chunk.data[15 + i])[row];
+	}
+	return out;
 }
 
-bool IsNull(DataChunk &chunk, idx_t column, idx_t row) {
-	return FlatVector::IsNull(chunk.data[column], row);
+//! What the statement reads: the catalog at one snapshot (phase A), every row of its history that
+//! a live snapshot can still see (the mirror's first load), what changed after a snapshot, or only
+//! whether the inlined data tables moved - they change without a snapshot, so a mirror that answers
+//! from what it holds asks that much first.
+enum class CatalogRead { AT_SNAPSHOT, HISTORY, CHANGES, INLINED };
+
+struct BranchBuilder {
+	const string &schema;
+	CatalogRead read;
+	vector<string> branches;
+
+	string Table(const string &name) const {
+		return schema + "." + name;
+	}
+	//! the rows of a versioned table this read wants
+	string Versioned(const string &alias) const {
+		switch (read) {
+		case CatalogRead::AT_SNAPSHOT:
+			return StringUtil::Format("%s.begin_snapshot <= @s AND (@s < %s.end_snapshot OR %s.end_snapshot IS NULL)",
+			                          alias, alias, alias);
+		case CatalogRead::HISTORY:
+			// a row that ended at or before the oldest snapshot is invisible to every snapshot left
+			return StringUtil::Format("(%s.end_snapshot IS NULL OR %s.end_snapshot > @oldest)", alias, alias);
+		default:
+			return StringUtil::Format("(%s.begin_snapshot > @a OR %s.end_snapshot > @a)", alias, alias);
+		}
+	}
+	//! the children of the parents this read wants: a new parent's children came with it
+	string Children(const string &parent_table, const string &key, const string &alias) const {
+		auto parent = read == CatalogRead::CHANGES ? string("p.begin_snapshot > @a") : Versioned("p");
+		return StringUtil::Format("EXISTS (SELECT 1 FROM %s p WHERE p.%s = %s.%s AND %s)", Table(parent_table), key,
+		                          alias, key, parent);
+	}
+	//! one branch: the given slots filled, the rest typed NULLs
+	void Add(int64_t kind, const map<string, string> &slots, const string &from) {
+		string select = StringUtil::Format("CAST(%lld AS BIGINT)", static_cast<long long>(kind));
+		for (auto &slot : SLOTS) {
+			auto entry = slots.find(slot);
+			if (entry != slots.end()) {
+				select += ", " + entry->second;
+			} else if (slot[0] == 'u') {
+				select += ", CAST(NULL AS UNIQUEIDENTIFIER)";
+			} else if (slot[0] == 's') {
+				// VARCHAR(1): a UNION column takes its widest branch, and MAX made every string MAX
+				select += ", CAST(NULL AS VARCHAR(1))";
+			} else if (slot[0] == 'f') {
+				select += ", CAST(NULL AS BIT)";
+			} else {
+				select += ", CAST(NULL AS BIGINT)";
+			}
+		}
+		branches.push_back("SELECT " + select + " FROM " + from);
+	}
+	void AddVersioned(int64_t kind, map<string, string> slots, const string &table, const string &alias) {
+		slots["bs"] = alias + ".begin_snapshot";
+		slots["es"] = alias + ".end_snapshot";
+		Add(kind, slots, Table(table) + " " + alias + " WHERE " + Versioned(alias));
+	}
+};
+
+//! The mirror's reads start with the snapshots, in a statement of their own and before anything
+//! else: once snapshot @latest is seen committed, every snapshot up to it is (a commit takes the
+//! next id under the primary key, so none overtakes another). Whatever a branch read after it sees
+//! past it is a committed fact too, read again next time - never one missed.
+string MirrorPreamble(const BranchBuilder &b) {
+	return StringUtil::Format(
+	    "DECLARE @latest BIGINT = (SELECT MAX(snapshot_id) FROM %s);\n"
+	    "DECLARE @oldest BIGINT = (SELECT MIN(snapshot_id) FROM %s);\n"
+	    "DECLARE @n BIGINT, @c BIGINT;\n"
+	    "SELECT @n = COUNT_BIG(*), @c = ISNULL(CHECKSUM_AGG(CHECKSUM(table_id, schema_version, table_name)), 0) "
+	    "FROM %s;\n",
+	    b.Table("ducklake_snapshot"), b.Table("ducklake_snapshot"), b.Table("ducklake_inlined_data_tables"));
 }
 
-uint64_t Id(DataChunk &chunk, idx_t column, idx_t row) {
-	return static_cast<uint64_t>(FlatVector::GetData<int64_t>(chunk.data[column])[row]);
+void AddMeta(BranchBuilder &b) {
+	b.Add(META_ROW, {{"i1", "@latest"}, {"i2", "@oldest"}, {"i3", "@n"}, {"i4", "@c"}}, "(SELECT 1 AS one) meta");
 }
 
-string Str(DataChunk &chunk, idx_t column, idx_t row) {
-	return FlatVector::GetData<string_t>(chunk.data[column])[row].GetString();
-}
+string CatalogStatement(const string &schema, bool v1_1, CatalogRead read) {
+	BranchBuilder b {schema, read, {}};
+	if (read == CatalogRead::INLINED) {
+		b.Add(INLINED_TABLE_ROW, {{"i1", "idt.table_id"}, {"i2", "idt.schema_version"}, {"s1", "idt.table_name"}},
+		      b.Table("ducklake_inlined_data_tables") + " idt WHERE @n <> @known_n OR @c <> @known_c");
+		AddMeta(b);
+		return MirrorPreamble(b) + StringUtil::Join(b.branches, "\nUNION ALL\n");
+	}
+	map<string, string> schema_slots = {{"i1", "sch.schema_id"},
+	                                    {"u", "sch.schema_uuid"},
+	                                    {"s1", "sch.schema_name"},
+	                                    {"s2", "sch.path"},
+	                                    {"f1", "sch.path_is_relative"}};
+	if (v1_1) {
+		schema_slots["i2"] = "sch.parent_schema_id";
+	}
+	b.AddVersioned(SCHEMA_ROW, schema_slots, "ducklake_schema", "sch");
+	b.AddVersioned(TABLE_ROW,
+	               {{"i1", "tbl.table_id"},
+	                {"i2", "tbl.schema_id"},
+	                {"u", "tbl.table_uuid"},
+	                {"s1", "tbl.table_name"},
+	                {"s2", "tbl.path"},
+	                {"f1", "tbl.path_is_relative"}},
+	               "ducklake_table", "tbl");
+	b.AddVersioned(COLUMN_ROW,
+	               {{"i1", "col.table_id"},
+	                {"i2", "col.column_id"},
+	                {"i3", "col.column_order"},
+	                {"i4", "col.parent_column"},
+	                {"s1", "col.column_name"},
+	                {"s2", "col.column_type"},
+	                {"s3", "col.initial_default"},
+	                {"s4", "col.default_value"},
+	                {"s5", "col.default_value_type"},
+	                {"f1", "col.nulls_allowed"}},
+	               "ducklake_column", "col");
+	b.AddVersioned(TAG_ROW, {{"i1", "tag.object_id"}, {"s1", "tag.[key]"}, {"s2", "tag.[value]"}}, "ducklake_tag",
+	               "tag");
+	b.AddVersioned(COLUMN_TAG_ROW,
+	               {{"i1", "ct.table_id"}, {"i2", "ct.column_id"}, {"s1", "ct.[key]"}, {"s2", "ct.[value]"}},
+	               "ducklake_column_tag", "ct");
+	// every inlined data table, with no snapshot to filter by - as the base reads them. They change
+	// without a snapshot (an empty one is dropped after a commit), so a read of changes brings them
+	// all whenever their fingerprint moved, and none otherwise
+	b.Add(INLINED_TABLE_ROW, {{"i1", "idt.table_id"}, {"i2", "idt.schema_version"}, {"s1", "idt.table_name"}},
+	      b.Table("ducklake_inlined_data_tables") + " idt" +
+	          (read == CatalogRead::CHANGES ? " WHERE @n <> @known_n OR @c <> @known_c" : ""));
 
-bool Flag(DataChunk &chunk, idx_t column, idx_t row) {
-	return FlatVector::GetData<bool>(chunk.data[column])[row];
-}
-
-//! A string column as the base reads it into a Value: NULL stays NULL.
-Value StrValue(DataChunk &chunk, idx_t column, idx_t row) {
-	return IsNull(chunk, column, row) ? Value() : Value(Str(chunk, column, row));
+	b.AddVersioned(VIEW_ROW,
+	               {{"i1", "vw.view_id"},
+	                {"i2", "vw.schema_id"},
+	                {"u", "vw.view_uuid"},
+	                {"s1", "vw.view_name"},
+	                {"s2", "vw.dialect"},
+	                {"s3", "vw.[sql]"},
+	                {"s4", "vw.column_aliases"}},
+	               "ducklake_view", "vw");
+	if (v1_1) {
+		b.AddVersioned(VIEW_COLUMN_TAG_ROW,
+		               {{"i1", "vct.view_id"}, {"s1", "vct.column_name"}, {"s2", "vct.[key]"}, {"s3", "vct.[value]"}},
+		               "ducklake_view_column_tag", "vct");
+	}
+	b.AddVersioned(MACRO_ROW, {{"i1", "mac.macro_id"}, {"i2", "mac.schema_id"}, {"s1", "mac.macro_name"}},
+	               "ducklake_macro", "mac");
+	b.Add(MACRO_IMPL_ROW,
+	      {{"i1", "imp.macro_id"},
+	       {"i2", "imp.impl_id"},
+	       {"s1", "imp.dialect"},
+	       {"s2", "imp.[sql]"},
+	       {"s3", "imp.[type]"}},
+	      b.Table("ducklake_macro_impl") + " imp WHERE " + b.Children("ducklake_macro", "macro_id", "imp"));
+	b.Add(MACRO_PARAMETER_ROW,
+	      {{"i1", "par.macro_id"},
+	       {"i2", "par.impl_id"},
+	       {"i3", "par.column_id"},
+	       {"s1", "par.parameter_name"},
+	       {"s2", "par.parameter_type"},
+	       {"s3", "par.default_value"},
+	       {"s4", "par.default_value_type"}},
+	      b.Table("ducklake_macro_parameters") + " par WHERE " + b.Children("ducklake_macro", "macro_id", "par"));
+	b.AddVersioned(PARTITION_ROW, {{"i1", "part.partition_id"}, {"i2", "part.table_id"}}, "ducklake_partition_info",
+	               "part");
+	b.Add(PARTITION_COLUMN_ROW,
+	      {{"i1", "pc.partition_id"}, {"i2", "pc.partition_key_index"}, {"i3", "pc.column_id"}, {"s1", "pc.transform"}},
+	      b.Table("ducklake_partition_column") + " pc WHERE " +
+	          b.Children("ducklake_partition_info", "partition_id", "pc"));
+	b.AddVersioned(SORT_ROW, {{"i1", "srt.sort_id"}, {"i2", "srt.table_id"}}, "ducklake_sort_info", "srt");
+	b.Add(SORT_EXPRESSION_ROW,
+	      {{"i1", "se.sort_id"},
+	       {"i2", "se.sort_key_index"},
+	       {"s1", "se.expression"},
+	       {"s2", "se.dialect"},
+	       {"s3", "se.sort_direction"},
+	       {"s4", "se.null_order"}},
+	      b.Table("ducklake_sort_expression") + " se WHERE " + b.Children("ducklake_sort_info", "sort_id", "se"));
+	if (read == CatalogRead::AT_SNAPSHOT) {
+		return StringUtil::Join(b.branches, "\nUNION ALL\n");
+	}
+	AddMeta(b);
+	return MirrorPreamble(b) + StringUtil::Join(b.branches, "\nUNION ALL\n");
 }
 
 //! the base's AddChildColumn: a nested column goes under its parent, wherever that sits
@@ -193,280 +356,173 @@ bool AddChildColumn(vector<DuckLakeColumnInfo> &columns, FieldIndex parent_id, D
 	return false;
 }
 
-} // namespace
-
-DuckLakeCatalogInfo MSSQLMetadataManager::GetCatalogForSnapshot(DuckLakeSnapshot snapshot) {
-	if (CatalogStatementDisabled()) {
-		return DuckLakeMetadataManager::GetCatalogForSnapshot(snapshot);
-	}
-	auto catalog = LoadCatalogInOneStatement(snapshot);
-	if (VerifyCatalogEnabled()) {
-		auto base = DuckLakeMetadataManager::GetCatalogForSnapshot(snapshot);
-		auto difference = CatalogDifference(base, catalog);
-		if (!difference.empty()) {
-			throw InvalidInputException(
-			    "mssql_ducklake: the one-statement catalog load differs from DuckLake's at snapshot %llu: %s",
-			    snapshot.snapshot_id, difference);
-		}
-	}
-	return catalog;
+Value StringValue(const CatalogRow &row, idx_t i) {
+	return row.string_null[i] ? Value() : Value(row.strings[i]);
 }
 
-DuckLakeCatalogInfo MSSQLMetadataManager::LoadCatalogInOneStatement(DuckLakeSnapshot snapshot) {
-	auto &ducklake_catalog = transaction.GetCatalog();
-	const bool v1_1 = ducklake_catalog.SupportsV1_1Metadata();
-	const auto &base_data_path = ducklake_catalog.DataPath();
-	const auto &separator = ducklake_catalog.Separator();
-
-	auto query = StringUtil::Format(
-	    "SELECT * FROM mssql_scan_params_unsafe({METADATA_CATALOG_NAME_LITERAL}, %s, {'s': {SNAPSHOT_ID}}, "
-	    "'@s BIGINT', columns := {%s}) ORDER BY k, o1, o2, o3, o4",
-	    SQLString(CatalogStatement(SchemaIdentifier(), v1_1)), CATALOG_COLUMNS);
-	auto result = Query(snapshot, query);
-	if (result->HasError()) {
-		result->GetErrorObject().Throw("Failed to load the DuckLake catalog from SQL Server: ");
+//! The catalog at `snapshot` from catalog rows, the way BuildCatalogForSnapshot builds it from its
+//! seven queries: the same fields, the same order where the base orders, the same refusals.
+DuckLakeCatalogInfo AssembleCatalog(const vector<reference<const CatalogRow>> &all_rows, idx_t snapshot,
+                                    const string &base_data_path, const string &separator, bool v1_1) {
+	map<int64_t, vector<reference<const CatalogRow>>> rows;
+	for (auto &row : all_rows) {
+		if (row.get().VisibleAt(snapshot)) {
+			rows[row.get().kind].push_back(row);
+		}
 	}
-
-	DuckLakeCatalogInfo catalog;
-	map<SchemaIndex, idx_t> schema_map;
-	map<TableIndex, idx_t> table_map;
-	map<TableIndex, idx_t> view_map;
-	map<MacroIndex, idx_t> macro_map;
-	// tags arrive before the views they belong to (the kinds are ordered), so they wait here
-	map<idx_t, vector<DuckLakeTag>> object_tags;
-	map<pair<idx_t, idx_t>, vector<DuckLakeTag>> column_tags;
-	map<idx_t, vector<DuckLakeViewColumnTag>> view_column_tags;
-	// a macro's implementations by impl_id, for its parameters to find
-	map<pair<idx_t, idx_t>, idx_t> impl_map;
-
-	auto attach_column_tags = [&](DuckLakeTableInfo &table) {
-		std::function<void(vector<DuckLakeColumnInfo> &)> walk = [&](vector<DuckLakeColumnInfo> &columns) {
-			for (auto &column : columns) {
-				auto entry = column_tags.find({table.id.index, column.id.index});
-				if (entry != column_tags.end()) {
-					column.tags = entry->second;
-				}
-				walk(column.children);
-			}
-		};
-		walk(table.columns);
+	auto sorted = [&](int64_t kind, std::function<bool(const CatalogRow &, const CatalogRow &)> less) {
+		auto &list = rows[kind];
+		std::stable_sort(list.begin(), list.end(),
+		                 [&](reference<const CatalogRow> a, reference<const CatalogRow> b) { return less(a, b); });
+		return list;
+	};
+	auto by_id = [](const CatalogRow &a, const CatalogRow &b) {
+		return a.ids[0] < b.ids[0];
 	};
 
-	while (true) {
-		auto chunk = result->Fetch();
-		if (!chunk || chunk->size() == 0) {
-			break;
+	DuckLakeCatalogInfo catalog;
+	map<idx_t, idx_t> schema_map;
+	for (const CatalogRow &row : sorted(SCHEMA_ROW, by_id)) {
+		DuckLakeSchemaInfo schema;
+		schema.id = SchemaIndex(row.Id(0));
+		schema.uuid = row.uuid;
+		schema.name = row.strings[0];
+		if (row.string_null[1]) {
+			schema.path = base_data_path;
+		} else {
+			DuckLakePath path {row.strings[1], row.flags[0]};
+			schema.path = DuckLakeMetadataManager::FromRelativePath(path, base_data_path, separator);
 		}
-		chunk->Flatten();
-		for (idx_t row = 0; row < chunk->size(); row++) {
-			switch (static_cast<CatalogRowKind>(Id(*chunk, K, row))) {
-			case SCHEMA_ROW: {
-				DuckLakeSchemaInfo schema;
-				schema.id = SchemaIndex(Id(*chunk, I1, row));
-				schema.uuid = chunk->GetValue(U, row).ToString();
-				schema.name = Str(*chunk, S1, row);
-				if (IsNull(*chunk, S2, row)) {
-					schema.path = base_data_path;
-				} else {
-					DuckLakePath path {Str(*chunk, S2, row), !IsNull(*chunk, B1, row) && Flag(*chunk, B1, row)};
-					schema.path = DuckLakeMetadataManager::FromRelativePath(path, base_data_path, separator);
-				}
-				if (v1_1 && !IsNull(*chunk, I2, row)) {
-					schema.parent_id = SchemaIndex(Id(*chunk, I2, row));
-				}
-				schema_map[schema.id] = catalog.schemas.size();
-				catalog.schemas.push_back(std::move(schema));
-				break;
-			}
-			case TABLE_ROW: {
-				auto table_id = TableIndex(Id(*chunk, I1, row));
-				auto &tables = catalog.tables;
-				if (tables.empty() || tables.back().id != table_id) {
-					DuckLakeTableInfo table_info;
-					table_info.id = table_id;
-					table_info.schema_id = SchemaIndex(Id(*chunk, I2, row));
-					table_info.uuid = chunk->GetValue(U, row).ToString();
-					table_info.name = Str(*chunk, S1, row);
-					auto schema_entry = schema_map.find(table_info.schema_id);
-					if (schema_entry == schema_map.end()) {
-						throw InvalidInputException(
-						    "Failed to load DuckLake - table with id %d references schema id %d that does not exist",
-						    table_info.id.index, table_info.schema_id.index);
-					}
-					auto &schema = catalog.schemas[schema_entry->second];
-					if (IsNull(*chunk, S2, row)) {
-						table_info.path = schema.path;
-					} else {
-						DuckLakePath path {Str(*chunk, S2, row), !IsNull(*chunk, B1, row) && Flag(*chunk, B1, row)};
-						table_info.path = DuckLakeMetadataManager::FromRelativePath(path, schema.path, separator);
-					}
-					table_map[table_id] = tables.size();
-					tables.push_back(std::move(table_info));
-				}
-				auto &table_entry = tables.back();
-				if (IsNull(*chunk, I3, row)) {
-					throw InvalidInputException(
-					    "Failed to load DuckLake - Table entry \"%s\" does not have any columns", table_entry.name);
-				}
-				DuckLakeColumnInfo column_info;
-				column_info.id = FieldIndex(Id(*chunk, I3, row));
-				column_info.name = Str(*chunk, S3, row);
-				column_info.type = Str(*chunk, S4, row);
-				if (!IsNull(*chunk, S5, row)) {
-					column_info.initial_default = Value(Str(*chunk, S5, row));
-				}
-				if (!IsNull(*chunk, S6, row)) {
-					auto value = Str(*chunk, S6, row);
-					column_info.default_value = value == "NULL" ? Value() : Value(value);
-				}
-				if (!IsNull(*chunk, S7, row)) {
-					column_info.default_value_type = Str(*chunk, S7, row);
-				}
-				column_info.nulls_allowed = Flag(*chunk, B2, row);
-				if (IsNull(*chunk, I4, row)) {
-					table_entry.columns.push_back(std::move(column_info));
-				} else {
-					auto parent_id = FieldIndex(Id(*chunk, I4, row));
-					if (!AddChildColumn(table_entry.columns, parent_id, column_info)) {
-						throw InvalidInputException(
-						    "Failed to load DuckLake - Could not find parent column for column %s", column_info.name);
-					}
-				}
-				break;
-			}
-			case TAG_ROW:
-				// the base's LoadTags: a tag without a value is skipped
-				if (!IsNull(*chunk, S2, row)) {
-					object_tags[Id(*chunk, I1, row)].push_back({Str(*chunk, S1, row), Str(*chunk, S2, row)});
-				}
-				break;
-			case COLUMN_TAG_ROW:
-				if (!IsNull(*chunk, S2, row)) {
-					column_tags[{Id(*chunk, I1, row), Id(*chunk, I2, row)}].push_back(
-					    {Str(*chunk, S1, row), Str(*chunk, S2, row)});
-				}
-				break;
-			case INLINED_TABLE_ROW: {
-				auto entry = table_map.find(TableIndex(Id(*chunk, I1, row)));
-				if (entry != table_map.end()) {
-					DuckLakeInlinedTableInfo inlined;
-					inlined.table_name = Str(*chunk, S1, row);
-					inlined.schema_version = Id(*chunk, I2, row);
-					catalog.tables[entry->second].inlined_data_tables.push_back(std::move(inlined));
-				}
-				break;
-			}
-			case VIEW_ROW: {
-				DuckLakeViewInfo view_info;
-				view_info.id = TableIndex(Id(*chunk, I1, row));
-				view_info.uuid = chunk->GetValue(U, row).ToString();
-				view_info.schema_id = SchemaIndex(Id(*chunk, I2, row));
-				view_info.name = Str(*chunk, S1, row);
-				view_info.dialect = Str(*chunk, S2, row);
-				view_info.sql = Str(*chunk, S3, row);
-				if (!IsNull(*chunk, S4, row)) {
-					view_info.column_aliases = DuckLakeUtil::ParseQuotedList(Str(*chunk, S4, row));
-				}
-				view_map[view_info.id] = catalog.views.size();
-				catalog.views.push_back(std::move(view_info));
-				break;
-			}
-			case VIEW_COLUMN_TAG_ROW: {
-				DuckLakeViewColumnTag tag;
-				tag.column_name = Str(*chunk, S1, row);
-				tag.key = Str(*chunk, S2, row);
-				tag.value = StrValue(*chunk, S3, row);
-				view_column_tags[Id(*chunk, I1, row)].push_back(std::move(tag));
-				break;
-			}
-			case MACRO_ROW: {
-				DuckLakeMacroInfo macro_info;
-				macro_info.schema_id = SchemaIndex(Id(*chunk, I1, row));
-				macro_info.macro_id = MacroIndex(Id(*chunk, I2, row));
-				macro_info.macro_name = Str(*chunk, S1, row);
-				macro_map[macro_info.macro_id] = catalog.macros.size();
-				catalog.macros.push_back(std::move(macro_info));
-				break;
-			}
-			case MACRO_IMPL_ROW: {
-				auto entry = macro_map.find(MacroIndex(Id(*chunk, I1, row)));
-				if (entry == macro_map.end()) {
-					break;
-				}
-				auto &implementations = catalog.macros[entry->second].implementations;
-				DuckLakeMacroImplementation impl;
-				impl.dialect = Str(*chunk, S1, row);
-				impl.sql = Str(*chunk, S2, row);
-				impl.type = Str(*chunk, S3, row);
-				impl_map[{Id(*chunk, I1, row), Id(*chunk, I2, row)}] = implementations.size();
-				implementations.push_back(std::move(impl));
-				break;
-			}
-			case MACRO_PARAMETER_ROW: {
-				auto macro = macro_map.find(MacroIndex(Id(*chunk, I1, row)));
-				auto impl = impl_map.find({Id(*chunk, I1, row), Id(*chunk, I2, row)});
-				if (macro == macro_map.end() || impl == impl_map.end()) {
-					break;
-				}
-				DuckLakeMacroParameters parameter;
-				parameter.parameter_name = Str(*chunk, S1, row);
-				parameter.parameter_type = Str(*chunk, S2, row);
-				parameter.default_value = StrValue(*chunk, S3, row);
-				parameter.default_value_type = IsNull(*chunk, S4, row) ? string() : Str(*chunk, S4, row);
-				catalog.macros[macro->second].implementations[impl->second].parameters.push_back(std::move(parameter));
-				break;
-			}
-			case PARTITION_ROW: {
-				auto table_id = TableIndex(Id(*chunk, I2, row));
-				auto &partitions = catalog.partitions;
-				if (partitions.empty() || partitions.back().table_id != table_id) {
-					DuckLakePartitionInfo partition_info;
-					partition_info.id = Id(*chunk, I1, row);
-					partition_info.table_id = table_id;
-					partitions.push_back(std::move(partition_info));
-				}
-				DuckLakePartitionFieldInfo field;
-				field.partition_key_index = Id(*chunk, I3, row);
-				field.field_id = FieldIndex(Id(*chunk, I4, row));
-				field.transform = Str(*chunk, S1, row);
-				partitions.back().fields.push_back(std::move(field));
-				break;
-			}
-			case SORT_ROW: {
-				auto table_id = TableIndex(Id(*chunk, I2, row));
-				auto &sorts = catalog.sorts;
-				if (sorts.empty() || sorts.back().table_id != table_id) {
-					DuckLakeSortInfo sort_info;
-					sort_info.id = Id(*chunk, I1, row);
-					sort_info.table_id = table_id;
-					sorts.push_back(std::move(sort_info));
-				}
-				DuckLakeSortFieldInfo field;
-				field.sort_key_index = Id(*chunk, I3, row);
-				field.expression = Str(*chunk, S1, row);
-				field.dialect = Str(*chunk, S2, row);
-				field.sort_direction =
-				    StringUtil::CIEquals(Str(*chunk, S3, row), "DESC") ? OrderType::DESCENDING : OrderType::ASCENDING;
-				field.null_order = StringUtil::CIEquals(Str(*chunk, S4, row), "NULLS_FIRST")
-				                       ? OrderByNullType::NULLS_FIRST
-				                       : OrderByNullType::NULLS_LAST;
-				sorts.back().fields.push_back(std::move(field));
-				break;
-			}
-			default:
-				throw InternalException("mssql_ducklake: unknown row kind in the catalog load");
-			}
+		if (v1_1 && !row.id_null[1]) {
+			schema.parent_id = SchemaIndex(row.Id(1));
 		}
+		schema_map[schema.id.index] = catalog.schemas.size();
+		catalog.schemas.push_back(std::move(schema));
 	}
 
-	for (auto &table : catalog.tables) {
+	// tags by object, column tags by (table, column), inlined tables by table
+	map<idx_t, vector<DuckLakeTag>> object_tags;
+	for (const CatalogRow &row : rows[TAG_ROW]) {
+		// the base's LoadTags: a tag without a value is skipped
+		if (!row.string_null[1]) {
+			object_tags[row.Id(0)].push_back({row.strings[0], row.strings[1]});
+		}
+	}
+	map<pair<idx_t, idx_t>, vector<DuckLakeTag>> column_tags;
+	for (const CatalogRow &row : rows[COLUMN_TAG_ROW]) {
+		if (!row.string_null[1]) {
+			column_tags[{row.Id(0), row.Id(1)}].push_back({row.strings[0], row.strings[1]});
+		}
+	}
+	map<idx_t, vector<DuckLakeInlinedTableInfo>> inlined_tables;
+	for (const CatalogRow &row :
+	     sorted(INLINED_TABLE_ROW, [](const CatalogRow &a, const CatalogRow &b) { return a.ids[1] < b.ids[1]; })) {
+		inlined_tables[row.Id(0)].push_back({row.strings[0], row.Id(1)});
+	}
+
+	// tables, with their columns in the base's order: parent_column NULLS FIRST, then column_order
+	map<idx_t, vector<reference<const CatalogRow>>> table_columns;
+	for (const CatalogRow &row : rows[COLUMN_ROW]) {
+		table_columns[row.Id(0)].push_back(row);
+	}
+	std::function<void(vector<DuckLakeColumnInfo> &, idx_t)> attach_column_tags =
+	    [&](vector<DuckLakeColumnInfo> &columns, idx_t table_id) {
+		    for (auto &column : columns) {
+			    auto entry = column_tags.find({table_id, column.id.index});
+			    if (entry != column_tags.end()) {
+				    column.tags = entry->second;
+			    }
+			    attach_column_tags(column.children, table_id);
+		    }
+	    };
+	for (const CatalogRow &row : sorted(TABLE_ROW, by_id)) {
+		DuckLakeTableInfo table;
+		table.id = TableIndex(row.Id(0));
+		table.schema_id = SchemaIndex(row.Id(1));
+		table.uuid = row.uuid;
+		table.name = row.strings[0];
+		auto schema_entry = schema_map.find(table.schema_id.index);
+		if (schema_entry == schema_map.end()) {
+			throw InvalidInputException(
+			    "Failed to load DuckLake - table with id %d references schema id %d that does not exist",
+			    table.id.index, table.schema_id.index);
+		}
+		auto &schema = catalog.schemas[schema_entry->second];
+		if (row.string_null[1]) {
+			table.path = schema.path;
+		} else {
+			DuckLakePath path {row.strings[1], row.flags[0]};
+			table.path = DuckLakeMetadataManager::FromRelativePath(path, schema.path, separator);
+		}
+		auto columns = table_columns.find(table.id.index);
+		if (columns == table_columns.end() || columns->second.empty()) {
+			throw InvalidInputException("Failed to load DuckLake - Table entry \"%s\" does not have any columns",
+			                            table.name);
+		}
+		auto &list = columns->second;
+		std::stable_sort(list.begin(), list.end(), [](reference<const CatalogRow> a, reference<const CatalogRow> b) {
+			const CatalogRow &x = a, &y = b;
+			if (x.id_null[3] != y.id_null[3]) {
+				return x.id_null[3];
+			}
+			if (x.ids[3] != y.ids[3]) {
+				return x.ids[3] < y.ids[3];
+			}
+			return x.ids[2] < y.ids[2];
+		});
+		for (const CatalogRow &col : list) {
+			DuckLakeColumnInfo column;
+			column.id = FieldIndex(col.Id(1));
+			column.name = col.strings[0];
+			column.type = col.strings[1];
+			if (!col.string_null[2]) {
+				column.initial_default = Value(col.strings[2]);
+			}
+			if (!col.string_null[3]) {
+				column.default_value = col.strings[3] == "NULL" ? Value() : Value(col.strings[3]);
+			}
+			if (!col.string_null[4]) {
+				column.default_value_type = col.strings[4];
+			}
+			column.nulls_allowed = col.flags[0];
+			if (col.id_null[3]) {
+				table.columns.push_back(std::move(column));
+			} else if (!AddChildColumn(table.columns, FieldIndex(col.Id(3)), column)) {
+				throw InvalidInputException("Failed to load DuckLake - Could not find parent column for column %s",
+				                            column.name);
+			}
+		}
+		attach_column_tags(table.columns, table.id.index);
 		auto tags = object_tags.find(table.id.index);
 		if (tags != object_tags.end()) {
 			table.tags = tags->second;
 		}
-		attach_column_tags(table);
+		auto inlined = inlined_tables.find(table.id.index);
+		if (inlined != inlined_tables.end()) {
+			table.inlined_data_tables = inlined->second;
+		}
+		catalog.tables.push_back(std::move(table));
 	}
-	for (auto &view : catalog.views) {
+
+	map<idx_t, vector<DuckLakeViewColumnTag>> view_column_tags;
+	for (const CatalogRow &row : rows[VIEW_COLUMN_TAG_ROW]) {
+		DuckLakeViewColumnTag tag;
+		tag.column_name = row.strings[0];
+		tag.key = row.strings[1];
+		tag.value = StringValue(row, 2);
+		view_column_tags[row.Id(0)].push_back(std::move(tag));
+	}
+	for (const CatalogRow &row : sorted(VIEW_ROW, by_id)) {
+		DuckLakeViewInfo view;
+		view.id = TableIndex(row.Id(0));
+		view.schema_id = SchemaIndex(row.Id(1));
+		view.uuid = row.uuid;
+		view.name = row.strings[0];
+		view.dialect = row.strings[1];
+		view.sql = row.strings[2];
+		if (!row.string_null[3]) {
+			view.column_aliases = DuckLakeUtil::ParseQuotedList(row.strings[3]);
+		}
 		auto tags = object_tags.find(view.id.index);
 		if (tags != object_tags.end()) {
 			view.tags = tags->second;
@@ -475,8 +531,337 @@ DuckLakeCatalogInfo MSSQLMetadataManager::LoadCatalogInOneStatement(DuckLakeSnap
 		if (vct != view_column_tags.end()) {
 			view.column_tags = vct->second;
 		}
+		catalog.views.push_back(std::move(view));
+	}
+
+	// macros: their implementations by impl_id, each implementation's parameters by column_id
+	map<pair<idx_t, idx_t>, vector<DuckLakeMacroParameters>> parameters;
+	for (const CatalogRow &row :
+	     sorted(MACRO_PARAMETER_ROW, [](const CatalogRow &a, const CatalogRow &b) { return a.ids[2] < b.ids[2]; })) {
+		DuckLakeMacroParameters parameter;
+		parameter.parameter_name = row.strings[0];
+		parameter.parameter_type = row.strings[1];
+		parameter.default_value = StringValue(row, 2);
+		parameter.default_value_type = row.string_null[3] ? string() : row.strings[3];
+		parameters[{row.Id(0), row.Id(1)}].push_back(std::move(parameter));
+	}
+	map<idx_t, vector<DuckLakeMacroImplementation>> implementations;
+	for (const CatalogRow &row :
+	     sorted(MACRO_IMPL_ROW, [](const CatalogRow &a, const CatalogRow &b) { return a.ids[1] < b.ids[1]; })) {
+		DuckLakeMacroImplementation impl;
+		impl.dialect = row.strings[0];
+		impl.sql = row.strings[1];
+		impl.type = row.strings[2];
+		auto entry = parameters.find({row.Id(0), row.Id(1)});
+		if (entry != parameters.end()) {
+			impl.parameters = entry->second;
+		}
+		implementations[row.Id(0)].push_back(std::move(impl));
+	}
+	for (const CatalogRow &row : sorted(MACRO_ROW, by_id)) {
+		DuckLakeMacroInfo macro;
+		macro.macro_id = MacroIndex(row.Id(0));
+		macro.schema_id = SchemaIndex(row.Id(1));
+		macro.macro_name = row.strings[0];
+		auto entry = implementations.find(row.Id(0));
+		if (entry != implementations.end()) {
+			macro.implementations = entry->second;
+		}
+		catalog.macros.push_back(std::move(macro));
+	}
+
+	// partitions and sorts: ordered by table, then the spec's id, then the key - the base's ORDER BY -
+	// and one entry per table, carrying its first spec's id
+	auto keyed_children = [&](int64_t kind) {
+		map<idx_t, vector<reference<const CatalogRow>>> out;
+		for (const CatalogRow &row : rows[kind]) {
+			out[row.Id(0)].push_back(row);
+		}
+		for (auto &entry : out) {
+			std::stable_sort(entry.second.begin(), entry.second.end(),
+			                 [](reference<const CatalogRow> a, reference<const CatalogRow> b) {
+				                 return a.get().ids[1] < b.get().ids[1];
+			                 });
+		}
+		return out;
+	};
+	auto by_table_then_id = [](const CatalogRow &a, const CatalogRow &b) {
+		return a.ids[1] != b.ids[1] ? a.ids[1] < b.ids[1] : a.ids[0] < b.ids[0];
+	};
+	auto partition_columns = keyed_children(PARTITION_COLUMN_ROW);
+	for (const CatalogRow &row : sorted(PARTITION_ROW, by_table_then_id)) {
+		auto table_id = TableIndex(row.Id(1));
+		auto fields = partition_columns.find(row.Id(0));
+		if (fields == partition_columns.end()) {
+			continue; // the base's inner join: a spec without columns is not loaded
+		}
+		if (catalog.partitions.empty() || catalog.partitions.back().table_id != table_id) {
+			DuckLakePartitionInfo partition;
+			partition.id = row.Id(0);
+			partition.table_id = table_id;
+			catalog.partitions.push_back(std::move(partition));
+		}
+		for (const CatalogRow &col : fields->second) {
+			DuckLakePartitionFieldInfo field;
+			field.partition_key_index = col.Id(1);
+			field.field_id = FieldIndex(col.Id(2));
+			field.transform = col.strings[0];
+			catalog.partitions.back().fields.push_back(std::move(field));
+		}
+	}
+	auto sort_expressions = keyed_children(SORT_EXPRESSION_ROW);
+	for (const CatalogRow &row : sorted(SORT_ROW, by_table_then_id)) {
+		auto table_id = TableIndex(row.Id(1));
+		auto fields = sort_expressions.find(row.Id(0));
+		if (fields == sort_expressions.end()) {
+			continue;
+		}
+		if (catalog.sorts.empty() || catalog.sorts.back().table_id != table_id) {
+			DuckLakeSortInfo sort;
+			sort.id = row.Id(0);
+			sort.table_id = table_id;
+			catalog.sorts.push_back(std::move(sort));
+		}
+		for (const CatalogRow &expr : fields->second) {
+			DuckLakeSortFieldInfo field;
+			field.sort_key_index = expr.Id(1);
+			field.expression = expr.strings[0];
+			field.dialect = expr.strings[1];
+			field.sort_direction =
+			    StringUtil::CIEquals(expr.strings[2], "DESC") ? OrderType::DESCENDING : OrderType::ASCENDING;
+			field.null_order = StringUtil::CIEquals(expr.strings[3], "NULLS_FIRST") ? OrderByNullType::NULLS_FIRST
+			                                                                        : OrderByNullType::NULLS_LAST;
+			catalog.sorts.back().fields.push_back(std::move(field));
+		}
 	}
 	return catalog;
+}
+
+//! The mirror of one attached catalog (phase B), in the DuckDB instance's object cache under the
+//! attached database's oid - one per ATTACH, never shared between lakes or two attaches of one.
+struct MSSQLCatalogMirror : public ObjectCacheEntry {
+	std::mutex lock;
+	bool loaded = false;
+	//! the catalog grew past the row budget: this attach loads at each snapshot instead (phase A)
+	bool over_budget = false;
+	//! the oldest snapshot the rows can answer for, and the one they are caught up to
+	idx_t base = 0;
+	idx_t as_of = 0;
+	//! the fingerprint of ducklake_inlined_data_tables the rows were read with
+	int64_t inlined_count = -1;
+	int64_t inlined_checksum = 0;
+	vector<unique_ptr<CatalogRow>> rows;
+	std::unordered_map<string, idx_t> index;
+
+	static string ObjectType() {
+		return "mssql_ducklake_catalog_mirror";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		return optional_idx(); // never evicted: losing it costs a full load, keeping it a few MB
+	}
+
+	//! Merge rows read from the server: a new row is added; a known one can only have ended since,
+	//! so its end_snapshot is taken if it was open. Reading a row twice, or two readers' rows in
+	//! either order, ends in the same state.
+	void Merge(vector<CatalogRow> &read, bool inlined_changed) {
+		if (inlined_changed) {
+			for (auto &row : rows) {
+				if (row && row->kind == INLINED_TABLE_ROW) {
+					index.erase(row->Key());
+					row.reset();
+				}
+			}
+		}
+		for (auto &row : read) {
+			auto key = row.Key();
+			auto entry = index.find(key);
+			if (entry == index.end()) {
+				index[key] = rows.size();
+				rows.push_back(make_uniq<CatalogRow>(std::move(row)));
+			} else if (!row.end_null && rows[entry->second]->end_null) {
+				rows[entry->second]->end = row.end;
+				rows[entry->second]->end_null = false;
+			}
+		}
+	}
+
+	//! Drop the versions no snapshot left can see - expire_snapshots removed their snapshots.
+	void Prune(idx_t oldest) {
+		bool dropped = false;
+		for (auto &row : rows) {
+			if (row && IsVersioned(row->kind) && !row->end_null && row->end <= static_cast<int64_t>(oldest)) {
+				row.reset();
+				dropped = true;
+			}
+		}
+		if (dropped || rows.size() > 2 * index.size()) {
+			vector<unique_ptr<CatalogRow>> kept;
+			index.clear();
+			for (auto &row : rows) {
+				if (row) {
+					index[row->Key()] = kept.size();
+					kept.push_back(std::move(row));
+				}
+			}
+			rows = std::move(kept);
+		}
+	}
+
+	vector<reference<const CatalogRow>> Rows() const {
+		vector<reference<const CatalogRow>> out;
+		out.reserve(rows.size());
+		for (auto &row : rows) {
+			if (row) {
+				out.push_back(*row);
+			}
+		}
+		return out;
+	}
+};
+
+vector<CatalogRow> ReadCatalogRows(QueryResult &result) {
+	vector<CatalogRow> rows;
+	while (true) {
+		auto chunk = result.Fetch();
+		if (!chunk || chunk->size() == 0) {
+			break;
+		}
+		chunk->Flatten();
+		for (idx_t row = 0; row < chunk->size(); row++) {
+			rows.push_back(ReadRow(*chunk, row));
+		}
+	}
+	return rows;
+}
+
+} // namespace
+
+DuckLakeCatalogInfo MSSQLMetadataManager::GetCatalogForSnapshot(DuckLakeSnapshot snapshot) {
+	if (CatalogStatementDisabled()) {
+		return DuckLakeMetadataManager::GetCatalogForSnapshot(snapshot);
+	}
+	auto catalog = LoadCatalog(snapshot);
+	if (VerifyCatalogEnabled()) {
+		auto base = DuckLakeMetadataManager::GetCatalogForSnapshot(snapshot);
+		auto difference = CatalogDifference(base, catalog);
+		if (!difference.empty()) {
+			throw InvalidInputException("mssql_ducklake: the catalog load differs from DuckLake's at snapshot %llu: %s",
+			                            snapshot.snapshot_id, difference);
+		}
+	}
+	return catalog;
+}
+
+DuckLakeCatalogInfo MSSQLMetadataManager::LoadCatalog(DuckLakeSnapshot snapshot) {
+	auto &ducklake_catalog = transaction.GetCatalog();
+	const bool v1_1 = ducklake_catalog.SupportsV1_1Metadata();
+	const auto &base_data_path = ducklake_catalog.DataPath();
+	const auto &separator = ducklake_catalog.Separator();
+	const auto schema = SchemaIdentifier();
+
+	auto read = [&](CatalogRead what, const string &params, const string &declarations) {
+		auto query = StringUtil::Format(
+		    "SELECT * FROM mssql_scan_params_unsafe({METADATA_CATALOG_NAME_LITERAL}, %s, {%s}, %s, columns := {%s})",
+		    SQLString(CatalogStatement(schema, v1_1, what)), params, SQLString(declarations), CATALOG_COLUMNS);
+		auto result = Query(snapshot, query);
+		if (result->HasError()) {
+			result->GetErrorObject().Throw("Failed to load the DuckLake catalog from SQL Server: ");
+		}
+		return ReadCatalogRows(*result);
+	};
+	auto at_snapshot = [&]() {
+		auto rows = read(CatalogRead::AT_SNAPSHOT, "'s': {SNAPSHOT_ID}", "@s BIGINT");
+		vector<reference<const CatalogRow>> refs(rows.begin(), rows.end());
+		return AssembleCatalog(refs, snapshot.snapshot_id, base_data_path, separator, v1_1);
+	};
+
+	// A transaction that has written reads its own uncommitted rows on its connection: those are not
+	// the committed history the mirror holds, so it reads at its snapshot and leaves the mirror be.
+	auto client_context = transaction.context.lock();
+	if (CatalogMirrorDisabled() || wrote_in_transaction || !client_context) {
+		return at_snapshot();
+	}
+	auto &cache = ObjectCache::GetObjectCache(*client_context);
+	auto key = StringUtil::Format("mssql_ducklake:catalog_mirror:%llu", ducklake_catalog.GetAttached().oid);
+	auto mirror = cache.GetOrCreate<MSSQLCatalogMirror>(key);
+
+	bool full;
+	bool held;
+	idx_t as_of;
+	int64_t known_count, known_checksum;
+	{
+		std::lock_guard<std::mutex> guard(mirror->lock);
+		if (mirror->over_budget) {
+			return at_snapshot();
+		}
+		// held: the rows of every snapshot up to as_of. A flush or a compaction asks for older schema
+		// versions, one per table - only whether the inlined tables moved is read for those
+		held = mirror->loaded && snapshot.snapshot_id >= mirror->base && snapshot.snapshot_id <= mirror->as_of;
+		full = !mirror->loaded;
+		as_of = mirror->as_of;
+		known_count = mirror->inlined_count;
+		known_checksum = mirror->inlined_checksum;
+	}
+
+	// the round trip runs without the lock: a reader waiting on the server never holds up the rest
+	vector<CatalogRow> rows;
+	if (full) {
+		rows = read(CatalogRead::HISTORY, "", "");
+	} else {
+		rows = read(held ? CatalogRead::INLINED : CatalogRead::CHANGES,
+		            StringUtil::Format("'a': %llu, 'known_n': %lld, 'known_c': %lld", as_of,
+		                               static_cast<long long>(known_count), static_cast<long long>(known_checksum)),
+		            "@a BIGINT, @known_n BIGINT, @known_c BIGINT");
+	}
+	auto meta = std::find_if(rows.begin(), rows.end(), [](const CatalogRow &row) { return row.kind == META_ROW; });
+	if (meta == rows.end() || meta->id_null[0]) {
+		// an empty snapshot table: nothing to mirror yet
+		return at_snapshot();
+	}
+	const auto latest = static_cast<idx_t>(meta->ids[0]);
+	const auto oldest = static_cast<idx_t>(meta->ids[1]);
+	const auto count = meta->ids[2];
+	const auto checksum = meta->ids[3];
+	rows.erase(meta);
+
+	std::lock_guard<std::mutex> guard(mirror->lock);
+	if (mirror->over_budget) {
+		return at_snapshot();
+	}
+	const bool inlined_changed = count != mirror->inlined_count || checksum != mirror->inlined_checksum;
+	// a full read brings every inlined table, a read of changes or of the fingerprint only when it moved
+	mirror->Merge(rows, full || inlined_changed);
+	if (inlined_changed) {
+		mirror->inlined_count = count;
+		mirror->inlined_checksum = checksum;
+	}
+	if (!mirror->loaded) {
+		mirror->loaded = true;
+		mirror->base = oldest;
+	}
+	// only a read of rows moves as_of: the fingerprint read of a held snapshot looked at no versioned
+	// table, so a snapshot committed since is still to be read
+	if (!held) {
+		mirror->as_of = MaxValue(mirror->as_of, latest);
+	}
+	if (oldest > mirror->base) {
+		mirror->Prune(oldest);
+		mirror->base = oldest;
+	}
+	if (mirror->rows.size() > CatalogMirrorRowBudget()) {
+		mirror->over_budget = true;
+		mirror->rows.clear();
+		mirror->index.clear();
+		return at_snapshot();
+	}
+	if (snapshot.snapshot_id >= mirror->base && snapshot.snapshot_id <= mirror->as_of) {
+		return AssembleCatalog(mirror->Rows(), snapshot.snapshot_id, base_data_path, separator, v1_1);
+	}
+	// a snapshot past what the server just said is the latest, or before the oldest: not ours to answer
+	return at_snapshot();
 }
 
 // The verify switch (specs/020 B6): the base's answer and ours, field by field. Lists the base

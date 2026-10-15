@@ -1,6 +1,6 @@
 # Spec 020: the catalog load in one T-SQL statement, and a mirror behind it
 
-- **Status**: phase A implemented (branch `spec/020-catalog-mirror`); phase B open
+- **Status**: implemented, phase A (#42) and phase B
 - **Date**: 2026-10-15
 - **Author**: vgsml, with Claude
 
@@ -65,71 +65,74 @@ base's order. That includes:
 
 ### Phase A: one statement
 
-`MSSQLMetadataManager::GetCatalogForSnapshot` overrides the base. It sends one parameterised T-SQL
-statement (`@s` = the snapshot id) through `mssql_scan_params_unsafe` with the shape given
-(`columns := {...}`), as the file list does (specs/008), so the bind sends nothing.
+`MSSQLMetadataManager::GetCatalogForSnapshot` overrides the base. The catalog's rows come from one
+parameterised T-SQL statement through `mssql_scan_params_unsafe`, with the shape given
+(`columns := {...}`) as for the file list (specs/008), so the bind sends nothing.
 
-- **One result set.** `UNION ALL` of one branch per kind (schema, table+column, table tag, column
-  tag, inlined table, view, view column tag, macro, macro impl, macro parameter, partition, sort). It
-  is a fixed tagged row: `kind TINYINT`, five `BIGINT` ids, a handful of `VARCHAR` slots and `BIT`
-  flags.
-- **Assembled on the client.** The rows come back ordered by kind and then by the base's order. The
-  client builds the structures the base builds; the base's helpers are reused where they are
-  reachable (`FromRelativePath`, the type parsing).
-- **One read.** One statement replaces seven queries and their sub-scans. Under
-  `READ_COMMITTED_SNAPSHOT` it is one statement-consistent read.
-- **The joins stay on the server and use what exists.** `pk_ducklake_column (table_id, column_id,
-  begin_snapshot)`, `ix_ducklake_column_live` and the tag keys already lead with the ids the joins
-  use. The plan is checked with `SET STATISTICS IO` on the 1000-table catalog before an index is
-  added.
-- **Fallback.** A statement that fails is an error naming it, never a silent fallback. Under
-  `MSSQL_DUCKLAKE_STRICT_BATCH` it has the same strictness as the commit batch.
-- **No state, so no staleness.** Every call is a fresh read of committed rows. Other nodes cannot
-  make it wrong.
+- **One result set, one row per catalog row.** It is a `UNION ALL` of one branch per table: the
+  versioned tables (schema, table, column, tag, column tag, view, view column tag, macro, partition
+  info, sort info) with their `begin_snapshot` and `end_snapshot`, the children (macro
+  implementations and parameters, partition columns, sort expressions), and every inlined data
+  table. Each row has the same tagged shape: the kind, five `BIGINT` ids, begin and end, one
+  `UNIQUEIDENTIFIER`, six strings and two flags.
+- **Joined, filtered and ordered on the client.** `AssembleCatalog` builds what
+  `BuildCatalogForSnapshot` builds from its seven queries: the same fields, the base's order where
+  the base orders, and the same refusals. One function serves every read, a snapshot's rows (phase
+  A) and the mirror's (phase B), because the joins are not done on the server.
+- **The NULL placeholders are `VARCHAR(1)`.** A UNION column takes the widest of its branches, and
+  a `MAX` placeholder made every string column `MAX` (see Measured).
+- **Fallback.** A statement that fails is an error naming it, never a silent fallback.
+- **No state, so no staleness.** At a snapshot, every call is a fresh read of committed rows.
+  `MSSQL_DUCKLAKE_NO_CATALOG_TSQL=1` goes back to DuckLake's seven queries.
 
-### Phase B: the mirror (only if phase A leaves the rebuilds dominant)
+### Phase B: the mirror
 
 Phase A cuts the cost of a rebuild, not the number of rebuilds, and every rebuild still reads every
-live table and column. Phase B removes the re-reading.
+live table and column. Phase B keeps the rows instead.
 
 #### B1: what is kept, and where
 
-- **Contents.** All rows of the versioned tables with `begin_snapshot <= as_of` that were still
-  visible at `base` or later, plus their children.
-- **Bounds.** `base` is the snapshot of the first load. `as_of` is the last snapshot caught up to.
+- **Contents.** Every row of the versioned tables that a snapshot still alive can see (`end_snapshot
+  IS NULL OR end_snapshot > oldest`), with their children and every inlined data table.
+- **Bounds.** `base` is the oldest snapshot at the first load. `as_of` is the last snapshot read up
+  to.
 - **Where it lives.** In the DuckDB instance's object cache under
   `mssql_ducklake:catalog_mirror:<attached database oid>`, like the stats cache of spec 019 and the
   ready marker. So each ATTACH has its own mirror, and several lakes attached in one process never
-  share one. It is guarded by its own mutex. Round trips run outside the lock, and the state is
-  copied in and out, as in 019.
-- **Answering a rebuild.** A rebuild at a snapshot `S` with `base <= S <= as_of` is answered by
-  filtering the mirror in memory with the same visibility predicate.
+  share one. It is never evicted: losing it costs a full load, and keeping it costs a few MB.
+- **Locking.** It is guarded by its own mutex. Round trips run without it, and the assembly at a
+  snapshot runs under it.
+- **Merging.** A row is keyed by its table's key columns and, if versioned, its begin snapshot. A
+  row read again only ever brings an `end_snapshot` that was open before, so reading a row twice,
+  or two readers' rows in either order, ends in the same state.
 
-#### B2: catching up, in one small query
+#### B2: the three reads
 
-If `S > as_of`, one statement reads, for the range `(as_of, S]`:
+Each read is one statement. The mirror's reads start with a statement of their own that takes
+`@latest = MAX(snapshot_id)`, `@oldest = MIN(snapshot_id)`, and the fingerprint of
+`ducklake_inlined_data_tables` (`COUNT_BIG(*)`, `CHECKSUM_AGG(CHECKSUM(...))`), returned as a meta
+row.
 
-- `MAX(snapshot_id)` of `ducklake_snapshot`, read first. The new `as_of` is `min(S, that)`.
-- The rows of each versioned table with `begin_snapshot` or `end_snapshot` in the range. A drop or
-  an alter sets `end_snapshot` on an old row, and a create inserts a row with `begin_snapshot`.
-- The children of parents that began in the range.
-- A fingerprint of `ducklake_inlined_data_tables`: `COUNT_BIG(*)` and
-  `CHECKSUM_AGG(CHECKSUM(table_id, schema_version, table_name))`. When it differs from the cached
-  one, the table's rows are read in the same statement, never by a second round trip. These rows
-  change without a snapshot, so a snapshot range cannot see the change.
-
-That is one round trip, and nothing comes back when nothing changed. The range predicates need
-`(begin_snapshot)` and `(end_snapshot)` indexes on the versioned tables, a shaping change (a
-`SHAPE_VERSION` bump). Their write cost is measured with the commit bench before they are kept.
-The alternative is to scope the delta by `ducklake_snapshot_changes`, which spec 019 already reads.
-It is decided by measurement.
+- **The first load** (`HISTORY`) reads every row a live snapshot can see.
+- **A snapshot past `as_of`** (`CHANGES`) reads the versioned rows with `begin_snapshot > @a OR
+  end_snapshot > @a`, the children of parents that began after `@a`, and the inlined data tables
+  only if their fingerprint moved. Then `as_of = @latest`. No index was added for the range
+  predicates. This read runs once per new schema version, after DDL, and the bench below shows it
+  costs less than phase A's load did.
+- **A snapshot the mirror holds** (`base <= S <= as_of`, which is what a flush or a compaction asks
+  for, one per table) reads only the fingerprint, and the inlined data tables if it moved. They
+  change without a snapshot: this manager creates and registers an inlined data table outside the
+  commit's transaction (specs/004 D2), and DuckLake drops a superseded empty one after a commit. The
+  verify switch caught the first case on the first run: a held snapshot answered from memory missed
+  a table registered a moment before. That read does not move `as_of`, because it looked at no
+  versioned table.
 
 #### B3: why other nodes cannot make it wrong
 
 - **Committed history does not change.** A row's `begin_snapshot` is set by the commit that inserts
   it, and its `end_snapshot` is set once by the commit that ends it. So the visible set at a
   committed snapshot `S` never changes after `S` committed. The only exception is
-  `ducklake_inlined_data_tables`, which is fingerprinted on every catch-up.
+  `ducklake_inlined_data_tables`, which is fingerprinted on every load (B2).
 - **Snapshot ids have no gaps.** A commit takes `MAX(snapshot_id) + 1` under the
   `ducklake_snapshot` primary key. A second committer that collides waits or retries, and never
   skips ahead. So once snapshot `S` is visible as committed, every snapshot up to `S` is committed.
@@ -148,16 +151,18 @@ In these cases the rebuild uses phase A's statement, and the mirror is not updat
 
 - **A transaction that has written** (`wrote_in_transaction`). It reads on its own connection
   inside its open server transaction, so it would see its own uncommitted rows.
-- **A snapshot older than `base`.** This is time travel to before the first load. The mirror never
-  loads history backwards.
-- **`MSSQL_DUCKLAKE_NO_CATALOG_CACHE=1`**, the off switch.
-- **A mirror over its budget**: a row count from the catalog's size, measured. Beyond it the mirror
-  drops itself, and the next rebuild loads it again from the current snapshot.
+- **A snapshot older than `base`.** That is time travel to a snapshot `expire_snapshots` has
+  removed, which DuckLake refuses before it asks.
+- **`MSSQL_DUCKLAKE_NO_CATALOG_MIRROR=1`**, the off switch.
+- **A mirror over its budget**: `MSSQL_DUCKLAKE_CATALOG_MIRROR_ROWS`, 1,000,000 rows by default. A
+  1000-table, 41-column lake with a deep history holds about 60,000. Beyond the budget the mirror
+  empties itself, and that attach loads each snapshot from the server.
 
 #### B5: pruning
 
-`ducklake_expire_snapshots` deletes history that no one can ask for. When a catch-up sees that the
-oldest snapshot has moved past `base`, rows that ended before it are dropped, and `base` moves up.
+`ducklake_expire_snapshots` deletes history that no one can ask for. When a read sees that the
+oldest snapshot has moved past `base`, the rows that ended at or before it are dropped, and `base`
+moves up.
 
 #### B6: the verify switch
 
@@ -196,13 +201,41 @@ tables, per load):
   `VARCHAR(MAX)` placeholder made every string column MAX: 26 ms of server CPU per load. With
   `VARCHAR(1)` placeholders the catalog's own bounded columns decide the width: 14 ms.
 - **No ORDER BY on the server.** A sort of every row, wide strings included, was most of what
-  remained: 9 ms without it. DuckDB orders the rows on arrival (`ORDER BY k, o1, o2, o3, o4`
-  around the scan); that measured the same as a client-side `std::stable_sort`, and is simpler.
+  remained: 9 ms without it. Phase A first had DuckDB order the rows around the scan, which
+  measured the same as a client-side sort. Phase B's assembly orders them itself, because the
+  mirror's rows are in no order at all.
 
 The remaining server cost is the joins and the conversions; the plan is seeks on the existing keys
 (`pk_ducklake_column` leads with `table_id`). What phase A does not change is the number of loads:
 the flush still makes one per table, each reading the whole catalog. That is what phase B would
 remove, and the flush's 147 s at 1000 tables says it is still worth doing.
+
+## Measured (phase B)
+
+**The 1000-table scale bench, mssql**, the mirror against phase A (`MSSQL_DUCKLAKE_NO_CATALOG_MIRROR=1`),
+one run each, back to back (machine load 6-10):
+
+| phase | DuckLake's 7 queries (earlier, same day) | phase A | mirror | mirror vs A |
+| --- | ---: | ---: | ---: | ---: |
+| `flush_inlined` | 171.5 s | 115.4 s | 78.6 s | -32% |
+| `merge_adjacent` | 85.3 s | 57.6 s | 39.1 s | -32% |
+| `partitioned_merge_adjacent` | 82.5 s | 53.8 s | 34.7 s | -35% |
+| `first_commits` | 19.8 s | 27.8 s | 18.8 s | -32% |
+| `create_tables` | 137.5 s | 124.0 s | 111.0 s | -10% |
+| `evolution` | 35.0 s | 30.7 s | 25.8 s | -16% |
+| `evolution_read_latest` | 11.3 s | 7.3 s | 2.8 s | -61% |
+| `second_commits`, `deep_history`, the reattaches | | | | within ±5% |
+| **total** | **650.3 s** | **529.9 s** | **419.6 s** | **-21%** |
+
+Phase A measured 598.9 s that morning and 529.9 s here. The machine is shared, which is why each
+comparison above is between back-to-back runs. Against DuckLake's own seven queries the catalog
+load is now a third off the whole bench. Postgres, which pays the same rebuilds through the same
+embedded DuckLake, took ~1100 s on this bench the same day.
+
+**300 tables, the flush alone** (trace timelines, runs alternated): one catalog load is 1.1 ms with
+the mirror against 6.3-6.5 ms for phase A, and the flush is 8.5 s against 10.2-10.5 s. The 1.1 ms is
+the fingerprint read (B2). The rest of the flush is DuckLake's own reads of the inlined rows and its
+parquet writes.
 
 ## Enforcement & security
 
