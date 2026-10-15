@@ -88,6 +88,24 @@ inline bool CatalogStatementDisabled() {
 	return disabled;
 }
 
+//! Off switch for the catalog mirror (specs/020 phase B): every load reads its snapshot from the
+//! server, as phase A does.
+inline bool CatalogMirrorDisabled() {
+	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_CATALOG_MIRROR") != nullptr;
+	return disabled;
+}
+
+//! The rows a catalog mirror may hold before its attach goes back to loading each snapshot from the
+//! server (specs/020 B4). A 1000-table, 41-column lake with a deep history is ~60k rows.
+//! MSSQL_DUCKLAKE_CATALOG_MIRROR_ROWS overrides it.
+inline idx_t CatalogMirrorRowBudget() {
+	static const idx_t budget = [] {
+		auto *env = getenv("MSSQL_DUCKLAKE_CATALOG_MIRROR_ROWS");
+		return static_cast<idx_t>(env ? std::strtoull(env, nullptr, 10) : 1000000);
+	}();
+	return budget;
+}
+
 //! specs/020: every catalog load both ways, ours and DuckLake's, failing on the first field that
 //! differs. On in the integration suite; a ducklake bump that adds to the catalog fails it there.
 inline bool VerifyCatalogEnabled() {

@@ -185,6 +185,45 @@ SELECT count(*) > 20 FROM ducklake_snapshots('b');
 ----
 true
 
+# Another node writes after b holds its mirror (specs/020 B3): b reads nothing pushed to it - it
+# catches up from the server when a snapshot past its own is asked for, and every load is verified
+statement ok
+ALTER TABLE a.s1.t ADD COLUMN later INTEGER DEFAULT 7;
+
+statement ok
+INSERT INTO a.s1.t (id, name) VALUES (3, 'three');
+
+statement ok
+CREATE TABLE a.s1.fresh AS SELECT 1 AS f;
+
+query II
+SELECT id, later FROM b.s1.t ORDER BY id;
+----
+1	7
+2	7
+3	7
+
+query I
+SELECT count(*) FROM b.s1.fresh;
+----
+1
+
+statement ok
+DROP TABLE a.s1.fresh;
+
+statement error
+SELECT * FROM b.s1.fresh;
+----
+does not exist
+
+statement ok
+CREATE MACRO a.s1.twice(x) AS x * 2;
+
+query I
+SELECT b.s1.twice(21);
+----
+42
+
 # the flush reads each table at the schema version its inlined rows were written at
 statement ok
 SELECT count(*) FROM ducklake_flush_inlined_data('a');
@@ -194,6 +233,7 @@ SELECT id, extra FROM b.s1.t ORDER BY id;
 ----
 1	e
 2	e
+3	e
 
 statement ok
 DETACH b;

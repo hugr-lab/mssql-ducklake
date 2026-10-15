@@ -48,7 +48,7 @@ src/
   mssql_catalog_shape.cpp        # what shapes a catalog: keys, indexes, collations, the database option (004, 006, 012)
   mssql_server_commit.cpp        # phase 2: the commit staged and applied on the server (005)
   mssql_metadata_queries.cpp     # the queries written in T-SQL: the conflict check (007), the read layer (008)
-  mssql_catalog_load.cpp         # the catalog load in one T-SQL statement, and its verify switch (020)
+  mssql_catalog_load.cpp         # the catalog load: one T-SQL statement, a mirror per ATTACH, the verify switch (020)
   include/                       # the class header, mssql_metadata_internal.hpp (switches + shared helpers)
 ducklake/                        # submodule, EMBEDDED: add_subdirectory(ducklake/src) supplies
                                  #   ALL_OBJECT_FILES; never modified, never loaded separately
