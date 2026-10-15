@@ -54,6 +54,7 @@ set(EXTENSION_SOURCES
     src/mssql_commit_batch.cpp
     src/mssql_catalog_lengths.cpp
     src/mssql_trace.cpp
+    src/mssql_catalog_load.cpp
     ${ALL_OBJECT_FILES})
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

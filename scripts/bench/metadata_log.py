@@ -35,6 +35,10 @@ import subprocess
 import sys
 
 LOAD = (
+    # by path, so no autoload is needed - and on the duckdb 2.0 line a flush asks for `ducklake` by
+    # NAME, whose autoload fails against the build's own repository and ends the session
+    "SET autoload_known_extensions = false;\n"
+    "SET autoinstall_known_extensions = false;\n"
     "LOAD 'build/release/extension/mssql/mssql.duckdb_extension';\n"
     "LOAD 'build/release/extension/mssql_ducklake/mssql_ducklake.duckdb_extension';\n"
     "SET logging_storage = 'memory';\n"
