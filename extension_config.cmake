@@ -12,15 +12,12 @@ duckdb_extension_load(mssql_ducklake
 
 # The runtime dependency, as a loadable (DONT_LINK): production pairs the extension with the
 # distributed mssql artifact, so the tests do too - loaded by build path
-# (`LOAD '__BUILD_DIRECTORY__/extension/mssql/...'`). The pin is the release tag built against
-# the v1.5 line (v0.2.5: the catalog's default schema is dbo, multi-scan plans on a pinned
-# connection materialize - spec 003); its openssl/simdutf arrive through the merged vcpkg manifest.
-# RECON (specs/015): mssql main ed7cb2e - spec 081's given-shape vehicle (`mssql_scan_unsafe`,
-# #407), RPC parameters (083), metadata query shapes (084), the native_types ATTACH option, on the
-# same duckdb pin (4fbae437b22, #418). Move to a release tag before merge.
+# (`LOAD '__BUILD_DIRECTORY__/extension/mssql/...'`); its openssl/simdutf arrive through the merged
+# vcpkg manifest. Pinned to mssql-extension 0.3.0 (main ef1a807, #482) on the same duckdb
+# (bde1b27b461): the commit community-extensions' ref_next names for mssql.
 duckdb_extension_load(mssql
     GIT_URL https://github.com/hugr-lab/mssql-extension
-    GIT_TAG 412c63fdd48b441d8ea264aabd61debf0413ceeb
+    GIT_TAG ef1a807ffbdd3c3a375ee10ff63e65f55b8efe7f
 )
 
 # RECON (specs/015): the postgres arm of the bench. The 2.0-line duckdb is a dev build with no
