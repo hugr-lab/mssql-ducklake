@@ -21,9 +21,9 @@ model, the full manager plan §7: transpiler, keys + filtered indexes, server-si
 
   | Piece | Where | Pin |
   | --- | --- | --- |
-  | duckdb | submodule `duckdb/` | `4fbae437b22`, the v2.0-cyanoptera line (tag `v2.0.0` once released) |
-  | ducklake | submodule `ducklake/` (EMBEDDED — compiled into the extension) | branch `main` (SHA in the submodule) |
-  | mssql | `extension_config.cmake` (runtime pair, test loadable) | main `ed7cb2e` (a release tag once one is cut for 2.0) |
+  | duckdb | submodule `duckdb/` | `bde1b27b461`, the v2.0-cyanoptera line (tag `v2.0.0` once released) |
+  | ducklake | submodule `ducklake/` (EMBEDDED — compiled into the extension) | branch `main` (SHA in the submodule); for now the head of duckdb/ducklake#1680, which main needs to build on this duckdb |
+  | mssql | `extension_config.cmake` (runtime pair, test loadable) | `412c63f`, hugr-lab/mssql-extension#480 (main once it merges; a release tag once one is cut for 2.0) |
   | extension-ci-tools | submodule `extension-ci-tools/` | branch `main` (its v2.0 branch once it exists) |
   | CI reusable workflows | `.github/workflows/distribution.yml`, `release.yml` | `@main`, `duckdb_version: <the duckdb SHA>`, distribution with `skip_tests` until `v2.0.0` (a SHA does not fit the extension metadata; ci.yml runs the tests) |
 

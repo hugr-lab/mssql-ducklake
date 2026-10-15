@@ -20,7 +20,7 @@ duckdb_extension_load(mssql_ducklake
 # same duckdb pin (4fbae437b22, #418). Move to a release tag before merge.
 duckdb_extension_load(mssql
     GIT_URL https://github.com/hugr-lab/mssql-extension
-    GIT_TAG 1e44779996c69d70e977ff0e0c5aed73f2f38657
+    GIT_TAG 412c63fdd48b441d8ea264aabd61debf0413ceeb
 )
 
 # RECON (specs/015): the postgres arm of the bench. The 2.0-line duckdb is a dev build with no
