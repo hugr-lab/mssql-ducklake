@@ -242,6 +242,7 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Query(DuckLakeSnapshot snapshot, s
 	if (auto written = TryRewriteWrite(snapshot, query)) {
 		return written;
 	}
+	SubstituteServerScanPlaceholders(query, &snapshot);
 	return DuckLakeMetadataManager::Query(snapshot, query);
 }
 
@@ -250,10 +251,11 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Query(DuckLakeSnapshot snapshot, s
 //===--------------------------------------------------------------------===//
 
 //! One T-SQL statement as the sole source of a DuckDB query - the only shape mssql v0.2.5 runs on
-//! the pinned connection inside a transaction (design 002 section 3.1). The text keeps the base's
-//! placeholders: {METADATA_SCHEMA_ESCAPED} and {SNAPSHOT_ID} are substituted by the base's Query
-//! after this, on the finished statement, which is why the schema is the identifier form and not
-//! the literal one - a literal would arrive with quotes the doubling below has already passed.
+//! the pinned connection inside a transaction (design 002 section 3.1). The text keeps the
+//! placeholders: {METADATA_SCHEMA_ESCAPED} and {SNAPSHOT_ID} are substituted in Query after this
+//! (SubstituteServerScanPlaceholders), on the finished statement, which is why the schema is the
+//! identifier form and not the literal one - a literal would arrive with quotes the doubling below
+//! has already passed.
 static string ServerScan(const string &tsql, const string &columns) {
 	return "FROM mssql_scan_unsafe({METADATA_CATALOG_NAME_LITERAL}, '" + StringUtil::Replace(tsql, "'", "''") +
 	       "', columns := " + columns + ")";
@@ -282,30 +284,18 @@ static idx_t ScalarOf(QueryResult &result, const string &context, idx_t absent) 
 // nothing is warmed and the batch pays the load itself. So they stay on the catalog path.
 
 string MSSQLMetadataManager::GetInlinedDeletionTableName(TableIndex table_id, DuckLakeSnapshot snapshot,
-                                                         bool create_if_not_exists, bool include_local_changes) {
+                                                         bool include_local_changes) {
 	auto table_name = InlinedFileDeletionTableName(table_id);
 	// as the base: a reader of local changes reads the flushed deletions from local delete files
-	if (!create_if_not_exists && include_local_changes && transaction.InlinedFileDeletionsFlushed(table_id)) {
+	if (include_local_changes && transaction.InlinedFileDeletionsFlushed(table_id)) {
 		return string();
 	}
-	if (create_if_not_exists) {
-		// Reached only by a pin whose commit loop asks the virtual WriteNewInlinedFileDeletes; this
-		// one calls the static batch builder and the Execute seam catches the DDL instead. Either
-		// way the table is created the manager's way, keyed (specs/006 D5b).
-		if (created_deletion_tables.find(table_id.index) == created_deletion_tables.end()) {
-			auto &catalog = transaction.GetCatalog();
-			if (catalog.CheckInlinedDeletionTableCache(table_id, snapshot) != InlinedDeletionCacheResult::EXISTS) {
-				CreateInlinedDeletionTable(table_name);
-			}
-			created_deletion_tables.insert(table_id.index);
-		}
-		return table_name;
-	}
-
-	// The read path. The catalog-level cache is the base's and is consulted the same way; what
-	// differs is the probe behind a miss. The base runs `SELECT NULL FROM <table> LIMIT 1` through
-	// the catalog and reads its error state as "absent" - and on a miss the mssql extension reloads
-	// the whole schema's metadata to find out. OBJECT_ID is one round trip and one row either way.
+	// The table itself is created by the commit batch's DDL, which the Execute seam turns into ours,
+	// keyed and outside the transaction (specs/006 D5b). The catalog-level cache is the base's and is
+	// consulted the same way; what differs is the probe behind a miss. The base runs
+	// `SELECT NULL FROM <table> LIMIT 1` through the catalog and reads its error state as "absent" -
+	// and on a miss the mssql extension reloads the whole schema's metadata to find out. OBJECT_ID is
+	// one round trip and one row either way.
 	auto &catalog = transaction.GetCatalog();
 	auto cached = catalog.CheckInlinedDeletionTableCache(table_id, snapshot);
 	if (cached == InlinedDeletionCacheResult::EXISTS) {
@@ -320,20 +310,14 @@ string MSSQLMetadataManager::GetInlinedDeletionTableName(TableIndex table_id, Du
 	                       "AS present",
 	                       table_name),
 	    "{'present': 'INTEGER'}");
-	auto result = transaction.Query(snapshot, query);
+	auto result = Query(snapshot, query);
 	auto present = ScalarOf(*result, "Failed to look up the inlined deletion table in DuckLake: ", 0) != 0;
 	if (!present) {
 		catalog.CacheInlinedDeletionTableResult(table_id, snapshot, false);
 		return string();
 	}
-	// Seen through this transaction's own connection, so a table this transaction created but has
-	// not committed is visible too. The catalog-level "exists" is permanent, and that create can
-	// still roll back - so it is recorded only for tables some earlier transaction committed. The
-	// base gets the same protection from its private per-transaction cache, checked before the
-	// probe; we cannot see that cache, so the test is our own record of what we created.
-	if (created_deletion_tables.find(table_id.index) == created_deletion_tables.end()) {
-		catalog.CacheInlinedDeletionTableResult(table_id, snapshot, true);
-	}
+	// created outside any transaction (CreateInlinedDeletionTable), so "exists" cannot roll back
+	catalog.CacheInlinedDeletionTableResult(table_id, snapshot, true);
 	return table_name;
 }
 
@@ -344,7 +328,29 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Query(string &query) {
 	if (auto written = TryRewriteWrite(query)) {
 		return written;
 	}
+	SubstituteServerScanPlaceholders(query);
 	return DuckLakeMetadataManager::Query(query);
+}
+
+void MSSQLMetadataManager::SubstituteServerScanPlaceholders(string &query,
+                                                            optional_ptr<const DuckLakeSnapshot> snapshot) const {
+	// DuckLake 1.1 substitutes its placeholders outside quoted text only
+	// (DuckLakeUtil::ReplacePlaceholders), so a value that merely spells one is left alone - and with it every
+	// placeholder inside our server scans, whose T-SQL travels as the string literal of mssql_scan(_params)_unsafe.
+	// Those statements are ours, so here the replacement is the plain one DuckLake used before, on them and nothing
+	// else. {METADATA_SCHEMA_ESCAPED} DuckLake no longer supplies at all: the schema as a quoted identifier, its quotes
+	// doubled for the literal.
+	if (query.find("_unsafe({METADATA_CATALOG_NAME_LITERAL},") == string::npos) {
+		return;
+	}
+	auto identifier = SQLQuotedIdentifier::ToString(transaction.GetCatalog().MetadataSchemaName());
+	query = StringUtil::Replace(query, "{METADATA_SCHEMA_ESCAPED}", StringUtil::Replace(identifier, "'", "''"));
+	if (snapshot) {
+		query = StringUtil::Replace(query, "{SNAPSHOT_ID}", to_string(snapshot->snapshot_id));
+		query = StringUtil::Replace(query, "{SCHEMA_VERSION}", to_string(snapshot->schema_version));
+		query = StringUtil::Replace(query, "{NEXT_CATALOG_ID}", to_string(snapshot->next_catalog_id));
+		query = StringUtil::Replace(query, "{NEXT_FILE_ID}", to_string(snapshot->next_file_id));
+	}
 }
 
 //===--------------------------------------------------------------------===//
@@ -545,13 +551,15 @@ string MSSQLMetadataManager::CastStatsToTarget(const string &stats, const Logica
 	}
 }
 
-string MSSQLMetadataManager::GenerateFileListQuery(DuckLakeTableEntry &table, const FilterPushdownInfo *filter_info,
+string MSSQLMetadataManager::GenerateFileListQuery(DuckLakeTableEntry &table, DuckLakeSnapshot snapshot,
+                                                   const FilterPushdownInfo *filter_info,
                                                    const vector<DuckLakeFileListDynamicFilter> &dynamic_filters,
                                                    const vector<idx_t> &runtime_filter_stats_columns,
                                                    FileListType file_list_type, const string &metadata_table_prefix) {
 	auto catalog_path = [&]() {
-		return DuckLakeMetadataManager::GenerateFileListQuery(
-		    table, filter_info, dynamic_filters, runtime_filter_stats_columns, file_list_type, metadata_table_prefix);
+		return DuckLakeMetadataManager::GenerateFileListQuery(table, snapshot, filter_info, dynamic_filters,
+		                                                      runtime_filter_stats_columns, file_list_type,
+		                                                      metadata_table_prefix);
 	};
 	if (ServerFileListDisabled()) {
 		return catalog_path();
@@ -563,7 +571,7 @@ string MSSQLMetadataManager::GenerateFileListQuery(DuckLakeTableEntry &table, co
 	string query;
 	building_tsql_file_list = true;
 	try {
-		query = DuckLakeMetadataManager::GenerateFileListQuery(table, filter_info, dynamic_filters,
+		query = DuckLakeMetadataManager::GenerateFileListQuery(table, snapshot, filter_info, dynamic_filters,
 		                                                       runtime_filter_stats_columns, file_list_type,
 		                                                       "{METADATA_SCHEMA_ESCAPED}");
 	} catch (...) {
@@ -714,6 +722,19 @@ constexpr idx_t STATS_CACHE_MAX_REREADS = 64;
 
 } // namespace
 
+//! DuckLake's global stats query narrowed to one table: upstream dropped its own table filter, so it
+//! goes in before the ORDER BY its builder ends with - and a builder that no longer ends that way
+//! fails here rather than reading every table's stats as one table's.
+static string TableGlobalStatsQuery(bool include_exactness, idx_t table_id) {
+	auto query = DuckLakeMetadataManager::GlobalTableStatsQuery(include_exactness);
+	const string order_by = "ORDER BY table_id\n";
+	auto pos = query.rfind(order_by);
+	if (pos == string::npos) {
+		throw InternalException("mssql_ducklake: DuckLake's global stats query has no ORDER BY table_id");
+	}
+	return query.insert(pos, StringUtil::Format("WHERE table_id = %llu\n", table_id));
+}
+
 vector<DuckLakeGlobalStatsInfo> MSSQLMetadataManager::GetGlobalTableStats(DuckLakeSnapshot snapshot) {
 	// DuckLake asks for every table's stats once per snapshot (174a6f56), and a commit into one table
 	// is a new snapshot - so each commit read all of them: 1000 tables x 41 columns, 15-30 ms on the
@@ -815,7 +836,7 @@ vector<DuckLakeGlobalStatsInfo> MSSQLMetadataManager::GetGlobalTableStats(DuckLa
 			tables.erase(table_id);
 		}
 		for (auto &table_id : reread) {
-			auto stats_query = GlobalTableStatsQuery(v1_1, table_id.index);
+			auto stats_query = TableGlobalStatsQuery(v1_1, table_id.index);
 			auto result = Query(snapshot, stats_query);
 			auto stats = ParseGlobalTableStats(*result);
 			FillMissingTableSizes(stats, [&](string query) { return Query(snapshot, query); });

@@ -344,6 +344,33 @@ SELECT column_id, contains_null, max_value FROM mssql_scan('srv', 'SELECT CAST(s
 2	true	v99
 3	false	149.5
 
+# Two transactions on two connections, the second committing first: the first one's commit runs
+# the conflict check, our one-statement T-SQL (specs/007), whose {SNAPSHOT_ID} sits inside the
+# server scan's string literal - which DuckLake 1.1 no longer substitutes, so the manager does. One
+# process, one statement each: the regression the multi-process make test-concurrent found first.
+statement ok
+CREATE TABLE lake.conflict_a(i INTEGER);
+
+statement ok
+CREATE TABLE lake.conflict_b(i INTEGER);
+
+statement ok con1
+BEGIN
+
+statement ok con1
+INSERT INTO lake.conflict_a VALUES (1);
+
+statement ok con2
+INSERT INTO lake.conflict_b VALUES (2);
+
+statement ok con1
+COMMIT
+
+query II
+SELECT (SELECT sum(i) FROM lake.conflict_a), (SELECT sum(i) FROM lake.conflict_b);
+----
+1	2
+
 statement ok
 DETACH lake;
 

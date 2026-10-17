@@ -88,7 +88,7 @@ query II
 SELECT key, value FROM mssql_scan('srv', 'SELECT [key], [value] FROM dbo.ducklake_metadata WHERE [key] IN (''version'', ''encrypted'')') ORDER BY key;
 ----
 encrypted	false
-version	1.1-dev1
+version	1.1
 
 query I
 SELECT snapshot_id FROM ducklake_snapshots('lake');
@@ -601,13 +601,13 @@ SELECT count(*) FROM mssql_scan('srv', 'SELECT name FROM sys.extended_properties
 ----
 0
 
-# and the migration marker: a catalog this build created at 1.1-dev1 has nothing to migrate, and
-# without the marker every writable attach re-ran the migration - on every node attaching before the
-# first was done, which deadlocked them against each other's marker reads (1205)
+# and the migration marker: a catalog this build created at 1.1 has nothing to migrate, and without
+# the marker an AUTOMATIC_MIGRATION attach re-ran it - on 1.1-dev1 every writable attach did, on every
+# node attaching before the first was done, which deadlocked them against each other's marker reads (1205)
 query I
 SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(64)) AS v FROM sys.extended_properties WHERE class = 1 AND major_id = OBJECT_ID(''dbo.ducklake_metadata'') AND minor_id = 0 AND name = ''mssql_ducklake_migration''');
 ----
-1.1-dev1/1
+1.1/1
 
 # A catalog shaped by an OLDER build is brought up to the current shape on attach. It was not: the
 # marker used to be the presence of one constraint, which answers "some build shaped this" - so a
