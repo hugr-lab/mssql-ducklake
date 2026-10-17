@@ -233,6 +233,37 @@ the repeated call return at once. When 1.1 is final, the repeated calls stop.
     held by the attach transaction it would make the attach's own shaping a conversion two
     attaches deadlock on; the same session holding it exclusively is granted at once, verified).
   After: 0 of 60 in five runs.
+- **Format 1.1, final** (ducklake#1799, 2026-10-17; pinned at `ca86db02` with DuckDB `f8f3f4dcd95`).
+  `1.1` replaces `1.1-dev1` as the latest format, and DuckLake no longer evolves a dev catalog in
+  place: a plain attach of a `1.1-dev1` catalog refuses and asks for `AUTOMATIC_MIGRATION`, which
+  runs the one migration `MigrateV10(from_dev1)` - from `1.0` and `1.1-dev1` alike. So:
+  - `MigrateV10Dev` is gone, and with it the per-attach re-run this section was about. The marker
+    stays (`1.1/1`): it is what the nodes that waited on the shaping lock read to do nothing. A
+    `1.1-dev1` catalog an earlier build migrated carries `1.1-dev1/1`, so its migration runs again,
+    guarded as ever, and moves the version from `1.1-dev1` to `1.1`.
+  - Upstream's migration gained two data repairs, and both are T-SQL in our batch, outside the
+    attach transaction like the rest of it. The struct-field defaults a rename lost
+    (`MigrateRenamedFieldDefaults`) are an `UPDATE … AS … FROM` with no T-SQL form. The schema
+    versions of older inlined tables (`MigrateInlinedSchemaVersions`) would run through duckdb, but
+    inside the attach transaction, holding locks on `ducklake_schema_versions` while the shaping, on
+    a connection of its own, may rebuild that table's key. `migrate_v11.test` removes such a row
+    from a 1.0 catalog and checks the migration restores it.
+  - The migration marker is no longer read: only `MigrateV10Dev` asked it. The batch still checks it
+    under the shaping lock.
+  - DuckLake now substitutes placeholders outside quoted text only (`ReplacePlaceholders`, so a value
+    that spells one is left alone), and dropped `{METADATA_SCHEMA_ESCAPED}`. Our server scans carry
+    their T-SQL as the string literal of `mssql_scan(_params)_unsafe`, so their `{SNAPSHOT_ID}` and
+    schema went to the server raw - every attach failed, and with the attach fixed the conflict
+    check still did: `make test-concurrent` lost 42 of 60 writers, which the one-connection suite
+    never reaches. The manager now substitutes, the plain way, in its own server scans only
+    (`SubstituteServerScanPlaceholders`); `write_shapes.test` commits two transactions from two
+    connections so the suite runs the conflict check too (it fails without the fix).
+  - The rest of the port: the global stats query lost its table filter, ours
+    adds it before the `ORDER BY` (and fails loudly if that anchor moves); the deletion-table
+    lookup lost its create path (the batch's DDL creates the table, through the Execute seam);
+    `DroppedTablesStayReadable` answers `false`, as on postgres and sqlite.
+  - DuckLake now refuses to inline a negative interval (ducklake#1727): it could not be flushed to
+    Parquet. `inlined_rows.test` asserts the refusal and keeps a large positive one.
 
 ### R4 — reads: the catalog load is the target
 

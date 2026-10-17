@@ -63,15 +63,13 @@ MSSQLMetadataManager::CatalogMarkers MSSQLMetadataManager::ReadCatalogMarkers() 
 		    schema_name);
 	};
 	auto result = TracedQuery(
-	    connection,
-	    StringUtil::Format(
-	        "SELECT present, shape, migration, limits FROM mssql_scan_unsafe(%s, 'DECLARE @lock INT; %sBEGIN TRY "
-	        "SELECT CAST(CASE WHEN %s IS NULL THEN 0 ELSE 1 END AS BIGINT) AS present, %s AS shape, %s AS migration, "
-	        "%s AS limits; END TRY BEGIN CATCH %sTHROW; END CATCH; %s', columns := {'present': 'BIGINT', "
-	        "'shape': 'BIGINT', 'migration': 'VARCHAR', 'limits': 'VARCHAR'})",
-	        CatalogLiteral(), applock(true), anchor, property(SHAPE_VERSION_PROPERTY, "BIGINT"),
-	        property(MIGRATION_MARKER_PROPERTY, "NVARCHAR(64)"), property(LIMITS_PROPERTY, "NVARCHAR(400)"),
-	        applock(false), applock(false)));
+	    connection, StringUtil::Format(
+	                    "SELECT present, shape, limits FROM mssql_scan_unsafe(%s, 'DECLARE @lock INT; %sBEGIN TRY "
+	                    "SELECT CAST(CASE WHEN %s IS NULL THEN 0 ELSE 1 END AS BIGINT) AS present, %s AS shape, "
+	                    "%s AS limits; END TRY BEGIN CATCH %sTHROW; END CATCH; %s', columns := {'present': 'BIGINT', "
+	                    "'shape': 'BIGINT', 'limits': 'VARCHAR'})",
+	                    CatalogLiteral(), applock(true), anchor, property(SHAPE_VERSION_PROPERTY, "BIGINT"),
+	                    property(LIMITS_PROPERTY, "NVARCHAR(400)"), applock(false), applock(false)));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to inspect the DuckLake catalog on SQL Server: ");
 	}
@@ -84,10 +82,8 @@ MSSQLMetadataManager::CatalogMarkers MSSQLMetadataManager::ReadCatalogMarkers() 
 	auto shape = chunk->GetValue(1, 0);
 	markers.shaped = !shape.IsNull();
 	markers.shape_current = !shape.IsNull() && shape.GetValue<int64_t>() >= SHAPE_VERSION;
-	auto limits = chunk->GetValue(3, 0);
+	auto limits = chunk->GetValue(2, 0);
 	markers.limits = limits.IsNull() ? string() : limits.ToString();
-	auto migration = chunk->GetValue(2, 0);
-	markers.migration_current = !migration.IsNull() && migration.ToString() == MIGRATION_MARKER;
 	return markers;
 }
 
@@ -116,7 +112,7 @@ void MSSQLMetadataManager::RequireUtf8Collation() {
 }
 
 //===--------------------------------------------------------------------===//
-// The 1.0 -> 1.1-dev1 migration, in T-SQL (design/005)
+// The 1.0 (or 1.1-dev1) -> 1.1 migration, in T-SQL (design/005)
 //===--------------------------------------------------------------------===//
 
 //! Why this is ours. DuckLake's migration is `ALTER TABLE … ADD COLUMN {IF_NOT_EXISTS} …` plus a
@@ -127,13 +123,12 @@ void MSSQLMetadataManager::RequireUtf8Collation() {
 //!   SQL Server error 2705: Column names in each table must be unique.
 //!   Column name 'row_group_count' in table 'dbo.ducklake_data_file' is specified more than once.
 //!
-//! - which `MigrateV10Dev` turns into a warning, leaving the catalog at 1.0 for good. So the three
-//! migration virtuals are overridden and none of their SQL is touched: the same migration, written
-//! the way the shaping writes everything, each step guarded by the server's own catalog views, so a
+//! So the migration virtuals are overridden and none of their SQL is touched: the same migration,
+//! written the way the shaping writes everything, each step guarded by the server's own catalog views, so a
 //! re-run is a no-op instead of an error. The pre-1.0 migrations have the same problem and are
 //! left alone: every catalog a release of this extension created is at 1.0 or later, because 1.0 was
 //! the latest format on the line it shipped on.
-//! The columns 1.1-dev1 adds, in this catalog's types rather than DuckLake's spelling: BOOLEAN is
+//! The columns 1.1 adds, in this catalog's types rather than DuckLake's spelling: BOOLEAN is
 //! BIT here. Beside them the migration adds one table, ducklake_view_column_tag.
 static const vector<pair<string, string>> &MigrationAddedColumns() {
 	static const vector<pair<string, string>> added_columns = {
@@ -145,9 +140,9 @@ static const vector<pair<string, string>> &MigrationAddedColumns() {
 	return added_columns;
 }
 
-void MSSQLMetadataManager::MigrateToV1_1Dev1() {
-	// META_LIMITS narrows a catalog only on its way from 1.0 (specs/018): DuckLake re-runs this for a
-	// dev format on every writable attach, and a catalog already at 1.1 lives with the limits it has.
+void MSSQLMetadataManager::MigrateToV1_1() {
+	// META_LIMITS narrows a catalog only on its way from 1.0 (specs/018): a 1.1-dev1 catalog an earlier
+	// build migrated lives with the limits it has.
 	// Read before anything below changes the version.
 	const bool from_v1_0 = CatalogVersion() == "1.0";
 	// and checked before it too: a META_LIMITS shorter than what is stored fails the attach while the
@@ -179,10 +174,43 @@ void MSSQLMetadataManager::MigrateToV1_1Dev1() {
 	                          "column_name VARCHAR(MAX) COLLATE %s, begin_snapshot BIGINT, end_snapshot BIGINT, "
 	                          "[key] VARCHAR(MAX) COLLATE %s, value VARCHAR(MAX) COLLATE %s); SET @changed = 1; END;\n",
 	                          schema_literal, schema, VARCHAR_COLLATION, VARCHAR_COLLATION, VARCHAR_COLLATION);
+	// DuckLake's MigrateInlinedSchemaVersions, the same statement in T-SQL: the schema versions older
+	// versions did not record for an inlined table, read back off the snapshot that moved the schema
+	// version. Here rather than through duckdb because duckdb would run it in the attach transaction,
+	// holding locks on ducklake_schema_versions while the shaping - on a connection of its own - may
+	// rebuild that table's key. Idempotent: NOT EXISTS.
+	ddl += StringUtil::Format(
+	    "INSERT INTO %s.ducklake_schema_versions (begin_snapshot, schema_version, table_id) "
+	    "SELECT DISTINCT commits.snapshot_id, idt.schema_version, idt.table_id FROM ("
+	    "SELECT snapshot_id, schema_version, LAG(snapshot_id) OVER (ORDER BY snapshot_id) AS previous_snapshot_id, "
+	    "LAG(schema_version) OVER (ORDER BY snapshot_id) AS previous_schema_version FROM %s.ducklake_snapshot) commits "
+	    "JOIN %s.ducklake_inlined_data_tables idt ON idt.schema_version > commits.previous_schema_version "
+	    "AND idt.schema_version <= commits.schema_version "
+	    "WHERE commits.previous_snapshot_id = commits.snapshot_id - 1 "
+	    "AND commits.previous_schema_version < commits.schema_version "
+	    "AND NOT EXISTS (SELECT 1 FROM %s.ducklake_schema_versions sv WHERE sv.table_id = idt.table_id "
+	    "AND sv.schema_version = idt.schema_version) "
+	    "AND (SELECT COUNT(*) FROM %s.ducklake_schema_versions sv WHERE sv.table_id = idt.table_id "
+	    "AND sv.begin_snapshot <= commits.snapshot_id) > 1;\n",
+	    schema, schema, schema, schema, schema);
+	// DuckLake's MigrateRenamedFieldDefaults in T-SQL - its `UPDATE … AS renamed … FROM` has no T-SQL
+	// form: a struct field's defaults cannot change, so a later row of the field without them lost
+	// them in a rename. Idempotent, like the rest: a restored row no longer has a NULL default.
+	ddl += StringUtil::Format(
+	    "UPDATE renamed SET initial_default = original.initial_default, default_value = original.default_value, "
+	    "default_value_type = original.default_value_type, default_value_dialect = original.default_value_dialect "
+	    "FROM %s.ducklake_column AS renamed JOIN %s.ducklake_column AS original "
+	    "ON original.table_id = renamed.table_id AND original.column_id = renamed.column_id "
+	    "WHERE renamed.parent_column IS NOT NULL AND renamed.initial_default IS NULL "
+	    "AND original.initial_default IS NOT NULL AND original.begin_snapshot < renamed.begin_snapshot "
+	    "AND NOT EXISTS (SELECT 1 FROM %s.ducklake_column later WHERE later.table_id = original.table_id "
+	    "AND later.column_id = original.column_id AND later.initial_default IS NOT NULL "
+	    "AND later.begin_snapshot > original.begin_snapshot AND later.begin_snapshot < renamed.begin_snapshot);\n",
+	    schema, schema, schema);
 	// the value is named as well as the key: this runs on a 1.0 or an already-migrated catalog and
 	// nothing else, so a stray call cannot relabel a catalog of some later format as this one
-	ddl += StringUtil::Format("UPDATE %s.ducklake_metadata SET value = N'1.1-dev1' "
-	                          "WHERE [key] = N'version' AND value IN (N'1.0', N'1.1-dev1');\n",
+	ddl += StringUtil::Format("UPDATE %s.ducklake_metadata SET value = N'1.1' "
+	                          "WHERE [key] = N'version' AND value IN (N'1.0', N'1.1-dev1', N'1.1');\n",
 	                          schema);
 	// the marker, last: this build's migration has run on this catalog (specs/015 R3)
 	ddl += StringUtil::Format(
@@ -217,7 +245,7 @@ void MSSQLMetadataManager::MigrateToV1_1Dev1() {
 	    "OBJECT_ID(QUOTENAME(%s) + '.ducklake_metadata') AND minor_id = 0 AND name = '%s' "
 	    "AND CAST(value AS NVARCHAR(64)) = N'%s')\nBEGIN\n%sEND;\nCOMMIT TRANSACTION;\n",
 	    schema_name, schema_literal, MIGRATION_MARKER_PROPERTY, MIGRATION_MARKER, ddl);
-	RunServerSideOutsideTransaction(locked_ddl, "Failed to migrate the DuckLake catalog to v1.1-dev1: ");
+	RunServerSideOutsideTransaction(locked_ddl, "Failed to migrate the DuckLake catalog to v1.1: ");
 	// the limits the ATTACH that migrates asks for (specs/018) - before the shaping, which reads them
 	if (from_v1_0) {
 		ApplyMigrationLimits();
@@ -303,7 +331,7 @@ void MSSQLMetadataManager::MigrateInlinedColumnNames(bool probe_renamed) {
 	            "WHERE c.name IN ('row_id', 'begin_snapshot', 'end_snapshot')",
 	            schema, schema_literal))));
 	if (listing->HasError()) {
-		listing->GetErrorObject().Throw("Failed to list the inlined tables to rename to v1.1-dev1: ");
+		listing->GetErrorObject().Throw("Failed to list the inlined tables to rename to v1.1: ");
 	}
 	vector<string> renamed;
 	while (auto chunk = listing->Fetch()) {
@@ -333,41 +361,21 @@ BEGIN
 END;
 )",
 	                                    schema_literal, schema, schema_literal);
-	RunServerSideOutsideTransaction(statement, "Failed to rename the inlined metadata columns to v1.1-dev1: ");
-	// the renamed tables' cached columns are the old names (see MigrateToV1_1Dev1)
+	RunServerSideOutsideTransaction(statement, "Failed to rename the inlined metadata columns to v1.1: ");
+	// the renamed tables' cached columns are the old names (see MigrateToV1_1)
 	for (auto &table : renamed) {
 		InvalidateTableCache(table);
 	}
 }
 
-//! The explicit path, `ATTACH … (AUTOMATIC_MIGRATION TRUE)`: every statement is guarded, so a
-//! failure here is a real one and is left to surface.
-void MSSQLMetadataManager::MigrateV10(bool allow_failures) {
-	MigrateToV1_1Dev1();
-}
-
-//! The attach-time path, and DuckLake runs it on EVERY writable attach: `1.1-dev1` is a development
-//! format, its version string does not move when upstream adds another column under the same name,
-//! so a catalog stamped by an earlier build can be missing a later addition and re-applying is the
-//! only way to know (ducklake_initializer.cpp). Upstream's re-run is nine cheap duckdb statements.
-//! Ours is one server-side batch - but it ends by dropping the shape stamp, and that made
-//! EnsureCatalogShape re-shape the whole catalog on every attach: 0.8 s of the 1.8 s an attach of a
-//! 1000-table catalog cost, measured by scripts/bench/attach_probe.py. So the stamp answers the
-//! question instead of being invalidated by it: it is written after the shaping, which runs after
-//! the migration, so a current stamp means a build wanting this shape has already done both. The
-//! version is 1.1-dev1 here by construction - that is the branch DuckLake took to get here - and a
-//! 1.0 catalog arrives at MigrateV10, which always runs.
-//!
-//! The marker answers that, not the shape stamp (specs/015 R3): they move independently.
-//!
-//! Upstream also splits the re-run in two halves and logs a warning for each, because either can
-//! fail on a catalog it has already half-migrated; ours cannot, so there is nothing to swallow and
-//! the error is the answer here too.
-void MSSQLMetadataManager::MigrateV10Dev() {
-	if (ReadCatalogMarkers().migration_current) {
-		return;
-	}
-	MigrateToV1_1Dev1();
+//! `ATTACH … (AUTOMATIC_MIGRATION TRUE)` on a 1.0 catalog, or on a 1.1-dev1 one an earlier build
+//! created (DuckLake 1.1 opens a dev format only to migrate it). Every statement is guarded, so a
+//! failure here is a real one and is left to surface. DuckLake's two data repairs - the schema
+//! versions of older inlined tables, the defaults a struct-field rename lost - are T-SQL in the
+//! batch, idempotent both, before the version moves, in upstream's order.
+void MSSQLMetadataManager::MigrateV10(bool from_dev1) {
+	(void)from_dev1;
+	MigrateToV1_1();
 }
 
 string MSSQLMetadataManager::CatalogVersion() {
@@ -944,14 +952,14 @@ void MSSQLMetadataManager::EnsureCatalogShape() {
 		    SHAPE_VERSION_PROPERTY, schema_literal);
 	}
 	// and the migration marker, when the catalog already has everything the migration adds - one this
-	// build created at 1.1-dev1. Without it DuckLake's re-run of the migration on every writable
-	// attach found no marker and ran the whole batch, on every node attaching before the first was
-	// done; their batches and marker reads deadlocked (1205) when several nodes attached a new lake.
+	// build created at 1.1. Without it an AUTOMATIC_MIGRATION attach found no marker and ran the whole
+	// batch; on 1.1-dev1, re-run on every attach, the batches and marker reads of several nodes
+	// attaching a new lake deadlocked (1205).
 	// Asked of the server as the batch runs: the state above holds only the string columns.
 	if (!state.properties.count(MIGRATION_MARKER_PROPERTY)) {
 		string migrated = StringUtil::Format(
 		    "OBJECT_ID(QUOTENAME(%s) + '.ducklake_view_column_tag') IS NOT NULL AND EXISTS (SELECT 1 FROM "
-		    "%s.ducklake_metadata WHERE [key] = N'version' AND value = N'1.1-dev1')",
+		    "%s.ducklake_metadata WHERE [key] = N'version' AND value = N'1.1')",
 		    schema_literal, schema);
 		for (auto &entry : MigrationAddedColumns()) {
 			migrated += StringUtil::Format(" AND COL_LENGTH(QUOTENAME(%s) + '.%s', '%s') IS NOT NULL", schema_literal,

@@ -55,7 +55,7 @@ INSERT INTO expected VALUES
  999.9, 99999999999999.9999, 9999999999999999999999999999.9999999999, 3.4e38, 1.7976931348623157e308,
  DATE '9999-12-31', TIME '23:59:59.999999', TIMESTAMP '9999-12-31 23:59:59.999999', TIMESTAMP_MS '9999-12-31 23:59:59.999',
  TIMESTAMP_S '9999-12-31 23:59:59', TIMESTAMP_NS '2262-04-11 23:47:16.854775', '9999-12-31 23:59:59.999999+00'::TIMESTAMPTZ,
- INTERVAL '-5 days', '23:59:59-12:00'::TIMETZ, 'ffffffff-ffff-ffff-ffff-ffffffffffff',
+ INTERVAL '178000000 years 11 months 30 days 23:59:59.999999', '23:59:59-12:00'::TIMETZ, 'ffffffff-ffff-ffff-ffff-ffffffffffff',
  'it''s "q" ключ 日本 🦆 {SNAPSHOT_ID} ; -- x', '\x00\xFF\x27abc'::BLOB),
 (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
  NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
@@ -67,6 +67,13 @@ INSERT INTO expected VALUES
 
 statement ok
 CREATE TABLE lake.t AS SELECT * FROM expected LIMIT 0;
+
+# a negative interval is not inlined: DuckLake refuses it (ducklake#1727), since a flush could not
+# write it to Parquet - and the row goes to a Parquet file of its own, which refuses it too
+statement error
+INSERT INTO lake.t (id, iv) VALUES (9, INTERVAL '-5 days');
+----
+Parquet files do not support negative intervals
 
 # one commit a row, then all four in one commit
 statement ok

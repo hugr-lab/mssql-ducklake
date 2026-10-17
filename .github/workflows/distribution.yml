@@ -5,7 +5,7 @@
 # On the DuckDB 2.0 line, pinned to the duckdb submodule's commit. Until v2.0.0 is tagged this is a
 # build check across the platforms, without the tests: the reusable workflow turns duckdb_version
 # into the build's version string, and an extension's metadata keeps 32 bytes of a 40-character SHA,
-# so the loadables refuse to LOAD in a test ("built specifically for DuckDB version 'bde1b27b...'").
+# so the loadables refuse to LOAD in a test ("built specifically for DuckDB version 'f8f3f4dc...'").
 # A branch name would fit but floats past our pin (v2.0-cyanoptera's head already changed an API the
 # embedded ducklake uses). The tests run in ci.yml, on the pinned submodule. At the release:
 # duckdb_version v2.0.0, extension-ci-tools' v2.0 branch, and skip_tests goes.
@@ -29,7 +29,7 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       extension_name: mssql_ducklake
-      duckdb_version: bde1b27b4610a81739ed6117ecbb85d5b3224ed4
+      duckdb_version: f8f3f4dcd954cea2613572e8cc40a8612698d232
       ci_tools_version: main
       # wasm is out: mssql (raw TDS sockets) does not exist there, and the manager is nothing
       # without it
@@ -42,6 +42,6 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
     with:
       extension_name: mssql_ducklake
-      duckdb_version: bde1b27b4610a81739ed6117ecbb85d5b3224ed4
+      duckdb_version: f8f3f4dcd954cea2613572e8cc40a8612698d232
       ci_tools_version: main
       format_checks: 'format;tidy'

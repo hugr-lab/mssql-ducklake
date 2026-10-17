@@ -1428,6 +1428,7 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 			return last;
 		}
 		string one = stmt + ";";
+		SubstituteServerScanPlaceholders(one, &snapshot);
 		last = DuckLakeMetadataManager::Execute(snapshot, one);
 		if (last->HasError()) {
 			return last;

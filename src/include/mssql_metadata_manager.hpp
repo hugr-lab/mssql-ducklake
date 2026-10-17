@@ -39,6 +39,11 @@ public:
 	//! goes through the manager's cached one. Round trips per commit stop growing with its size -
 	//! 65 flat against 2065 for a thousand data files, and 1.7x faster at that size.
 	bool SupportsAppender() const override;
+	//! A table dropped on SQL Server is gone for every transaction, open ones too - as on postgres and
+	//! sqlite, so DuckLake keeps the empty inlined table an ALTER supersedes rather than dropping it.
+	bool DroppedTablesStayReadable() const override {
+		return false;
+	}
 	//! a new file of this commit carries a statistic longer than the catalog's stats_length (specs/018)
 	bool HasStatsPastBound() const;
 	//! SQL Server sysname is 128 characters
@@ -59,13 +64,11 @@ public:
 	//! than at the end of the commit - see the call site for why the timing matters.
 	void InvalidateTableCache(const string &table_name);
 
-	//! Two jobs. On the create path it is the other place DuckLake creates a table behind the mssql
-	//! extension's back, and ClearCache needs to know which one. On the read path it replaces the
-	//! base's existence probe - a catalog query whose error state means "absent", and which on a
-	//! miss makes the extension reload the whole schema's metadata - with one mssql_scan of
-	//! OBJECT_ID (specs/008 D1).
+	//! Replaces the base's existence probe - a catalog query whose error state means "absent", and
+	//! which on a miss makes the extension reload the whole schema's metadata - with one mssql_scan
+	//! of OBJECT_ID (specs/008 D1).
 	string GetInlinedDeletionTableName(TableIndex table_id, DuckLakeSnapshot snapshot,
-	                                   bool create_if_not_exists = false, bool include_local_changes = true) override;
+	                                   bool include_local_changes = true) override;
 
 	//! The inlined table's DDL is ours: its column types are T-SQL, which the duckdb-parsed commit
 	//! batch could not carry, so it is executed separately (specs/004 D2).
@@ -103,7 +106,8 @@ public:
 	//! postgres, instead of through the catalog path in pieces. DuckLake builds it with our CTE body
 	//! and our casts; a closed list of rewrites makes it T-SQL; anything outside that list keeps the
 	//! catalog path.
-	string GenerateFileListQuery(DuckLakeTableEntry &table, const FilterPushdownInfo *filter_info,
+	string GenerateFileListQuery(DuckLakeTableEntry &table, DuckLakeSnapshot snapshot,
+	                             const FilterPushdownInfo *filter_info,
 	                             const vector<DuckLakeFileListDynamicFilter> &dynamic_filters,
 	                             const vector<idx_t> &runtime_filter_stats_columns, FileListType file_list_type,
 	                             const string &metadata_table_prefix) override;
@@ -128,6 +132,8 @@ public:
 	//! goes to the base untouched. Both query texts are constants in the .cpp; nothing outside needs
 	//! them.
 	unique_ptr<QueryResult> Query(DuckLakeSnapshot snapshot, string &query) override;
+	//! The placeholders inside our server scans' T-SQL literal, which DuckLake's substitution skips.
+	void SubstituteServerScanPlaceholders(string &query, optional_ptr<const DuckLakeSnapshot> snapshot = nullptr) const;
 	//! The snapshot-less overload DuckLake's expiry, cleanup and flush use for their DELETEs: the
 	//! same T-SQL path for a recognised write (specs/014 D3c).
 	unique_ptr<QueryResult> Query(string &query) override;
@@ -235,16 +241,15 @@ private:
 	string TSQLColumnType(const LogicalType &type) const;
 	//! Keys, indexes and collations, written so that running them twice is a no-op.
 	void EnsureCatalogShape();
-	//! The 1.0 -> 1.1-dev1 migration, ours in T-SQL rather than DuckLake's statements run through
-	//! duckdb: `ADD COLUMN {IF_NOT_EXISTS}` has no T-SQL form, so the upstream batch fails the moment
-	//! a column is already there and the catalog silently stays at 1.0 (design/005). Overriding the
-	//! three virtuals is the seam - their SQL is never touched.
-	void MigrateV10(bool allow_failures = false) override;
-	void MigrateV10Dev() override;
+	//! The 1.0 (or 1.1-dev1) -> 1.1 migration, ours in T-SQL rather than DuckLake's statements run
+	//! through duckdb: `ADD COLUMN {IF_NOT_EXISTS}` has no T-SQL form, so the upstream batch fails the
+	//! moment a column is already there (design/005). Overriding the virtuals is the seam - their SQL
+	//! is never touched.
+	void MigrateV10(bool from_dev1 = false) override;
 	void MigrateInlinedColumnNames(bool probe_renamed) override;
-	//! The one implementation behind all three: every statement guarded, so running it twice is a
-	//! no-op rather than an error.
-	void MigrateToV1_1Dev1();
+	//! The one implementation behind both: every statement guarded, so running it twice is a no-op
+	//! rather than an error.
+	void MigrateToV1_1();
 	//! The last step of that shaping, and the only one outside the transaction and allowed to fail:
 	//! the catalog's database options - `PARAMETERIZATION FORCED` (specs/012) and
 	//! `AUTO_UPDATE_STATISTICS_ASYNC` (specs/017), each skipped when its setting is false.
@@ -253,13 +258,12 @@ private:
 	//! (a `sys.databases` condition) holds, a warning naming the statement when the server refuses it.
 	void ApplyDatabaseOption(const char *setting, const char *option, const char *already_set, const char *without_it);
 	//! What the server says about this catalog, in one statement: does it exist yet, is its shape
-	//! this build's, and has this build's migration run on it (specs/015 R3).
+	//! this build's, and the limits it was given (specs/015 R3, specs/018).
 	struct CatalogMarkers {
 		bool present = false;
 		//! a shape stamp of any version: some build of this extension shaped the catalog
 		bool shaped = false;
 		bool shape_current = false;
-		bool migration_current = false;
 		//! the limits recorded at the catalog's creation or migration (specs/018); empty: none yet
 		string limits;
 	};
@@ -304,11 +308,10 @@ private:
 	//! tables are, which is what makes a recreated catalog shape itself again.
 	static constexpr const char *SHAPE_VERSION_PROPERTY = "mssql_ducklake_shape";
 	//! The migration's own marker, beside the stamp and independent of it (specs/015 R3): the format
-	//! and the revision of our migration to it. DuckLake re-runs the migration of a dev format on
-	//! every writable attach; an equal marker makes that a no-op. The revision moves when upstream
-	//! adds to the format under the same name, which brings already-migrated catalogs along.
+	//! and the revision of our migration to it. Nodes attaching one catalog at once all reach the
+	//! migration; the ones that waited on the shaping lock find an equal marker and do nothing.
 	static constexpr const char *MIGRATION_MARKER_PROPERTY = "mssql_ducklake_migration";
-	static constexpr const char *MIGRATION_MARKER = "1.1-dev1/1";
+	static constexpr const char *MIGRATION_MARKER = "1.1/1";
 	//! The catalog's limits (specs/018), `name_length=256,...`: what its string columns are declared
 	//! with, chosen once - at its creation or its migration from 1.0 - and read from here after.
 	static constexpr const char *LIMITS_PROPERTY = "mssql_ducklake_limits";
@@ -322,7 +325,7 @@ private:
 	void CheckMigrationLimits();
 	//! (table, column, bytes) for the columns META_LIMITS names a length for; empty when it names none.
 	string MigrationLimitTargets();
-	//! ducklake_metadata's version as the server holds it now ('1.0', '1.1-dev1', ...).
+	//! ducklake_metadata's version as the server holds it now ('1.0', '1.1-dev1', '1.1', ...).
 	string CatalogVersion();
 	//! The length statistics are bounded to in this catalog, 0 for MAX - read with the markers; a
 	//! longer min/max is written as NULL (specs/018).
@@ -350,10 +353,6 @@ private:
 	//! them only so it does not fall back to the whole schema; refreshing them again is a wasted round
 	//! trip per DDL commit, so it skips them.
 	unordered_set<string> tables_already_refreshed;
-	//! Tables whose inlined-deletion table THIS transaction created. The catalog-level "exists"
-	//! cache is permanent, and a create can still roll back - so the read-path probe never records
-	//! "exists" for one of these. See GetInlinedDeletionTableName.
-	unordered_set<idx_t> created_deletion_tables;
 };
 
 } // namespace duckdb
