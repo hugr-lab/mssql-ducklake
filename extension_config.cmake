@@ -13,11 +13,12 @@ duckdb_extension_load(mssql_ducklake
 # The runtime dependency, as a loadable (DONT_LINK): production pairs the extension with the
 # distributed mssql artifact, so the tests do too - loaded by build path
 # (`LOAD '__BUILD_DIRECTORY__/extension/mssql/...'`); its openssl/simdutf arrive through the merged
-# vcpkg manifest. Pinned to mssql-extension 0.3.0 (main ef1a807, #482), built here from source
-# against our duckdb pin; it does not have to name the same duckdb commit.
+# vcpkg manifest. Pinned to mssql-extension main 75e0fb6 (#494): 0.3.0 plus the TDS read-path
+# fixes (#487) on our duckdb (f8f3f4dcd95). Built here from source, so the duckdb commit it names
+# does not have to match ours.
 duckdb_extension_load(mssql
     GIT_URL https://github.com/hugr-lab/mssql-extension
-    GIT_TAG ef1a807ffbdd3c3a375ee10ff63e65f55b8efe7f
+    GIT_TAG 75e0fb6d39dcbb244d08271b9922931623257cc6
 )
 
 # RECON (specs/015): the postgres arm of the bench. The 2.0-line duckdb is a dev build with no
