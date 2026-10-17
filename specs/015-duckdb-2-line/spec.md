@@ -241,10 +241,15 @@ the repeated call return at once. When 1.1 is final, the repeated calls stop.
     stays (`1.1/1`): it is what the nodes that waited on the shaping lock read to do nothing. A
     `1.1-dev1` catalog an earlier build migrated carries `1.1-dev1/1`, so its migration runs again,
     guarded as ever, and moves the version from `1.1-dev1` to `1.1`.
-  - Upstream's migration gained two data repairs. The schema versions of older inlined tables
-    (`MigrateInlinedSchemaVersions`) go through duckdb as written - an `INSERT … SELECT` it runs
-    itself. The struct-field defaults a rename lost (`MigrateRenamedFieldDefaults`) are an
-    `UPDATE … AS … FROM` with no T-SQL form; ours is the same statement in T-SQL, in the batch.
+  - Upstream's migration gained two data repairs, and both are T-SQL in our batch, outside the
+    attach transaction like the rest of it. The struct-field defaults a rename lost
+    (`MigrateRenamedFieldDefaults`) are an `UPDATE … AS … FROM` with no T-SQL form. The schema
+    versions of older inlined tables (`MigrateInlinedSchemaVersions`) would run through duckdb, but
+    inside the attach transaction, holding locks on `ducklake_schema_versions` while the shaping, on
+    a connection of its own, may rebuild that table's key. `migrate_v11.test` removes such a row
+    from a 1.0 catalog and checks the migration restores it.
+  - The migration marker is no longer read: only `MigrateV10Dev` asked it. The batch still checks it
+    under the shaping lock.
   - DuckLake now substitutes placeholders outside quoted text only (`ReplacePlaceholders`, so a value
     that spells one is left alone), and dropped `{METADATA_SCHEMA_ESCAPED}`. Our server scans carry
     their T-SQL as the string literal of `mssql_scan(_params)_unsafe`, so their `{SNAPSHOT_ID}` and

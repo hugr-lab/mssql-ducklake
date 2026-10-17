@@ -258,13 +258,12 @@ private:
 	//! (a `sys.databases` condition) holds, a warning naming the statement when the server refuses it.
 	void ApplyDatabaseOption(const char *setting, const char *option, const char *already_set, const char *without_it);
 	//! What the server says about this catalog, in one statement: does it exist yet, is its shape
-	//! this build's, and has this build's migration run on it (specs/015 R3).
+	//! this build's, and the limits it was given (specs/015 R3, specs/018).
 	struct CatalogMarkers {
 		bool present = false;
 		//! a shape stamp of any version: some build of this extension shaped the catalog
 		bool shaped = false;
 		bool shape_current = false;
-		bool migration_current = false;
 		//! the limits recorded at the catalog's creation or migration (specs/018); empty: none yet
 		string limits;
 	};

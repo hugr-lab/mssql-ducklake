@@ -63,15 +63,13 @@ MSSQLMetadataManager::CatalogMarkers MSSQLMetadataManager::ReadCatalogMarkers() 
 		    schema_name);
 	};
 	auto result = TracedQuery(
-	    connection,
-	    StringUtil::Format(
-	        "SELECT present, shape, migration, limits FROM mssql_scan_unsafe(%s, 'DECLARE @lock INT; %sBEGIN TRY "
-	        "SELECT CAST(CASE WHEN %s IS NULL THEN 0 ELSE 1 END AS BIGINT) AS present, %s AS shape, %s AS migration, "
-	        "%s AS limits; END TRY BEGIN CATCH %sTHROW; END CATCH; %s', columns := {'present': 'BIGINT', "
-	        "'shape': 'BIGINT', 'migration': 'VARCHAR', 'limits': 'VARCHAR'})",
-	        CatalogLiteral(), applock(true), anchor, property(SHAPE_VERSION_PROPERTY, "BIGINT"),
-	        property(MIGRATION_MARKER_PROPERTY, "NVARCHAR(64)"), property(LIMITS_PROPERTY, "NVARCHAR(400)"),
-	        applock(false), applock(false)));
+	    connection, StringUtil::Format(
+	                    "SELECT present, shape, limits FROM mssql_scan_unsafe(%s, 'DECLARE @lock INT; %sBEGIN TRY "
+	                    "SELECT CAST(CASE WHEN %s IS NULL THEN 0 ELSE 1 END AS BIGINT) AS present, %s AS shape, "
+	                    "%s AS limits; END TRY BEGIN CATCH %sTHROW; END CATCH; %s', columns := {'present': 'BIGINT', "
+	                    "'shape': 'BIGINT', 'limits': 'VARCHAR'})",
+	                    CatalogLiteral(), applock(true), anchor, property(SHAPE_VERSION_PROPERTY, "BIGINT"),
+	                    property(LIMITS_PROPERTY, "NVARCHAR(400)"), applock(false), applock(false)));
 	if (result->HasError()) {
 		result->GetErrorObject().Throw("Failed to inspect the DuckLake catalog on SQL Server: ");
 	}
@@ -84,10 +82,8 @@ MSSQLMetadataManager::CatalogMarkers MSSQLMetadataManager::ReadCatalogMarkers() 
 	auto shape = chunk->GetValue(1, 0);
 	markers.shaped = !shape.IsNull();
 	markers.shape_current = !shape.IsNull() && shape.GetValue<int64_t>() >= SHAPE_VERSION;
-	auto limits = chunk->GetValue(3, 0);
+	auto limits = chunk->GetValue(2, 0);
 	markers.limits = limits.IsNull() ? string() : limits.ToString();
-	auto migration = chunk->GetValue(2, 0);
-	markers.migration_current = !migration.IsNull() && migration.ToString() == MIGRATION_MARKER;
 	return markers;
 }
 
@@ -178,6 +174,25 @@ void MSSQLMetadataManager::MigrateToV1_1() {
 	                          "column_name VARCHAR(MAX) COLLATE %s, begin_snapshot BIGINT, end_snapshot BIGINT, "
 	                          "[key] VARCHAR(MAX) COLLATE %s, value VARCHAR(MAX) COLLATE %s); SET @changed = 1; END;\n",
 	                          schema_literal, schema, VARCHAR_COLLATION, VARCHAR_COLLATION, VARCHAR_COLLATION);
+	// DuckLake's MigrateInlinedSchemaVersions, the same statement in T-SQL: the schema versions older
+	// versions did not record for an inlined table, read back off the snapshot that moved the schema
+	// version. Here rather than through duckdb because duckdb would run it in the attach transaction,
+	// holding locks on ducklake_schema_versions while the shaping - on a connection of its own - may
+	// rebuild that table's key. Idempotent: NOT EXISTS.
+	ddl += StringUtil::Format(
+	    "INSERT INTO %s.ducklake_schema_versions (begin_snapshot, schema_version, table_id) "
+	    "SELECT DISTINCT commits.snapshot_id, idt.schema_version, idt.table_id FROM ("
+	    "SELECT snapshot_id, schema_version, LAG(snapshot_id) OVER (ORDER BY snapshot_id) AS previous_snapshot_id, "
+	    "LAG(schema_version) OVER (ORDER BY snapshot_id) AS previous_schema_version FROM %s.ducklake_snapshot) commits "
+	    "JOIN %s.ducklake_inlined_data_tables idt ON idt.schema_version > commits.previous_schema_version "
+	    "AND idt.schema_version <= commits.schema_version "
+	    "WHERE commits.previous_snapshot_id = commits.snapshot_id - 1 "
+	    "AND commits.previous_schema_version < commits.schema_version "
+	    "AND NOT EXISTS (SELECT 1 FROM %s.ducklake_schema_versions sv WHERE sv.table_id = idt.table_id "
+	    "AND sv.schema_version = idt.schema_version) "
+	    "AND (SELECT COUNT(*) FROM %s.ducklake_schema_versions sv WHERE sv.table_id = idt.table_id "
+	    "AND sv.begin_snapshot <= commits.snapshot_id) > 1;\n",
+	    schema, schema, schema, schema, schema);
 	// DuckLake's MigrateRenamedFieldDefaults in T-SQL - its `UPDATE … AS renamed … FROM` has no T-SQL
 	// form: a struct field's defaults cannot change, so a later row of the field without them lost
 	// them in a rename. Idempotent, like the rest: a restored row no longer has a NULL default.
@@ -355,13 +370,11 @@ END;
 
 //! `ATTACH … (AUTOMATIC_MIGRATION TRUE)` on a 1.0 catalog, or on a 1.1-dev1 one an earlier build
 //! created (DuckLake 1.1 opens a dev format only to migrate it). Every statement is guarded, so a
-//! failure here is a real one and is left to surface. Of DuckLake's two data repairs, the schema
-//! versions of older inlined tables go through duckdb as upstream wrote them (an INSERT … SELECT
-//! duckdb runs itself); the struct-field defaults are T-SQL in the batch. Both idempotent, both
-//! before the version moves, in upstream's order.
+//! failure here is a real one and is left to surface. DuckLake's two data repairs - the schema
+//! versions of older inlined tables, the defaults a struct-field rename lost - are T-SQL in the
+//! batch, idempotent both, before the version moves, in upstream's order.
 void MSSQLMetadataManager::MigrateV10(bool from_dev1) {
 	(void)from_dev1;
-	MigrateInlinedSchemaVersions();
 	MigrateToV1_1();
 }
 

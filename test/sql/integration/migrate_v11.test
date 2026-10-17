@@ -78,6 +78,37 @@ SELECT count(*) FROM mssql_scan('srv', 'SELECT 1 AS n WHERE OBJECT_ID(''migrate_
 ----
 0
 
+# A table whose inlined rows sit at its third schema version, with that version's row in
+# ducklake_schema_versions removed - the state older DuckLake versions left (they registered inlined
+# tables without one). The migration restores it, off the snapshot that moved the schema version.
+statement ok
+CREATE TABLE lake.evolved(a INTEGER);
+
+statement ok
+ALTER TABLE lake.evolved ADD COLUMN b INTEGER;
+
+statement ok
+ALTER TABLE lake.evolved ADD COLUMN c INTEGER;
+
+statement ok
+INSERT INTO lake.evolved VALUES (1, 2, 3);
+
+statement ok
+CREATE TABLE evolved_versions AS SELECT * FROM mssql_scan('srv', 'SELECT sv.begin_snapshot, sv.schema_version FROM migrate_v11.ducklake_schema_versions sv JOIN migrate_v11.ducklake_table t ON t.table_id = sv.table_id AND t.table_name = ''evolved'' AND t.end_snapshot IS NULL');
+
+query I
+SELECT count(*) FROM evolved_versions;
+----
+3
+
+statement ok
+SELECT mssql_exec('srv', 'DELETE sv FROM migrate_v11.ducklake_schema_versions sv JOIN migrate_v11.ducklake_table t ON t.table_id = sv.table_id AND t.table_name = ''evolved'' AND t.end_snapshot IS NULL WHERE sv.schema_version = (SELECT MAX(schema_version) FROM migrate_v11.ducklake_inlined_data_tables WHERE table_id = t.table_id)');
+
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT sv.schema_version FROM migrate_v11.ducklake_schema_versions sv JOIN migrate_v11.ducklake_table t ON t.table_id = sv.table_id AND t.table_name = ''evolved'' AND t.end_snapshot IS NULL');
+----
+2
+
 statement ok
 DETACH lake;
 
@@ -109,6 +140,17 @@ query I
 SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM migrate_v11.ducklake_metadata WHERE [key] = ''version''');
 ----
 1.1
+
+# the schema version the 1.0 catalog lost is back, as it was
+query I
+SELECT count(*) FROM (SELECT * FROM evolved_versions EXCEPT SELECT * FROM mssql_scan('srv', 'SELECT sv.begin_snapshot, sv.schema_version FROM migrate_v11.ducklake_schema_versions sv JOIN migrate_v11.ducklake_table t ON t.table_id = sv.table_id AND t.table_name = ''evolved'' AND t.end_snapshot IS NULL'));
+----
+0
+
+query III
+SELECT * FROM lake.evolved;
+----
+1	2	3
 
 # every column 1.1 adds, in this catalog's types: BOOLEAN is BIT here
 query II
