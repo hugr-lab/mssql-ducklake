@@ -88,3 +88,37 @@ jobs:
 
       - id: deployment
         uses: actions/deploy-pages@v4
+
+      # The second copy of the same docs, for https://hugr-lab.com/docs/mssql-ducklake/ (IONOS):
+      # built after the versions are snapshotted, so both copies carry the same versions, and after
+      # the Pages deploy, so an IONOS failure never holds GitHub Pages back.
+      # Off until the organization sets DOCS_IONOS=true; this workflow never runs on pull requests.
+      - name: Build for hugr-lab.com
+        if: ${{ vars.DOCS_IONOS == 'true' }}
+        working-directory: website
+        env:
+          DOCS_TARGET: ionos
+        run: npm run build -- --out-dir build-ionos
+
+      # On the real build, versions included - the PR gate has no snapshots: anything found fails
+      # the job before the upload.
+      - name: Check the hugr-lab.com copy requests no other server
+        if: ${{ vars.DOCS_IONOS == 'true' }}
+        working-directory: website
+        run: |
+          found=$(grep -rhoE "(src=\"|srcset=\"|url\(|@import )['\"]?https?://[^\"') ]+" build-ionos | sort -u || true)
+          if [ -n "$found" ]; then echo "third-party requests in the hugr-lab.com build:"; echo "$found"; exit 1; fi
+
+      - name: Upload to hugr-lab.com (IONOS)
+        if: ${{ vars.DOCS_IONOS == 'true' }}
+        env:
+          HOST: ${{ secrets.IONOS_SFTP_HOST }}
+          USER: ${{ secrets.IONOS_SFTP_USER }}
+          LFTP_PASSWORD: ${{ secrets.IONOS_SFTP_PASSWORD }}
+          REMOTE: ${{ vars.IONOS_DOCS_ROOT || '/hugr-lab/docs' }}/mssql-ducklake
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq lftp
+          # Mirrors the build into docs/mssql-ducklake/ on IONOS; nothing outside that folder is touched.
+          lftp --env-password -u "$USER" -e "set sftp:auto-confirm yes; set net:max-retries 3; \
+            mirror --reverse --delete --verbose website/build-ionos/ $REMOTE; bye" \
+            "sftp://$HOST"

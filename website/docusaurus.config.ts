@@ -7,14 +7,22 @@ import type * as Preset from '@docusaurus/preset-classic';
 // so the three share look and feel; published by this repo's Pages workflow to
 // https://hugr-lab.github.io/mssql-ducklake/ (specs/013).
 
+// The same docs are built twice: for GitHub Pages (default) and for hugr-lab.com on IONOS (DOCS_TARGET=ionos).
+const ionos = process.env.DOCS_TARGET === 'ionos';
+const site = ionos
+  ? {url: 'https://hugr-lab.com', baseUrl: '/docs/mssql-ducklake/', home: 'https://hugr-lab.com/', impressum: 'https://hugr-lab.com/impressum/', datenschutz: 'https://hugr-lab.com/datenschutz/'}
+  : {url: 'https://hugr-lab.github.io', baseUrl: '/mssql-ducklake/', home: 'https://hugr-lab.github.io/', impressum: 'https://hugr-lab.github.io/impressum/', datenschutz: 'https://hugr-lab.github.io/datenschutz/'};
+
 const config: Config = {
   title: 'DuckLake on SQL Server',
   tagline: 'A DuckDB extension that keeps a DuckLake catalog in Microsoft SQL Server - embedded DuckLake, native TDS.',
   favicon: 'img/favicon.ico',
 
-  url: 'https://hugr-lab.github.io',
-  baseUrl: '/mssql-ducklake/',
+  url: site.url,
+  baseUrl: site.baseUrl,
+  baseUrlIssueBanner: false,
   trailingSlash: true,
+  customFields: {docsTarget: ionos ? 'ionos' : 'github'},
 
   organizationName: 'hugr-lab',
   projectName: 'mssql-ducklake',
@@ -59,6 +67,12 @@ const config: Config = {
 
   markdown: {
     mermaid: true,
+    // The hugr-lab.com copy shows no image from another server - the released versions' badges
+    // included: their docs come from the tags, so removing them from docs/ is not enough.
+    preprocessor: ({fileContent}) =>
+      ionos
+        ? fileContent.replace(/\[!\[[^\]]*\]\(https?:\/\/[^)]*\)\]\([^)]*\)|!\[[^\]]*\]\(https?:\/\/[^)]*\)/g, '')
+        : fileContent,
     hooks: {
       onBrokenMarkdownLinks: 'throw',
     },
@@ -93,7 +107,7 @@ const config: Config = {
           position: 'left',
         },
         {
-          href: 'https://hugr-lab.github.io/',
+          href: site.home,
           label: 'Hugr Lab',
           position: 'right',
         },
@@ -133,8 +147,15 @@ const config: Config = {
         {
           title: 'Hugr Lab',
           items: [
-            {label: 'Main site', href: 'https://hugr-lab.github.io/'},
+            {label: 'Main site', href: site.home},
             {label: 'DuckDB MSSQL Extension', href: 'https://hugr-lab.github.io/mssql-extension/'},
+          ],
+        },
+        {
+          title: 'Legal',
+          items: [
+            {label: 'Impressum', href: site.impressum},
+            {label: 'Datenschutz', href: site.datenschutz},
           ],
         },
       ],

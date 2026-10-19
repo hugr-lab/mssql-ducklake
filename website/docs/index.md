@@ -6,10 +6,6 @@ slug: /
 
 # DuckLake on SQL Server
 
-[![GitHub stars](https://img.shields.io/github/stars/hugr-lab/mssql-ducklake?style=social)](https://github.com/hugr-lab/mssql-ducklake)
-[![CI](https://github.com/hugr-lab/mssql-ducklake/actions/workflows/ci.yml/badge.svg)](https://github.com/hugr-lab/mssql-ducklake/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/hugr-lab/mssql-ducklake)](https://github.com/hugr-lab/mssql-ducklake/blob/main/LICENSE)
-
 `mssql_ducklake` is a [DuckDB](https://duckdb.org) extension that runs [DuckLake](https://ducklake.select)
 with its **catalog in Microsoft SQL Server or Azure SQL**. It embeds the complete, unmodified DuckLake
 source at a pinned release and adds a SQL Server metadata manager beside DuckLake's built-in
