@@ -80,8 +80,18 @@ jobs:
         working-directory: website
         run: npx docusaurus build
 
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/build
+
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
       # The second copy of the same docs, for https://hugr-lab.com/docs/mssql-ducklake/ (IONOS):
-      # built after the versions are snapshotted, so both copies carry the same versions.
+      # built after the versions are snapshotted, so both copies carry the same versions, and after
+      # the Pages deploy, so an IONOS failure never holds GitHub Pages back.
       # Off until the organization sets DOCS_IONOS=true; this workflow never runs on pull requests.
       - name: Build for hugr-lab.com
         if: ${{ vars.DOCS_IONOS == 'true' }}
@@ -103,12 +113,3 @@ jobs:
           lftp --env-password -u "$USER" -e "set sftp:auto-confirm yes; set net:max-retries 3; \
             mirror --reverse --delete --verbose website/build-ionos/ $REMOTE; bye" \
             "sftp://$HOST"
-
-      - uses: actions/configure-pages@v5
-
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: website/build
-
-      - id: deployment
-        uses: actions/deploy-pages@v4
