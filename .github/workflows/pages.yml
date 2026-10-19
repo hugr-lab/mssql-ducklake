@@ -78,6 +78,9 @@ jobs:
 
       - name: Build the docs site
         working-directory: website
+        env:
+          # with the hugr-lab.com copy on, this copy names it as canonical and drops its sitemap
+          DOCS_CANONICAL: ${{ vars.DOCS_IONOS == 'true' && 'https://hugr-lab.com/docs/mssql-ducklake/' || '' }}
         run: npx docusaurus build
 
       - uses: actions/configure-pages@v5
