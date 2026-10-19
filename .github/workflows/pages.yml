@@ -100,6 +100,15 @@ jobs:
           DOCS_TARGET: ionos
         run: npm run build -- --out-dir build-ionos
 
+      # On the real build, versions included - the PR gate has no snapshots: anything found fails
+      # the job before the upload.
+      - name: Check the hugr-lab.com copy requests no other server
+        if: ${{ vars.DOCS_IONOS == 'true' }}
+        working-directory: website
+        run: |
+          found=$(grep -rhoE "(src=\"|srcset=\"|url\(|@import )['\"]?https?://[^\"') ]+" build-ionos | sort -u || true)
+          if [ -n "$found" ]; then echo "third-party requests in the hugr-lab.com build:"; echo "$found"; exit 1; fi
+
       - name: Upload to hugr-lab.com (IONOS)
         if: ${{ vars.DOCS_IONOS == 'true' }}
         env:

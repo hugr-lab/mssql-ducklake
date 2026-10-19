@@ -67,6 +67,12 @@ const config: Config = {
 
   markdown: {
     mermaid: true,
+    // The hugr-lab.com copy shows no image from another server - the released versions' badges
+    // included: their docs come from the tags, so removing them from docs/ is not enough.
+    preprocessor: ({fileContent}) =>
+      ionos
+        ? fileContent.replace(/\[!\[[^\]]*\]\(https?:\/\/[^)]*\)\]\([^)]*\)|!\[[^\]]*\]\(https?:\/\/[^)]*\)/g, '')
+        : fileContent,
     hooks: {
       onBrokenMarkdownLinks: 'throw',
     },
