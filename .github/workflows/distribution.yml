@@ -29,7 +29,7 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
       extension_name: mssql_ducklake
-      duckdb_version: f8f3f4dcd954cea2613572e8cc40a8612698d232
+      duckdb_version: 2ec7e8401c4d949487c3e3a8d6c04a9ec59d9380
       ci_tools_version: main
       # wasm is out: mssql (raw TDS sockets) does not exist there, and the manager is nothing
       # without it
@@ -42,6 +42,6 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
     with:
       extension_name: mssql_ducklake
-      duckdb_version: f8f3f4dcd954cea2613572e8cc40a8612698d232
+      duckdb_version: 2ec7e8401c4d949487c3e3a8d6c04a9ec59d9380
       ci_tools_version: main
       format_checks: 'format;tidy'

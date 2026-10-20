@@ -13,26 +13,24 @@ duckdb_extension_load(mssql_ducklake
 # The runtime dependency, as a loadable (DONT_LINK): production pairs the extension with the
 # distributed mssql artifact, so the tests do too - loaded by build path
 # (`LOAD '__BUILD_DIRECTORY__/extension/mssql/...'`); its openssl/simdutf arrive through the merged
-# vcpkg manifest. Pinned to mssql-extension main 3c2661a (#497): 0.3.0 plus the TDS read-path
-# fixes (#487), the refusal of MAX values past 2^31-1 bytes (#490) and the empty PLP frame (#497),
-# on our duckdb (f8f3f4dcd95). Built here from source, so the duckdb commit it names does not have
-# to match ours.
+# vcpkg manifest. Pinned to the mssql-extension v0.3.0 release commit (bfd347f), on our duckdb
+# (2ec7e8401c4). Built here from source, so the duckdb commit it names does not have to match ours.
 duckdb_extension_load(mssql
     GIT_URL https://github.com/hugr-lab/mssql-extension
-    GIT_TAG 3c2661afaf957b7d203917b2cdaa43eb0b80a440
+    GIT_TAG bfd347ffa89dc520eb0fb82c857b3c7af12673dc
 )
 
 # RECON (specs/015): the postgres arm of the bench. The 2.0-line duckdb is a dev build with no
 # published postgres_scanner, so it is built from source like mssql - a loadable, loaded by build
-# path. Not part of the release build. Pinned to duckdb-postgres main, which carries the v2.0-cyanoptera
-# patches (Parser's expression list is no longer static there).
+# path. Not part of the release build. Pinned to the duckdb-postgres commit DuckDB's own extension
+# config names at our duckdb (c0f5a3c), on the v2.0-cyanoptera line.
 # The distribution and release builds (extension-ci-tools' reusable workflow, which sets
 # DUCKDB_PLATFORM) leave it out: they ship mssql_ducklake, and postgres_scanner does not even link
 # on every platform there (MinGW).
 if(NOT DEFINED ENV{DUCKDB_PLATFORM})
   duckdb_extension_load(postgres_scanner
       GIT_URL https://github.com/duckdb/duckdb-postgres
-      GIT_TAG 9671d2c5cd5fa8e3b295ca7f130fa7590e9b4568
+      GIT_TAG c0f5a3c0c4b68b02afbf669d36d7f0e503985c88
       SUBMODULES database-connector
   )
 endif()
