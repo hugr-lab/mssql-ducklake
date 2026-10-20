@@ -21,9 +21,9 @@ model, the full manager plan §7: transpiler, keys + filtered indexes, server-si
 
   | Piece | Where | Pin |
   | --- | --- | --- |
-  | duckdb | submodule `duckdb/` | `f8f3f4dcd95`, the v2.0-cyanoptera line (tag `v2.0.0` once released) |
-  | ducklake | submodule `ducklake/` (EMBEDDED — compiled into the extension) | branch `main` (SHA in the submodule), catalog format 1.1 |
-  | mssql | `extension_config.cmake` (runtime pair, test loadable) | main `3c2661a` (#497, on duckdb `f8f3f4dcd95`; 0.3.0 + #487, #490, #497); built from source against our duckdb pin |
+  | duckdb | submodule `duckdb/` | `2ec7e8401c4` (v2.0.0-dev69342), the v2.0-cyanoptera line (tag `v2.0.0` once released) |
+  | ducklake | submodule `ducklake/` (EMBEDDED — compiled into the extension) | `417a9117` on `main`, the commit DuckDB's own extension config names at our duckdb; catalog format 1.1 |
+  | mssql | `extension_config.cmake` (runtime pair, test loadable) | `v0.3.0` (bfd347f, on duckdb `2ec7e8401c4`); built from source against our duckdb pin |
   | extension-ci-tools | submodule `extension-ci-tools/` | branch `main` (its v2.0 branch once it exists) |
   | CI reusable workflows | `.github/workflows/distribution.yml`, `release.yml` | `@main`, `duckdb_version: <the duckdb SHA>`, distribution with `skip_tests` until `v2.0.0` (a SHA does not fit the extension metadata; ci.yml runs the tests) |
 

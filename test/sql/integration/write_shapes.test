@@ -371,6 +371,41 @@ SELECT (SELECT sum(i) FROM lake.conflict_a), (SELECT sum(i) FROM lake.conflict_b
 ----
 1	2
 
+# a column added and dropped in one transaction, with a file written in between: the file holds its
+# field id, so DuckLake keeps the column's row, beginning and ending in the commit's snapshot (#73)
+statement ok
+CREATE TABLE lake.add_drop (id INTEGER);
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE lake.add_drop ADD COLUMN c1 INTEGER;
+
+statement ok
+INSERT INTO lake.add_drop SELECT i, i * 100 FROM range(20) t(i);
+
+statement ok
+ALTER TABLE lake.add_drop DROP COLUMN c1;
+
+statement ok
+COMMIT
+
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT c.column_id FROM write_shapes.ducklake_column c
+JOIN write_shapes.ducklake_table t ON t.table_id = c.table_id
+WHERE t.table_name = ''add_drop'' AND c.column_name = ''c1'' AND c.begin_snapshot = c.end_snapshot');
+----
+1
+
+statement ok
+ALTER TABLE lake.add_drop ADD COLUMN c2 INTEGER DEFAULT 0;
+
+query III
+SELECT count(*), sum(id), sum(c2) FROM lake.add_drop;
+----
+20	190	0
+
 statement ok
 DETACH lake;
 
