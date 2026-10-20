@@ -264,6 +264,30 @@ the repeated call return at once. When 1.1 is final, the repeated calls stop.
     `DroppedTablesStayReadable` answers `false`, as on postgres and sqlite.
   - DuckLake now refuses to inline a negative interval (ducklake#1727): it could not be flushed to
     Parquet. `inlined_rows.test` asserts the refusal and keeps a large positive one.
+- **ducklake `dcf71031` on DuckDB `d54cbbe3df1`** (2026-10-20; the commit community-extensions builds
+  as `v2.0.0`). The re-audit found four things:
+  - **The migration gained another repair.** `MigrateRetypedBounds` clears statistics bounds that
+    older versions stored in the wrong type: a FLOAT bound read as DOUBLE, a timestamp finer than
+    its column, a timestamptz that lost its nanoseconds. Such a bound can prune away rows. It runs
+    in the base `MigrateV10`, which we replace, so it is T-SQL in our batch now.
+    - One difference from upstream: DuckLake clears a DOUBLE bound when its text is a FLOAT's
+      shortest form. T-SQL cannot print that form, so ours clears any bound a REAL does not hold
+      exactly. More bounds lose pruning, and no row is lost.
+    - `migrate_v11.test` writes such a bound and checks that the migration clears it and the rows
+      come back. The test fails without the repair.
+  - **A commit statement no test had written.** It predates this pin: `ALTER … TYPE` from FLOAT to
+    DOUBLE over a file makes `WriteFloatWidenedStats` rewrite the column's bounds. Its
+    `(table_id, column_id) IN ((t, c), …)` is not T-SQL, so the batch sent it to the base path.
+    - The batch now recognises it: a joined `VALUES`, and the widened DOUBLE in
+      `CONVERT(…, 3)`'s 17 digits. That is the same DOUBLE as DuckDB's shortest form, only spelled
+      differently.
+    - `write_shapes.test` widens a FLOAT over a file and prunes on both sides of the FLOAT 1.1.
+  - **The conflict check is a virtual now:** `GetSnapshotAndStatsAndChangesQuery(snapshot, …)`, as
+    postgres overrides it. Ours returns the T-SQL statement instead of swapping DuckLake's text in
+    `Query`. DuckLake's text is still compared with our copy at attach.
+  - **Every `ORDER BY` in DuckLake's queries says `ASC` now.** The two anchors on that text moved
+    with it: the copy of the conflict-check query and the global stats query's `ORDER BY`. The
+    catalog load's column filter (above) is DuckLake's own now, and our rewrite is gone.
 
 ### R4 — reads: the catalog load is the target
 
@@ -563,7 +587,8 @@ pushdown, and with or without TLS, the same). Our `Query(snapshot)` now moves th
 joined table, matched on the template's exact text: 3.6M → 1.5M rows, the scan 3.95 → 1.97 s on
 the server, **the merge 18.4 → 16.7 s (postgres 16.4)**. The loaded schemas at every version of a
 table with dropped, renamed, added nested and re-defaulted columns are identical to the base's.
-`MSSQL_DUCKLAKE_NO_LOAD_REWRITE=1` turns it off.
+`MSSQL_DUCKLAKE_NO_LOAD_REWRITE=1` turns it off. *Superseded at ducklake `dcf71031`*: DuckLake now
+filters the columns inside the joined table itself (its #66), so the rewrite and its switch are gone.
 
 Found on the way, for the extension: a query naming a table that does not exist loads every
 schema's metadata of the catalog's database (DuckDB's "did you mean" enumeration), and on this

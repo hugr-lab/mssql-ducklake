@@ -127,10 +127,10 @@ public:
 	vector<FileListParameter> file_list_parameters;
 	string AddFileListParameter(const string &value, const string &declaration);
 
-	//! Intercepts exactly one of DuckLake's queries - the commit loop's conflict check - and swaps it
-	//! for a form that reads ducklake_snapshot once instead of twice (specs/007 D1). Everything else
-	//! goes to the base untouched. Both query texts are constants in the .cpp; nothing outside needs
-	//! them.
+	//! The commit loop's conflict check, as one T-SQL statement that reads ducklake_snapshot once
+	//! instead of twice (specs/007 D1); both query texts are constants in the .cpp.
+	string GetSnapshotAndStatsAndChangesQuery(DuckLakeSnapshot snapshot, bool include_exactness) const override;
+	//! The writes DuckLake sends through Query take the commit batch's T-SQL path (specs/014 D3c).
 	unique_ptr<QueryResult> Query(DuckLakeSnapshot snapshot, string &query) override;
 	//! The placeholders inside our server scans' T-SQL literal, which DuckLake's substitution skips.
 	void SubstituteServerScanPlaceholders(string &query, optional_ptr<const DuckLakeSnapshot> snapshot = nullptr) const;

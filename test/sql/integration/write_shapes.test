@@ -371,6 +371,31 @@ SELECT (SELECT sum(i) FROM lake.conflict_a), (SELECT sum(i) FROM lake.conflict_b
 ----
 1	2
 
+# a FLOAT widened to DOUBLE over a file: the commit rewrites the file's and the table's bounds as
+# DOUBLE text (WriteFloatWidenedStats), which T-SQL prints in 17 digits - the same DOUBLE, so the
+# bounds still prune right on both sides of the FLOAT 1.1 the file holds
+statement ok
+CREATE TABLE lake.widened (f FLOAT, i INTEGER);
+
+statement ok
+INSERT INTO lake.widened SELECT CASE WHEN r < 10 THEN 0.5 ELSE 1.1 END, r FROM range(20) t(r);
+
+statement ok
+ALTER TABLE lake.widened ALTER f TYPE DOUBLE;
+
+statement ok
+ALTER TABLE lake.widened ALTER i TYPE BIGINT;
+
+query III
+SELECT (SELECT count(*) FROM lake.widened WHERE f > 1.1), (SELECT count(*) FROM lake.widened WHERE f = CAST(CAST(1.1 AS FLOAT) AS DOUBLE)), (SELECT count(*) FROM lake.widened WHERE f < 0.6);
+----
+10	10	10
+
+query I
+SELECT CAST(max_value AS DOUBLE) = CAST(CAST(1.1 AS FLOAT) AS DOUBLE) FROM mssql_scan('srv', 'SELECT s.max_value FROM write_shapes.ducklake_file_column_stats s JOIN write_shapes.ducklake_table t ON t.table_id = s.table_id AND t.table_name = ''widened'' AND s.column_id = (SELECT MIN(column_id) FROM write_shapes.ducklake_column c WHERE c.table_id = t.table_id)');
+----
+true
+
 # a column added and dropped in one transaction, with a file written in between: the file holds its
 # field id, so DuckLake keeps the column's row, beginning and ending in the commit's snapshot (#73)
 statement ok

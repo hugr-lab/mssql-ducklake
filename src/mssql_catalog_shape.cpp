@@ -140,6 +140,66 @@ static const vector<pair<string, string>> &MigrationAddedColumns() {
 	return added_columns;
 }
 
+//! The statements of DuckLake's MigrateRetypedBounds, in T-SQL (see MigrateToV1_1).
+static string RetypedBoundsMigration(const string &schema) {
+	auto column_has_type = [&](const string &types) {
+		return StringUtil::Format("EXISTS (SELECT 1 FROM %s.ducklake_column AS col WHERE col.table_id = stats.table_id "
+		                          "AND col.column_id = stats.column_id AND col.column_type IN (%s))",
+		                          schema, types);
+	};
+	// a bound a REAL does not hold exactly: a DOUBLE file's, or a FLOAT file's read back as DOUBLE
+	auto float_bound = [](const string &bound) {
+		return StringUtil::Format("(TRY_CAST(TRY_CAST(%s AS REAL) AS FLOAT) <> TRY_CAST(%s AS FLOAT))", bound, bound);
+	};
+	// more fractional digits than the column's timestamp type keeps
+	auto finer_timestamp_bound = [&](const string &bound) {
+		return StringUtil::Format(
+		    "((CASE WHEN CHARINDEX('.', %s) > 0 THEN PATINDEX('%%[^0-9]%%', SUBSTRING(%s, CHARINDEX('.', %s) + 1, "
+		    "64) + 'x') - 1 ELSE 0 END) > (SELECT MIN(CASE col.column_type WHEN 'timestamp_s' THEN 0 WHEN "
+		    "'timestamp_ms' THEN 3 ELSE 6 END) FROM %s.ducklake_column AS col WHERE col.table_id = stats.table_id "
+		    "AND col.column_id = stats.column_id AND col.column_type IN ('timestamp', 'timestamp_ms', 'timestamp_s')))",
+		    bound, bound, bound, schema);
+	};
+	auto retyped = StringUtil::Format("EXISTS (SELECT 1 FROM %s.ducklake_column AS col WHERE col.table_id = "
+	                                  "stats.table_id AND col.column_id = stats.column_id AND col.column_type <> "
+	                                  "'float64')",
+	                                  schema);
+	auto added_file = StringUtil::Format("EXISTS (SELECT 1 FROM %s.ducklake_data_file AS added WHERE "
+	                                     "added.data_file_id = stats.data_file_id AND added.mapping_id IS NOT NULL)",
+	                                     schema);
+	auto table_has_added_file = StringUtil::Format("EXISTS (SELECT 1 FROM %s.ducklake_data_file AS added WHERE "
+	                                               "added.table_id = stats.table_id AND added.mapping_id IS NOT NULL)",
+	                                               schema);
+	auto float_column = column_has_type("'float64'");
+	auto timestamp_column = column_has_type("'timestamp', 'timestamp_ms', 'timestamp_s'");
+	auto timestamptz_column = column_has_type("'timestamptz'");
+	string sql;
+	sql += StringUtil::Format("UPDATE stats SET min_value = CASE WHEN %s THEN NULL ELSE stats.min_value END, "
+	                          "max_value = CASE WHEN %s THEN NULL ELSE stats.max_value END "
+	                          "FROM %s.ducklake_file_column_stats AS stats WHERE %s AND (%s OR %s) AND (%s OR %s);\n",
+	                          float_bound("stats.min_value"), float_bound("stats.max_value"), schema, float_column,
+	                          retyped, added_file, float_bound("stats.min_value"), float_bound("stats.max_value"));
+	sql += StringUtil::Format("UPDATE stats SET min_value = CASE WHEN %s THEN NULL ELSE stats.min_value END, "
+	                          "max_value = CASE WHEN %s THEN NULL ELSE stats.max_value END "
+	                          "FROM %s.ducklake_file_column_stats AS stats WHERE %s AND %s AND (%s OR %s);\n",
+	                          finer_timestamp_bound("stats.min_value"), finer_timestamp_bound("stats.max_value"),
+	                          schema, timestamp_column, added_file, finer_timestamp_bound("stats.min_value"),
+	                          finer_timestamp_bound("stats.max_value"));
+	// the release dropped the nanoseconds of these bounds
+	sql += StringUtil::Format("UPDATE stats SET min_value = NULL, max_value = NULL "
+	                          "FROM %s.ducklake_file_column_stats AS stats WHERE %s AND %s "
+	                          "AND (stats.min_value IS NOT NULL OR stats.max_value IS NOT NULL);\n",
+	                          schema, timestamptz_column, added_file);
+	// table bounds merged from those files can hide a larger value
+	sql += StringUtil::Format("UPDATE stats SET min_value = NULL, max_value = NULL "
+	                          "FROM %s.ducklake_table_column_stats AS stats "
+	                          "WHERE (stats.min_value IS NOT NULL OR stats.max_value IS NOT NULL) "
+	                          "AND ((%s AND (%s OR %s)) OR ((%s OR %s) AND %s));\n",
+	                          schema, float_column, retyped, table_has_added_file, timestamp_column, timestamptz_column,
+	                          table_has_added_file);
+	return sql;
+}
+
 void MSSQLMetadataManager::MigrateToV1_1() {
 	// META_LIMITS narrows a catalog only on its way from 1.0 (specs/018): a 1.1-dev1 catalog an earlier
 	// build migrated lives with the limits it has.
@@ -207,6 +267,13 @@ void MSSQLMetadataManager::MigrateToV1_1() {
 	    "AND later.column_id = original.column_id AND later.initial_default IS NOT NULL "
 	    "AND later.begin_snapshot > original.begin_snapshot AND later.begin_snapshot < renamed.begin_snapshot);\n",
 	    schema, schema, schema);
+	// DuckLake's MigrateRetypedBounds in T-SQL: older versions stored an added file's bounds in the
+	// file's type and kept a file's bounds across a type change, so a FLOAT bound read as DOUBLE, or a
+	// timestamp bound finer than its column, could prune away rows; those bounds become unknown. One
+	// difference, on the safe side: DuckLake clears a DOUBLE column's bound when its text is a FLOAT's
+	// shortest form, which T-SQL cannot print - here any bound a REAL does not hold exactly is cleared,
+	// which loses pruning on a few more bounds and never a row. Idempotent: it only writes NULLs.
+	ddl += RetypedBoundsMigration(schema);
 	// the value is named as well as the key: this runs on a 1.0 or an already-migrated catalog and
 	// nothing else, so a stray call cannot relabel a catalog of some later format as this one
 	ddl += StringUtil::Format("UPDATE %s.ducklake_metadata SET value = N'1.1' "

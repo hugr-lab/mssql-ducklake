@@ -93,7 +93,7 @@ constexpr const char *CONFLICT_TAIL = R"(
 FROM {METADATA_CATALOG}.ducklake_table_stats
 LEFT JOIN {METADATA_CATALOG}.ducklake_table_column_stats
     USING (table_id)
-ORDER BY table_id NULLS FIRST;
+ORDER BY table_id ASC NULLS FIRST;
 	)";
 
 string DuckLakeConflictCheckQuery(bool exactness) {
@@ -174,8 +174,17 @@ DuckLakeInlinedColNames InlinedColumnNames(DuckLakeTransaction &transaction) {
 }
 
 bool ConflictCheckQueryIsDuckLakes() {
-	return DuckLakeMetadataManager::GetSnapshotAndStatsAndChangesQuery(false) == DuckLakeConflictCheckQuery(false) &&
-	       DuckLakeMetadataManager::GetSnapshotAndStatsAndChangesQuery(true) == DuckLakeConflictCheckQuery(true);
+	return DuckLakeMetadataManager::SnapshotAndStatsAndChangesQuery(false) == DuckLakeConflictCheckQuery(false) &&
+	       DuckLakeMetadataManager::SnapshotAndStatsAndChangesQuery(true) == DuckLakeConflictCheckQuery(true);
+}
+
+string MSSQLMetadataManager::GetSnapshotAndStatsAndChangesQuery(DuckLakeSnapshot snapshot,
+                                                                bool include_exactness) const {
+	// still DuckLake's template (placeholders and all): Query substitutes it, the literal's included
+	if (!ConflictRewriteEnabled()) {
+		return DuckLakeMetadataManager::GetSnapshotAndStatsAndChangesQuery(snapshot, include_exactness);
+	}
+	return MSSQLConflictCheckQuery(include_exactness);
 }
 
 void MSSQLMetadataManager::CreateInlinedDeletionTable(const string &table_name) {
@@ -194,49 +203,8 @@ void MSSQLMetadataManager::CreateInlinedDeletionTable(const string &table_name) 
 	tables_already_refreshed.insert(table_name);
 }
 
-//! The join and filter of BuildCatalogForSnapshot's tables+columns statement, verbatim, and the same
-//! with the column filter inside the joined table.
-static constexpr const char *DUCKLAKE_LOAD_COLUMNS_JOIN =
-    "LEFT JOIN {METADATA_CATALOG}.ducklake_column col USING (table_id)\n"
-    "WHERE {SNAPSHOT_ID} >= tbl.begin_snapshot AND ({SNAPSHOT_ID} < tbl.end_snapshot OR tbl.end_snapshot IS NULL)\n"
-    "  AND (({SNAPSHOT_ID} >= col.begin_snapshot AND ({SNAPSHOT_ID} < col.end_snapshot OR col.end_snapshot IS NULL)) "
-    "OR column_id IS NULL)\n";
-static constexpr const char *MSSQL_LOAD_COLUMNS_JOIN =
-    "LEFT JOIN (SELECT * FROM {METADATA_CATALOG}.ducklake_column WHERE {SNAPSHOT_ID} >= begin_snapshot AND "
-    "({SNAPSHOT_ID} < end_snapshot OR end_snapshot IS NULL)) col USING (table_id)\n"
-    "WHERE {SNAPSHOT_ID} >= tbl.begin_snapshot AND ({SNAPSHOT_ID} < tbl.end_snapshot OR tbl.end_snapshot IS NULL)\n";
-
 unique_ptr<QueryResult> MSSQLMetadataManager::Query(DuckLakeSnapshot snapshot, string &query) {
 	EnsureReady();
-	// Recognised by comparing with DuckLake's own template, before any placeholder is substituted -
-	// which is why this overload and not Query(string &): here the text is still the raw template,
-	// and {SNAPSHOT_ID} has not yet been replaced with a number that would defeat the comparison.
-	// Nothing is parsed out of the query: the catalog and schema the replacement needs are the
-	// manager's own, and they arrive through the same {METADATA_CATALOG} substitution the base
-	// applies next.
-	//
-	// An exact match, so a ducklake bump that edits the query stops matching rather than applying a
-	// rewrite to something that no longer says what we think. ProbeServerCapabilities turns that
-	// mismatch into an error at attach, because the alternative is a silent return of the crash.
-	if (ConflictRewriteEnabled()) {
-		for (bool exactness : {false, true}) {
-			if (query == DuckLakeConflictCheckQuery(exactness)) {
-				query = MSSQLConflictCheckQuery(exactness);
-				break;
-			}
-		}
-	}
-	// The catalog load's tables+columns statement (BuildCatalogForSnapshot) filters the columns AFTER
-	// its LEFT JOIN - `((<visible>) OR column_id IS NULL)` - where no filter can be pushed below the
-	// join, so every load read ALL of ducklake_column: 293 loads of a 300-table lake brought 3.6M
-	// rows off the server, 3.95 s of its 4.4 s (specs/015). The same filter inside the joined table
-	// is pushed into the scan, and the server returns the visible columns only. The two differ only
-	// for a visible table without one visible column, which DuckLake never writes - and the base
-	// would then reject it as "does not have any columns" either way. Matched on the template's exact
-	// text: a ducklake bump that edits it leaves the statement as it is, merely slower.
-	if (!LoadRewriteDisabled() && query.find(DUCKLAKE_LOAD_COLUMNS_JOIN) != string::npos) {
-		query = StringUtil::Replace(query, DUCKLAKE_LOAD_COLUMNS_JOIN, MSSQL_LOAD_COLUMNS_JOIN);
-	}
 	// a write DuckLake sends through Query - the expiry's, the cleanup's, the flush's DELETEs -
 	// takes the commit batch's T-SQL path when it is one of its families (specs/014 D3c)
 	if (auto written = TryRewriteWrite(snapshot, query)) {
@@ -727,10 +695,10 @@ constexpr idx_t STATS_CACHE_MAX_REREADS = 64;
 //! fails here rather than reading every table's stats as one table's.
 static string TableGlobalStatsQuery(bool include_exactness, idx_t table_id) {
 	auto query = DuckLakeMetadataManager::GlobalTableStatsQuery(include_exactness);
-	const string order_by = "ORDER BY table_id\n";
+	const string order_by = "ORDER BY table_id ASC\n";
 	auto pos = query.rfind(order_by);
 	if (pos == string::npos) {
-		throw InternalException("mssql_ducklake: DuckLake's global stats query has no ORDER BY table_id");
+		throw InternalException("mssql_ducklake: DuckLake's global stats query has no ORDER BY table_id ASC");
 	}
 	return query.insert(pos, StringUtil::Format("WHERE table_id = %llu\n", table_id));
 }
