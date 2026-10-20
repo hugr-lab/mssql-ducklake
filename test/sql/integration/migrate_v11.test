@@ -109,6 +109,22 @@ SELECT count(*) FROM mssql_scan('srv', 'SELECT sv.schema_version FROM migrate_v1
 ----
 2
 
+# A FLOAT column retyped to DOUBLE, with a file whose max bound is a FLOAT's text - what older versions
+# left. Read as a DOUBLE, '1.1' is below the FLOAT 1.1 the file holds, so the bound prunes the file
+# from `f > 1.1`: the migration makes that bound unknown (MigrateRetypedBounds), and keeps the one a
+# FLOAT holds exactly.
+statement ok
+CREATE TABLE lake.retyped(f FLOAT);
+
+statement ok
+ALTER TABLE lake.retyped ALTER f TYPE DOUBLE;
+
+statement ok
+INSERT INTO lake.retyped SELECT CASE WHEN i < 10 THEN 0.5 ELSE CAST(CAST(1.1 AS FLOAT) AS DOUBLE) END FROM range(20) r(i);
+
+statement ok
+SELECT mssql_exec('srv', 'UPDATE s SET max_value = ''1.1'' FROM migrate_v11.ducklake_file_column_stats s JOIN migrate_v11.ducklake_table t ON t.table_id = s.table_id AND t.table_name = ''retyped''; UPDATE s SET max_value = ''1.1'' FROM migrate_v11.ducklake_table_column_stats s JOIN migrate_v11.ducklake_table t ON t.table_id = s.table_id AND t.table_name = ''retyped''');
+
 statement ok
 DETACH lake;
 
@@ -140,6 +156,22 @@ query I
 SELECT v FROM mssql_scan('srv', 'SELECT CAST(value AS VARCHAR(32)) AS v FROM migrate_v11.ducklake_metadata WHERE [key] = ''version''');
 ----
 1.1
+
+# the FLOAT-text bound is unknown now, the exact one is kept, and the rows above 1.1 are found again
+query II
+SELECT min_value, max_value FROM mssql_scan('srv', 'SELECT s.min_value, s.max_value FROM migrate_v11.ducklake_file_column_stats s JOIN migrate_v11.ducklake_table t ON t.table_id = s.table_id AND t.table_name = ''retyped''');
+----
+0.5	NULL
+
+query I
+SELECT count(*) FROM mssql_scan('srv', 'SELECT s.max_value FROM migrate_v11.ducklake_table_column_stats s JOIN migrate_v11.ducklake_table t ON t.table_id = s.table_id AND t.table_name = ''retyped'' WHERE s.max_value IS NOT NULL');
+----
+0
+
+query I
+SELECT count(*) FROM lake.retyped WHERE f > 1.1;
+----
+10
 
 # the schema version the 1.0 catalog lost is back, as it was
 query I

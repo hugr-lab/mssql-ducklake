@@ -581,6 +581,83 @@ bool RewriteUpdate(const string &stmt, const string &schema, string &tsql) {
 	return true;
 }
 
+//! The statistics of a column whose type changed in the commit (WriteFloatWidenedStats): a FLOAT
+//! widened to DOUBLE gets its bounds rewritten as DOUBLE text, any other change clears them -
+//! `UPDATE {METADATA_CATALOG}.<file|table>_column_stats SET <bounds> WHERE (table_id, column_id) IN
+//! ((t, c), ...)[ AND data_file_id < N]`, matched to the character. A row value IN is not T-SQL: the
+//! pairs become a joined VALUES. DuckDB prints the widened DOUBLE in its shortest form, which T-SQL
+//! cannot; style 3 gives the 17 digits that read back as exactly the same DOUBLE, and a bound a REAL
+//! does not parse (inf, -inf) is the same text either way.
+bool RewriteRetypedStats(const string &stmt, const string &schema, string &tsql) {
+	static const string WIDENED = "min_value = CAST(CAST(CAST(min_value AS REAL) AS DOUBLE PRECISION) AS VARCHAR), "
+	                              "max_value = CAST(CAST(CAST(max_value AS REAL) AS DOUBLE PRECISION) AS VARCHAR)";
+	static const string CLEARED = "min_value = NULL, max_value = NULL";
+	string table;
+	for (auto candidate : {"ducklake_file_column_stats", "ducklake_table_column_stats"}) {
+		if (StringUtil::StartsWith(stmt, string("UPDATE ") + CATALOG_PREFIX + candidate + " SET ")) {
+			table = candidate;
+		}
+	}
+	if (table.empty()) {
+		return false;
+	}
+	idx_t pos = strlen("UPDATE ") + strlen(CATALOG_PREFIX) + table.size() + strlen(" SET ");
+	string tsql_set;
+	if (stmt.compare(pos, WIDENED.size(), WIDENED) == 0) {
+		pos += WIDENED.size();
+		for (auto bound : {"min_value", "max_value"}) {
+			tsql_set += tsql_set.empty() ? "" : ", ";
+			tsql_set += StringUtil::Format("%s = CASE WHEN TRY_CAST(s.%s AS REAL) IS NULL THEN s.%s ELSE "
+			                               "CONVERT(VARCHAR(64), CAST(CAST(s.%s AS REAL) AS FLOAT), 3) END",
+			                               bound, bound, bound, bound);
+		}
+	} else if (stmt.compare(pos, CLEARED.size(), CLEARED) == 0) {
+		pos += CLEARED.size();
+		tsql_set = CLEARED;
+	} else {
+		return false;
+	}
+	const string where = " WHERE (table_id, column_id) IN (";
+	if (stmt.compare(pos, where.size(), where) != 0) {
+		return false;
+	}
+	pos += where.size();
+	// the pairs, the IN's `)`, and on the file stats ` AND data_file_id < N` to the end
+	const string file_bound = ") AND data_file_id < ";
+	auto bound_at = stmt.find(file_bound, pos);
+	auto pairs_end = bound_at == string::npos ? stmt.size() - 1 : bound_at;
+	if (pairs_end <= pos || stmt[pairs_end] != ')') {
+		return false;
+	}
+	string file_filter;
+	if (bound_at != string::npos) {
+		auto number = stmt.substr(bound_at + file_bound.size());
+		if (table != "ducklake_file_column_stats" || number.empty() ||
+		    number.find_first_not_of("0123456789") != string::npos) {
+			return false;
+		}
+		file_filter = " WHERE s.data_file_id < " + number;
+	}
+	vector<vector<Literal>> tuples;
+	idx_t tuple_pos = 0;
+	if (!ReadTuples(stmt.substr(pos, pairs_end - pos), tuple_pos, tuples)) {
+		return false;
+	}
+	vector<string> rows;
+	for (auto &tuple : tuples) {
+		if (tuple.size() != 2 || tuple[0].kind != LiteralKind::NUMBER || tuple[1].kind != LiteralKind::NUMBER) {
+			return false;
+		}
+		rows.push_back("(" + tuple[0].text + ", " + tuple[1].text + ")");
+	}
+	tsql = ChunkedStatements(
+	    StringUtil::Format("UPDATE s SET %s FROM %s.%s AS s JOIN (VALUES ", tsql_set, schema, table), rows,
+	    ") AS retyped(table_id, column_id) ON s.table_id = retyped.table_id AND s.column_id = "
+	    "retyped.column_id" +
+	        file_filter + ";");
+	return true;
+}
+
 //! `DELETE FROM {METADATA_CATALOG}.<t> [alias] [WHERE ...]` with a numeric body. SQL Server refuses
 //! an alias after the target in this form; the alias form becomes `DELETE alias FROM t alias ...`.
 bool RewriteDelete(const string &stmt, const string &schema, string &tsql) {
@@ -1400,7 +1477,8 @@ unique_ptr<QueryResult> MSSQLMetadataManager::Execute(DuckLakeSnapshot snapshot,
 			}
 		}
 		string tsql, dropped;
-		if (rewrite && (RewriteInsert(stmt, schema, v1_1, stats_length, tsql) || RewriteUpdate(stmt, schema, tsql) ||
+		if (rewrite && (RewriteInsert(stmt, schema, v1_1, stats_length, tsql) ||
+		                RewriteRetypedStats(stmt, schema, tsql) || RewriteUpdate(stmt, schema, tsql) ||
 		                RewriteDelete(stmt, schema, tsql) || RewriteCteUpdate(stmt, schema, tsql))) {
 			append(tsql + "\n");
 			if (failed) {

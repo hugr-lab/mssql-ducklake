@@ -113,11 +113,6 @@ inline bool VerifyCatalogEnabled() {
 	return enabled;
 }
 
-inline bool LoadRewriteDisabled() {
-	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_LOAD_REWRITE") != nullptr;
-	return disabled;
-}
-
 //! Off switch for the server-side file list (specs/015), so its absence can be measured.
 inline bool ServerFileListDisabled() {
 	static const bool disabled = getenv("MSSQL_DUCKLAKE_NO_SERVER_FILE_LIST") != nullptr;
