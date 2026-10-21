@@ -2,10 +2,8 @@
 # same inputs. Full platform coverage (Windows MSVC/MinGW, musl, linux_arm64, ...) lives here; the
 # PR loop stays on ci.yml's Linux job.
 #
-# On the DuckDB 2.0 line, the way community-extensions builds it until DuckDB tags v2.0.0:
-# duckdb_version names the release, which is what the binaries' metadata carries and what a stock
-# 2.0.0 CLI loads, and duckdb_commit the untagged commit it is built from (the submodule's). Once the
-# tag exists, duckdb_commit goes.
+# On the DuckDB 2.0 line: v2.0.0, the tag of the duckdb submodule's commit, with extension-ci-tools'
+# v2.0-cyanoptera, as community-extensions builds it.
 name: Distribution build
 
 on:
@@ -27,7 +25,6 @@ jobs:
     with:
       extension_name: mssql_ducklake
       duckdb_version: v2.0.0
-      duckdb_commit: d54cbbe3df17e8e5ce68312f483b4155836112aa
       ci_tools_version: v2.0-cyanoptera
       # wasm is out: mssql (raw TDS sockets) does not exist there, and the manager is nothing
       # without it
@@ -38,7 +35,6 @@ jobs:
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v2.0-cyanoptera
     with:
       extension_name: mssql_ducklake
-      # it checks out duckdb_version and takes no commit: the SHA until the tag exists
-      duckdb_version: d54cbbe3df17e8e5ce68312f483b4155836112aa
+      duckdb_version: v2.0.0
       ci_tools_version: v2.0-cyanoptera
       format_checks: 'format;tidy'
