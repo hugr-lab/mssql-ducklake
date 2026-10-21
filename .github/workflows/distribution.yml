@@ -5,8 +5,7 @@
 # On the DuckDB 2.0 line: v2.0.0, the tag of the duckdb submodule's commit, with extension-ci-tools'
 # v2.0-cyanoptera, as community-extensions builds it. Without the tests: v2.0.0 is a lightweight tag,
 # so the test runner built from it names itself after the nearest annotated one (v2.0.0-alpha49307)
-# and refuses the v2.0.0 binaries; ci.yml runs the tests on the submodule. The code-quality job stays
-# on extension-ci-tools' main, whose vcpkg still fetches meson (v2.0-cyanoptera's fails its hash).
+# and refuses the v2.0.0 binaries; ci.yml runs the tests on the submodule.
 name: Distribution build
 
 on:
@@ -37,9 +36,9 @@ jobs:
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v2.0-cyanoptera
     with:
       extension_name: mssql_ducklake
       duckdb_version: v2.0.0
-      ci_tools_version: main
+      ci_tools_version: v2.0-cyanoptera
       format_checks: 'format;tidy'
