@@ -3,7 +3,10 @@
 # PR loop stays on ci.yml's Linux job.
 #
 # On the DuckDB 2.0 line: v2.0.0, the tag of the duckdb submodule's commit, with extension-ci-tools'
-# v2.0-cyanoptera, as community-extensions builds it.
+# v2.0-cyanoptera, as community-extensions builds it. Without the tests: v2.0.0 is a lightweight tag,
+# so the test runner built from it names itself after the nearest annotated one (v2.0.0-alpha49307)
+# and refuses the v2.0.0 binaries; ci.yml runs the tests on the submodule. The code-quality job stays
+# on extension-ci-tools' main, whose vcpkg still fetches meson (v2.0-cyanoptera's fails its hash).
 name: Distribution build
 
 on:
@@ -29,12 +32,14 @@ jobs:
       # wasm is out: mssql (raw TDS sockets) does not exist there, and the manager is nothing
       # without it
       exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
+      # the lightweight v2.0.0 tag: see the header
+      skip_tests: true
 
   code-quality-check:
     name: Code Quality Check
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@v2.0-cyanoptera
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_code_quality.yml@main
     with:
       extension_name: mssql_ducklake
       duckdb_version: v2.0.0
-      ci_tools_version: v2.0-cyanoptera
+      ci_tools_version: main
       format_checks: 'format;tidy'

@@ -51,6 +51,8 @@ jobs:
       duckdb_version: v2.0.0
       ci_tools_version: v2.0-cyanoptera
       exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads'
+      # as distribution.yml: the test runner of the lightweight v2.0.0 tag refuses v2.0.0 binaries
+      skip_tests: true
 
   release:
     name: Publish the release

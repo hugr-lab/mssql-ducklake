@@ -25,7 +25,7 @@ model, the full manager plan §7: transpiler, keys + filtered indexes, server-si
   | ducklake | submodule `ducklake/` (EMBEDDED — compiled into the extension) | `dcf71031` on `main` (past the `417a9117` DuckDB's own extension config names); catalog format 1.1 |
   | mssql | `extension_config.cmake` (runtime pair, test loadable) | `v0.3.0` (bfd347f, on duckdb `2ec7e8401c4`); built from source against our duckdb pin |
   | extension-ci-tools | submodule `extension-ci-tools/` | branch `main` (the reusable workflows use its `v2.0-cyanoptera`) |
-  | CI reusable workflows | `.github/workflows/distribution.yml`, `release.yml` | `@v2.0-cyanoptera`, `duckdb_version: v2.0.0` (the tag of the submodule's commit), as community-extensions builds it |
+  | CI reusable workflows | `.github/workflows/distribution.yml`, `release.yml` | `@v2.0-cyanoptera`, `duckdb_version: v2.0.0` (the tag of the submodule's commit), as community-extensions builds it, with `skip_tests` (the lightweight tag's test runner calls itself `v2.0.0-alpha49307` and refuses the binaries; ci.yml runs the tests); the code-quality job on `@main` (v2.0-cyanoptera's vcpkg fails meson's hash) |
 
   The 1.5.6 line lives on in the `v1.5` branch (duckdb v1.5.6, ducklake v1.5-variegata, mssql
   v0.2.5) for fixes until DuckDB 2.0 is released.
