@@ -26,7 +26,7 @@ connections; see the [mssql extension's reference](https://hugr-lab.github.io/ms
 | function | returns |
 | --- | --- |
 | `mssql_ducklake_catalog_info('lake')` | `(kind, name, value)` rows about a catalog on SQL Server: its limits (`limit`, one per `META_LIMITS` key), its shape stamp and migration marker (`property`), the database's forced parameterization, asynchronous statistics and read committed snapshot (`database`), and every string column with its declared type as the server reports it (`column`). |
-| `mssql_ducklake_version()` | the extension's release version, `0.1.2` in this one — the same idea as the mssql extension's `mssql_version()`; a build between releases answers the coming version with `-dev`. `duckdb_extensions()` shows the build's git hash instead. |
+| `mssql_ducklake_version()` | the extension's release version, `0.2.0` in this one — the same idea as the mssql extension's `mssql_version()`; a build between releases answers the coming version with `-dev`. `duckdb_extensions()` shows the build's git hash instead. |
 
 Everything else is DuckLake's: `ducklake_snapshots()`, `ducklake_table_info()`,
 `ducklake_table_changes()`, `ducklake_flush_inlined_data()`, `ducklake_expire_snapshots()`,

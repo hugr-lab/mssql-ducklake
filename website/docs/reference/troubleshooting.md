@@ -14,6 +14,10 @@ sidebar_position: 3
 then `LOAD mssql_ducklake`. The load tries to autoload mssql itself and fails with this message when
 it cannot.
 
+**`certificate verification failed for <host>: self-signed certificate`** on attach — since v0.3.0
+the mssql extension verifies the server's certificate by default. Add `TrustServerCertificate=yes`
+to the connection string for a server on a self-signed certificate, as `sqlcmd -C` does.
+
 **`Schema 'main' not found in MSSQL database`** on attach — the mssql extension is older than
 v0.2.5, which answers `dbo` as the catalog's default schema. `SELECT mssql_version();` to check;
 `FORCE INSTALL mssql FROM community;` to update. With v0.2.4 the attach works with
@@ -39,8 +43,9 @@ the permission runs `ALTER DATABASE CURRENT SET PARAMETERIZATION FORCED;` on the
 
 **An `IO Error` from the mssql extension on a user query** that mixes `mssql_scan()` with a scan of
 the attached catalog inside a transaction, or `TDS parse error: Unknown token type` after calling a
-stored procedure through `mssql_scan()` — mssql v0.2.5 limitations, both fixed on its 2.0 line
-([Limitations](./limitations.md)). Run the `mssql_scan()` alone, outside the transaction.
+stored procedure through `mssql_scan()` — mssql v0.2.5 limitations, so on DuckDB v1.5.6 only. Both
+are fixed in v0.3.0, the DuckDB 2.0 build. On 1.5.6, run the `mssql_scan()` alone, outside the
+transaction.
 
 **Slow first read or first write into every table** — check `is_parameterization_forced` for the
 catalog's database (`SELECT is_parameterization_forced FROM sys.databases WHERE database_id = DB_ID()`

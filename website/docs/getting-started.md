@@ -7,11 +7,14 @@ sidebar_position: 2
 
 ### Prerequisites
 
-- DuckDB **v1.5.6** — the release line this extension is built on ([Versions](./versions.md)).
-- The **mssql extension v0.2.5 or newer**. Older versions answer DuckDB's `main` when DuckLake asks
-  the catalog for its default schema, and the attach fails with `Schema 'main' not found`.
-  `INSTALL mssql FROM community` gives a current version; `SELECT mssql_version()` says which one is
-  loaded.
+- DuckDB **v2.0.0**. On DuckDB v1.5.6, `INSTALL` gives v0.1.2 of this extension instead
+  ([Versions](./versions.md)).
+- The **mssql extension v0.3.0 or newer**, which is the mssql build for DuckDB 2.0.
+  `INSTALL mssql FROM community` installs the right one for your DuckDB, and
+  `SELECT mssql_version()` shows which one is loaded.
+  - Since v0.3.0 the mssql extension verifies the server's TLS certificate by default.
+  - A server on a self-signed certificate, such as a local Docker one, needs
+    `TrustServerCertificate=yes` in the connection string.
 - **SQL Server 2019 or later, or Azure SQL Database** — the catalog's strings need a UTF-8 collation
   ([Requirements](./catalog/requirements.md)).
 - A place for the data files: a local directory, S3, Azure Blob Storage — anything DuckDB can write
