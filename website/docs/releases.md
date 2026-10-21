@@ -8,6 +8,41 @@ sidebar_position: 8
 Versions of this documentation follow the releases: the dropdown shows the docs of each tag, and
 *Next* is what is being written for the coming one.
 
+## v0.2.0 — the DuckDB 2.0 line
+
+DuckDB **v2.0.0**, DuckLake `main` embedded at `dcf71031` (catalog format **1.1**), the mssql
+extension **v0.3.0** or newer. DuckDB v1.5.6 keeps v0.1.2, below. The community repository serves
+the build that matches the DuckDB you run.
+
+**What changed.**
+- **The release line moved to DuckDB 2.0.** DuckLake moved to its main branch, and the mssql
+  extension to its 2.0 build.
+- **A new catalog is created at DuckLake's format 1.1.**
+- **The extension does more of its work on the server, in T-SQL:**
+  - the commit, including the user's inlined rows;
+  - the catalog load, which is then kept per ATTACH and caught up from the server;
+  - the file list of a scan.
+- **Table statistics are cached per ATTACH.**
+- **On equal Azure VMs, the benchmark takes 0.63× of the PostgreSQL backend's time**
+  ([Performance](./performance.md)). On v0.1.2 it took 1.54×.
+
+**An existing catalog.**
+- **A v0.1.x catalog attaches as it is, at format 1.0.** It stays at 1.0, so v0.1.x keeps
+  attaching it too.
+- **Moving it to 1.1 is an explicit step:** `ATTACH … (AUTOMATIC_MIGRATION TRUE)`.
+  - The migration runs as T-SQL on the server and is safe to repeat.
+  - It adds 1.1's columns and table, and renames the inlined tables' metadata columns.
+  - It repairs what older DuckLake versions left behind: missing schema versions of inlined
+    tables, the defaults of renamed struct fields, and statistics bounds stored in the wrong type.
+  - `META_LIMITS` can narrow the string columns on the way ([Shaping](./catalog/shaping.md)).
+- **A catalog at 1.1 no longer attaches to v0.1.x.**
+
+**Connection strings.** Since v0.3.0 the mssql extension verifies the server's TLS certificate by
+default. For a server on a self-signed certificate, such as a local Docker one, add
+`TrustServerCertificate=yes`.
+
+**Platforms** are those of v0.1.0, below.
+
 ## v0.1.2 — the DuckDB v1.5.6 line
 
 DuckDB **v1.5.6**, DuckLake `v1.5-variegata` embedded, the mssql extension **v0.2.5** or newer.

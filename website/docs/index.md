@@ -49,14 +49,22 @@ Azure Blob, …); only the catalog is in SQL Server.
 
 ## Status
 
-**Experimental.** Released as v0.1.2 for the DuckDB v1.5.6 line, from the community extensions
-repository: `INSTALL mssql_ducklake FROM community` ([Getting started](./getting-started.md)); the
-v1.5.5 line keeps v0.1.1 ([Releases](./releases.md)). What
-is in place: the full DuckLake surface;
-DDL, inlined and file-backed writes, `UPDATE`, `DELETE`, `MERGE`; concurrent writers; re-attach;
-a server-backed integration suite and a concurrency test in CI; a benchmark against the PostgreSQL
-backend on a 1000-table catalog, currently at 1.5x of its total time with commits at parity. The
-[limitations](./reference/limitations.md) page is the honest list of what is not there yet.
+**Experimental.** Released from the community extensions repository with
+`INSTALL mssql_ducklake FROM community` ([Getting started](./getting-started.md)):
+
+- v0.2.0 for DuckDB v2.0.0, with DuckLake catalog format 1.1;
+- v0.1.2 for DuckDB v1.5.6 ([Releases](./releases.md)).
+
+What is in place:
+
+- the full DuckLake surface;
+- DDL, inlined and file-backed writes, `UPDATE`, `DELETE`, `MERGE`;
+- concurrent writers and re-attach;
+- a server-backed integration suite and a concurrency test in CI.
+
+A benchmark against the PostgreSQL backend on equal Azure VMs took 0.63× of its time, at 500
+tables ([Performance](./performance.md)). The [limitations](./reference/limitations.md) page is the
+honest list of what is not there yet.
 
 The project's design and every measurement behind a decision are in the repository's
 [specs](https://github.com/hugr-lab/mssql-ducklake/tree/main/specs); if the extension finds users,
