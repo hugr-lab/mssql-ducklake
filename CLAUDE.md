@@ -23,7 +23,7 @@ model, the full manager plan §7: transpiler, keys + filtered indexes, server-si
   | --- | --- | --- |
   | duckdb | submodule `duckdb/` | `v2.0.0` (`d54cbbe3df1`), the v2.0-cyanoptera line |
   | ducklake | submodule `ducklake/` (EMBEDDED — compiled into the extension) | `dcf71031` on `main` (past the `417a9117` DuckDB's own extension config names); catalog format 1.1 |
-  | mssql | `extension_config.cmake` (runtime pair, test loadable) | `v0.3.0` (bfd347f, on duckdb `2ec7e8401c4`); built from source against our duckdb pin |
+  | mssql | `extension_config.cmake` (runtime pair, test loadable) | main `6df11bc` (v0.3.0's code, on duckdb `v2.0.0`); built from source against our duckdb pin |
   | extension-ci-tools | submodule `extension-ci-tools/` | branch `main` (the reusable workflows use its `v2.0-cyanoptera`) |
   | CI reusable workflows | `.github/workflows/distribution.yml`, `release.yml` | `@v2.0-cyanoptera`, `duckdb_version: v2.0.0` (the tag of the submodule's commit), as community-extensions builds it, with `skip_tests` (the lightweight tag's test runner calls itself `v2.0.0-alpha49307` and refuses the binaries; ci.yml runs the tests) |
 
