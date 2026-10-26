@@ -26,8 +26,8 @@ duckdb_extension_load(mssql
 # config names at our duckdb (c0f5a3c), on the v2.0-cyanoptera line.
 # The distribution and release builds (extension-ci-tools' reusable workflow, which sets
 # DUCKDB_PLATFORM) leave it out: they ship mssql_ducklake, and postgres_scanner does not even link
-# on every platform there (MinGW).
-if(NOT DEFINED ENV{DUCKDB_PLATFORM})
+# on every platform there (MinGW). So does `make tidy-check` (MSSQL_DUCKLAKE_NO_POSTGRES, see Makefile).
+if(NOT DEFINED ENV{DUCKDB_PLATFORM} AND NOT DEFINED ENV{MSSQL_DUCKLAKE_NO_POSTGRES})
   duckdb_extension_load(postgres_scanner
       GIT_URL https://github.com/duckdb/duckdb-postgres
       GIT_TAG c0f5a3c0c4b68b02afbf669d36d7f0e503985c88
