@@ -26,7 +26,9 @@ duckdb_extension_load(mssql
 # config names at our duckdb (c0f5a3c), on the v2.0-cyanoptera line.
 # The distribution and release builds (extension-ci-tools' reusable workflow, which sets
 # DUCKDB_PLATFORM) leave it out: they ship mssql_ducklake, and postgres_scanner does not even link
-# on every platform there (MinGW). So does `make tidy-check` (MSSQL_DUCKLAKE_NO_POSTGRES, see Makefile).
+# on every platform there (MinGW). So do ci.yml and `make tidy-check`, through MSSQL_DUCKLAKE_NO_POSTGRES:
+# its vcpkg-tool-meson overlay port includes the vcpkg checkout's own portfile, and once that names a
+# newer meson its hash no longer matches the 1.9.0 the overlay asks for (vcpkg at HEAD, 2026-10-26).
 if(NOT DEFINED ENV{DUCKDB_PLATFORM} AND NOT DEFINED ENV{MSSQL_DUCKLAKE_NO_POSTGRES})
   duckdb_extension_load(postgres_scanner
       GIT_URL https://github.com/duckdb/duckdb-postgres

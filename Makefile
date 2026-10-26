@@ -192,9 +192,7 @@ vcpkg-setup:
 # roaring/openssl/simdutf at configure - `make tidy-check` then works there and here.
 tidy-check: vcpkg-setup $(EXTENSION_CONFIG_STEP)
 tidy-check: EXT_DEBUG_FLAGS += $(VCPKG_MANIFEST_FLAGS)
-# tidy reads our sources only: the bench's postgres_scanner stays out (extension_config.cmake). Its
-# vcpkg-tool-meson overlay port includes the runner vcpkg's own portfile, whose hash is for a newer
-# meson than the 1.9.0 the overlay names, and the download fails the job.
+# tidy reads our sources only: the bench's postgres_scanner stays out (why: extension_config.cmake)
 tidy-check: export MSSQL_DUCKLAKE_NO_POSTGRES := 1
 # make hands a target's variables down to its prerequisites, and the manifest step is the one that
 # CREATES the manifest the flag points at (vcpkg would fail reading it) - pin the prerequisites to the

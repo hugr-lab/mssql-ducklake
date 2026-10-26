@@ -48,6 +48,8 @@ jobs:
       GEN: ninja
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
+      # the bench's postgres_scanner is not built: no test uses it (extension_config.cmake)
+      MSSQL_DUCKLAKE_NO_POSTGRES: 1
     steps:
       - uses: actions/checkout@v7
         with:
@@ -141,6 +143,8 @@ jobs:
       GEN: ninja
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       VCPKG_BINARY_SOURCES: 'clear;files,${{ github.workspace }}/vcpkg_bincache,readwrite'
+      # the bench's postgres_scanner is not built: no test uses it (extension_config.cmake)
+      MSSQL_DUCKLAKE_NO_POSTGRES: 1
     steps:
       - uses: actions/checkout@v7
         with:
