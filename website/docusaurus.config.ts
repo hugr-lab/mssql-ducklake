@@ -1,6 +1,8 @@
 import {themes as prismThemes} from 'prism-react-renderer';
 import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
+import fs from 'node:fs';
+import path from 'node:path';
 
 // Docs for mssql_ducklake - DuckLake on SQL Server. Mirrors the mssql-extension
 // site (hugr-lab/mssql-extension/website) and the org site (hugr-lab.github.io)
@@ -16,6 +18,16 @@ const site = ionos
 // the GitHub Pages build: its pages then name the hugr-lab.com copy as canonical
 // (src/theme/SiteMetadata) and it has no sitemap of its own.
 const canonicalBase = ionos ? '' : process.env.DOCS_CANONICAL ?? '';
+
+// Only the latest release - the one at the root - is for search engines: Next and the older
+// releases are near-copies of it, so they get noindex (and leave the sitemap) while staying in
+// the version dropdown. versions.json is made by pages.yml from the tags, newest first; without it
+// the current docs are the only version and stay indexed.
+const versionsFile = path.join(__dirname, 'versions.json');
+const released: string[] = fs.existsSync(versionsFile) ? JSON.parse(fs.readFileSync(versionsFile, 'utf8')) : [];
+const noIndexVersions = Object.fromEntries(
+  released.length ? ['current', ...released.slice(1)].map((v) => [v, {noIndex: true}]) : [],
+);
 
 const config: Config = {
   title: 'DuckLake on SQL Server',
@@ -58,6 +70,7 @@ const config: Config = {
           // release are reachable but never the landing default.
           editUrl: 'https://github.com/hugr-lab/mssql-ducklake/tree/main/website/',
           showLastUpdateTime: true,
+          versions: noIndexVersions,
         },
         blog: false,
         sitemap: canonicalBase ? false : undefined,
