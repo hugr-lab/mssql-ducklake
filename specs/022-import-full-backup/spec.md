@@ -1,4 +1,4 @@
-# Spec 021: importing a full SQL Server backup, one DuckLake snapshot per file
+# Spec 022: importing a full SQL Server backup, one DuckLake snapshot per file
 
 - **Status**: draft (number tentative)
 - **Date**: 2026-11-05
@@ -17,8 +17,8 @@ snapshot, with no SQL Server instance anywhere. The work is done in three phases
   transaction (`AppendFiles`). It also creates the `__mssql_sys` mirror of the SQL Server base tables, the
   page map, and the provenance rows, and sets the commit message.
 
-The lake this spec creates is the base that 022 applies differentials and later fulls to, and its
-snapshots are the backup history that 023 keeps and expires. This spec also fixes the decisions the lake
+The lake this spec creates is the base that 023 applies differentials and later fulls to, and its
+snapshots are the backup history that 024 keeps and expires. This spec also fixes the decisions the lake
 is born with: the service columns, the partitioning and sort order proposed from SQL Server once, at
 creation (after that the layout is DuckLake's), inlining off, and importer-owned compaction.
 
@@ -27,7 +27,7 @@ Owner questions are cited as DQ-nn ([decisions.md](https://github.com/hugr-lab/m
 only proposes the initial DuckLake spec; partition values are computed exactly as DuckLake computes
 them, in the importing session; files are laid out by DuckLake partition values, sort order and file
 size, never per SQL Server partition (those are work units only); a SWITCH is a lake-side copy plus
-positional deletes (022 D8).
+positional deletes (023 D8).
 
 ## Problem
 
@@ -68,10 +68,10 @@ PRAGMA ducklake_import_mssql_backup('lake', 's3://bak/sales_full.bak',
 | --- | --- | --- |
 | `files` | `[]` | the other members of a striped media set: all FamilyCount files, one MediaSetId (E2 R9; the reader refuses an incomplete set). Passed to the reader as one path list |
 | `position` | 1 | the backup set's position in a file that holds several (`RESTORE … FILE = n`); the reader's parameter of the same name (085) |
-| `schemas`, `tables` | all | regex filters, fixed at the first import and stored in `__mssql_backup.config`. A table added to them later needs every one of its pages, so 022 refuses a change unless the next full is applied in `rebase` mode |
+| `schemas`, `tables` | all | regex filters, fixed at the first import and stored in `__mssql_backup.config`. A table added to them later needs every one of its pages, so 023 refuses a change unless the next full is applied in `rebase` mode |
 | `partitioning`, `sorting` | proposed (D5) | per-table specs for the tables this call creates; `'none'` declares none. After creation the specs are DuckLake's, changed only with DuckLake's own ALTERs |
 | `threads` | DuckDB's | export parallelism |
-| `mode` | `'auto'` | `'fresh'` requires a lake without this database; 022 adds `'incremental'` and `'rebase'` |
+| `mode` | `'auto'` | `'fresh'` requires a lake without this database; 023 adds `'incremental'` and `'rebase'` |
 | `if_applied` | `'skip'` | a file whose BackupSetGUID is already in `__mssql_backup.imports` is a no-op that returns its snapshot; `'error'` refuses it |
 | `manifests` | NULL | register files written by external workers (D4) instead of exporting |
 | `resume` | true | reuse the files of an unfinished run of the same file planned at the same lake state (D9) |
@@ -131,7 +131,7 @@ The order matters.
 | `ducklake_mssql_backup_plan(lake, file, …)` | the callback's work as rows: chain decision, DDL, specs and why, units, bytes, the expansion text. Read-only |
 | `ducklake_mssql_backup_export(lake, file, plan :=)` | the export phase (D2.2); returns the manifest |
 | `ducklake_mssql_backup_apply(lake, file, manifest :=, plan :=)` | the registration (D2.3); returns the summary |
-| `ducklake_mssql_backup_history(lake)` | imports with snapshot ids, generation, consistency, expired (023 extends it) |
+| `ducklake_mssql_backup_history(lake)` | imports with snapshot ids, generation, consistency, expired (024 extends it) |
 | `ducklake_mssql_backup_compact(lake [, schema, table], …)` | the importer's compaction (D6) |
 | `ducklake_mssql_backup_cleanup_runs(lake, older_than :=, dry_run :=)` | orphans of unregistered runs (D9) |
 
@@ -141,9 +141,9 @@ The order matters.
 
 1. `mssql_backup_info([file] + files, position := …)` gives the header (085: the path argument takes the
    list of a media set's families). This entry point takes a full or a copy-only full. On a lake that
-   already holds this database it hands over to 022 (`mode := 'auto'`).
+   already holds this database it hands over to 023 (`mode := 'auto'`).
 2. Lake state at S0: `__mssql_backup.imports` (empty means a fresh lake), `config`, existing schemas. A
-   lake that holds another database (a different FamilyGUID, 022 C1) is refused: v1 keeps one source database
+   lake that holds another database (a different FamilyGUID, 023 C1) is refused: v1 keeps one source database
    per lake.
 3. `mssql_backup_tables` (columns, AUs, `partitioning`), `mssql_backup_views`, `mssql_backup_catalog(file)`
    (with no base table: the list of allow-listed base tables to mirror; then each one's rows),
@@ -246,7 +246,7 @@ CALL ducklake_set_commit_message('lake', 'mssql-ducklake', 'full sales_full.bak'
   `COPY` computes them per row with the SQL text of DuckLake's own expression for the spec (D5), in the
   importing session, so any identity / calendar / `epoch_*` spec works in phase A, overrides included; a
   `bucket` spec waits for phase B unless its DuckLake expression is callable from SQL (to verify).
-- `_mssql_lob` is 089's column (PR 1). A phase-A lake written before it lands has no LOB maps, and 022
+- `_mssql_lob` is 089's column (PR 1). A phase-A lake written before it lands has no LOB maps, and 023
   then refuses partial LOB updates on it; whether to move the plain map output into 085 is DQ-05.
 - Phase A runs the tables one `COPY` after another, each `COPY` parallel inside, in the order DuckDB's
   COPY gives; correctness never depends on it, and the files follow DuckLake's partition values and
@@ -288,8 +288,8 @@ whole commit (specs/018, `MD/mssql_metadata_manager.cpp:26-31`). Why per table a
 | one mirror per base table `mssql_backup_catalog(file)` lists (085's allow-list) | the raw rows of `sysschobjs`, `syscolpars`, `sysrowsets`, `sysallocunits`, `sysrscols`, `sysidxstats`, `sysiscols`, `sysseobjvalues`, `sysclsobjs`, the columnstore tables (`syscsrowgroups`, `syscscolsegments`, `syscsdictionaries`), E7's partitioning tables (`systypedsubobjs`; `syssingleobjrefs` classes 7, 8, 30, 31), and `sysobjvalues` (rows for view text and partition boundaries, valclass 30, only: not module source; DQ-11). Each has its own `_mssql_rid`, `_mssql_page` (E1 rule 6) |
 | `page_map` | `(page_range BIGINT, page BIGINT, kind UTINYINT, au_id BIGINT, file_path VARCHAR, first_pos BIGINT, first_tuple INTEGER, row_count INTEGER, lsn DECIMAL(25,0))`, `PARTITIONED BY (page_range) SORTED BY (page)`, with `page_range = page >> 20`. One row per run; positions are 0-based row numbers in the file. `kind` 0 = rowstore page (`first_tuple` NULL); 1 = a run of surviving tuples of a columnstore rowgroup (`page` = rowgroup id, `au_id` = the columnstore rowset, a bitmap entry for tuple t maps to `first_pos + (t − first_tuple)`, 088 D3). **The page map records the AU (columnstore: the rowset), not the table**, because a SWITCH changes the table and leaves the AU (E7§4); the table is resolved through the mirror at each import. One global table, because "delete by page in every table" (E1 rule 5) is then a single lookup. `file_path` as `ducklake_list_files` reports it, because file ids exist only after the commit. `lsn` = the page's LSN from 089's page runs (R§6.2 point 4, E2 R5; NULL in phase A); no rule reads it, it is diagnostic |
 | `alloc_pages` | `(page, kind, lsn DECIMAL(25,0), image BLOB)`: the latest image of every allocation page (file header, GAM, SGAM, PFS, DCM, BCM, IAM; E2 R5), a side input to 089 |
-| `pending_pages` | `(file_id, page_id, page, xids UBIGINT[], lsn, image BLOB, import_seq)`: `mssql_backup_pending_pages`'s rows (090) plus the import that produced them; filled by a loaded full (D11); passed back as `base/pending.parquet` and resolved by 022. They hold uncommitted rows: DQ-09 |
-| `stale_pages` | `(page, reason, import_seq, skipped_xids UBIGINT[])`, `reason` as 090 reports it (`baseless`, `skipped_transaction`, `lob`): created empty; 022 fills it |
+| `pending_pages` | `(file_id, page_id, page, xids UBIGINT[], lsn, image BLOB, import_seq)`: `mssql_backup_pending_pages`'s rows (090) plus the import that produced them; filled by a loaded full (D11); passed back as `base/pending.parquet` and resolved by 023. They hold uncommitted rows: DQ-09 |
+| `stale_pages` | `(page, reason, import_seq, skipped_xids UBIGINT[])`, `reason` as 090 reports it (`baseless`, `skipped_transaction`, `lob`): created empty; 023 fills it |
 
 LSNs are `DECIMAL(25,0)` in SQL Server's numeric form (vlf · 10¹⁵ + block · 10⁵ + slot), which orders the
 way LSNs order and is the form HEADERONLY prints.
@@ -302,7 +302,7 @@ way LSNs order and is the form HEADERONLY prints.
 | `tables` | one row per imported object: object_id, the SQL Server schema and name, shape (heap / clustered / CCI), the lake schema and table it lives in, the import that created it, `created_partitioning`, `created_sorting`, `spec_source` (override / derived / none) and why, status (live / dropped) |
 | `columns` | object_id, colid → the lake column, SQL Server type text, declared length, collation, nullability, default text, computed text, identity seed and increment |
 | `views` | object_id, schema, name, the T-SQL definition (from `mssql_backup_views`) |
-| `config` | key/value: the filters, retention policy (023), compaction policy, and the loaded-diff mode (022) |
+| `config` | key/value: the filters, retention policy (024), compaction policy, and the loaded-diff mode (023) |
 
 **Sizes** (estimates, except where measured):
 
@@ -357,7 +357,7 @@ validates and registers. A side connection writes files only, never lake rows (r
 §8).
 
 **Side inputs and outputs.** A fresh full needs no side input. For a loaded full, the wrapper writes the
-pending set from `mssql_backup_pending_pages` (D11). 022 adds the side inputs under the run's `base/`
+pending set from `mssql_backup_pending_pages` (D11). 023 adds the side inputs under the run's `base/`
 (catalog, allocation, LOB, pending; 089 D10).
 
 ### D5. Partitioning and sort: proposed once, at creation; DuckLake's afterwards
@@ -368,7 +368,7 @@ clustered key only *propose* the spec a lake table is created with; the partitio
 the sort order and the file size are DuckLake's, exactly as for any DuckLake writer.
 
 Per table, when the lake table is created (at this import, or when a table first appears in a later file,
-022). The importer never changes the spec afterwards; manual DuckLake changes win, and later imports write
+023). The importer never changes the spec afterwards; manual DuckLake changes win, and later imports write
 under whatever spec the table has then.
 
 1. **An override from the call wins**: `partitioning := MAP {'s.t': '<spec>' | 'none'}`, and likewise
@@ -445,7 +445,7 @@ The lake-wide defaults stay as the user set them, for two reasons:
 
 **Why inlining 0.** `AppendFiles` never inlines, but some writes inside an import are native:
 
-- phase A's page map and provenance inserts, and 022's native `DELETE` fallback;
+- phase A's page map and provenance inserts, and 023's native `DELETE` fallback;
 - `ALTER` on a table with inlined data from the same transaction is refused
   (`DL/storage/ducklake_table_entry.cpp:1473`);
 - a delete of up to `limit` rows would become an inlined file deletion
@@ -472,7 +472,7 @@ sort applies (`DL/functions/ducklake_compaction_functions.cpp:727-745`). D5's so
 way. Only ties of a non-unique key at a page boundary can split a run, which is harmless.
 
 **The page-map rebuild.** After any compaction, the importer's or one a user forced by flipping the option,
-`page_map` rows that name files no longer live are stale. They are rebuilt before they are used (022 §D3):
+`page_map` rows that name files no longer live are stale. They are rebuilt before they are used (023 §D3):
 
 - for each live file of an imported table that has no page-map rows, read `filename, file_row_number,
   _mssql_page` (DuckLake exposes both virtual columns; `test/sql/virtualcolumns/`); for a columnstore
@@ -485,7 +485,7 @@ way. Only ties of a non-unique key at a page boundary can split a run, which is 
 The rebuild is exact whatever the row order (a page may get several runs), and its cost is one column of
 the compacted files. `ducklake_mssql_backup_compact` runs the rebuild as its own follow-up transaction, and
 every import checks for stale rows first, so a foreign compaction is caught too. When to compact is a
-policy (023 §D5): files below `small_file`, and files with more than `delete_threshold` of their rows
+policy (024 §D5): files below `small_file`, and files with more than `delete_threshold` of their rows
 deleted.
 
 ### D7. The commit, concretely
@@ -499,7 +499,7 @@ edited):
 | `AppendFiles(table_id, vector<DuckLakeDataFile>)` | every data, page-map, mirror, side-table and provenance file (`:248`) |
 | `AddNameMap(…)` | name-mapped files, unless they carry field ids (`:254`) |
 | `SetCommitMessage(DuckLakeSnapshotCommit)` | author, message, extra_info (`:300`) |
-| (022) `AddDeletes`, `DropFile`, `DuckLakeDeleteFileWriter::WriteDeleteFileWithSnapshots`, `DuckLakeDeleteFilter::ScanDeleteFile` | positional deletes from the page map |
+| (023) `AddDeletes`, `DropFile`, `DuckLakeDeleteFileWriter::WriteDeleteFileWithSnapshots`, `DuckLakeDeleteFilter::ScanDeleteFile` | positional deletes from the page map |
 
 **What DuckLake writes at commit.** `Commit()` → `FlushChanges()` → the commit loop
 (`DL/storage/ducklake_transaction_state.cpp:2648-2710`). Each attempt increments `snapshot_id` once and
@@ -543,7 +543,7 @@ Research-ducklake-import's "~80 k rows for 2,000 files × 40 columns" counts fil
 wide tables more than doubles it. **Not measured** (E8 was not run): the budget is ≤ 30 s for scenario A
 against a local server, and task 12 measures it. The commit holds the catalog's snapshot lock for its
 duration, so other writers to the lake wait. A full import is expected while the lake is otherwise quiet;
-022's differentials are small (022 §D9). If the commit proves slow, the fix is the one research §4.2
+023's differentials are small (023 §D9). If the commit proves slow, the fix is the one research §4.2
 names: extend the server-side apply to DuckLake's staged `DELETE_FILE` / `DROPPED_FILE` / `NAME_MAP`
 tables (`DL/include/storage/ducklake_staged_commit.hpp:39-58`).
 
@@ -562,7 +562,7 @@ uses a DuckDB-file lake.
 
 **`__mssql_backup.imports`**, one row per applied file:
 
-- `import_seq`, `run`, `mode` (fresh / incremental / rebase), `generation` (023);
+- `import_seq`, `run`, `mode` (fresh / incremental / rebase), `generation` (024);
 - `backup_set_guid`, `backup_type` (full / copy_only_full / diff), database name, `family_guid`,
   `recovery_fork_id` (NULL until 085 locates it);
 - `first_lsn`, `checkpoint_lsn`, `last_lsn`, `database_backup_lsn`, `differential_base_guid`,
@@ -586,7 +586,7 @@ The row's snapshot is its DuckLake `snapshot_id` virtual column
 
 - **Nothing is visible before the commit.**
 - **The run directory** `<data_path>/__mssql_backup/runs/<BackupSetGUID>/<run>/` holds `plan.json`, the
-  per-unit manifests, 022's side inputs and a status file. The data files are written at their final paths,
+  per-unit manifests, 023's side inputs and a status file. The data files are written at their final paths,
   because registration is zero-copy.
 - **Resume** (`resume := true`): when a run of the same file planned at the same plan id exists, the
   export skips the units whose files exist with their recorded sizes, and writes the rest.
@@ -605,7 +605,7 @@ The row's snapshot is its DuckLake `snapshot_id` virtual column
   - The apply's existence check fails closed, and the docs say so.
 - **After the commit**, a `ClientContextState::TransactionCommit` hook (called only after a successful
   commit, `DD/src/transaction/transaction_context.cpp:81-83`) drops the temp manifest table and the run's
-  scratch files. 023's automatic policy uses the same hook.
+  scratch files. 024's automatic policy uses the same hook.
 
 ### D10. Progress and reporting
 
@@ -635,7 +635,7 @@ A full backup is fuzzy (RESEARCH §4, E3). The owner's rule is **no dirt in the 
   `mssql_backup_pending_pages` (090), from the same cached recovery: the pre-undo images of every page undo
   changed, and of every page an open transaction logged a row operation on, with the transaction ids
   (E6 §6.2). The wrapper writes it as a Parquet file and the apply registers it as
-  `__mssql_sys.pending_pages`; 022 resolves it at the next file. A table recovery cannot cover is
+  `__mssql_sys.pending_pages`; 023 resolves it at the next file. A table recovery cannot cover is
   `unrecoverable`, and the file is refused naming it (090 D7).
 - **The watermark for the next file** is W = min(FirstLSN, CheckpointLSN), with LastLSN recorded beside it
   (E6 rule 7 needs it).
@@ -656,7 +656,7 @@ A full backup is fuzzy (RESEARCH §4, E3). The owner's rule is **no dirt in the 
   secret.
 - **What the lake exposes.** The lake holds the database's data. `__mssql_sys` holds catalog rows; module
   source (procedures, functions, triggers) is not mirrored, only view text and partition boundaries
-  (DQ-11). `pending_pages` holds uncommitted rows until 022 resolves them (DQ-09).
+  (DQ-11). `pending_pages` holds uncommitted rows until 023 resolves them (DQ-09).
   Type-101 pad bodies never reach the lake (the reader skips them, E2 R10).
 - **TDE backups** are refused until E10 reads their log tail: the reader reports `fuzzy_status =
   'unknown'` for every table of a TDE backup (087 D9), and no dirt may enter the lake.
@@ -664,7 +664,7 @@ A full backup is fuzzy (RESEARCH §4, E3). The owner's rule is **no dirt in the 
   per-file keys, and `ducklake_add_data_files` refuses them too
   (`DL/functions/ducklake_add_data_files.cpp:45-48`).
 - **Version mismatches.**
-  - A ducklake bump re-audits the apply (it mirrors `AddWrittenFiles`, and in 022 `FlushDelete`), next to
+  - A ducklake bump re-audits the apply (it mirrors `AddWrittenFiles`, and in 023 `FlushDelete`), next to
     spec 014's closed list.
   - The manifest carries the reader's version; a run whose workers report different mssql versions is
     refused.
@@ -734,7 +734,7 @@ T5 commits during the backup, and committed LOB updates run.
 **Counterfactuals.** Each switch is test-only (`MSSQL_DUCKLAKE_TEST_*`), and each shows a rule is
 necessary:
 
-1. Inlining left at 10: the page-map and provenance inserts are inlined, and 022's `ALTER` in the next
+1. Inlining left at 10: the page-map and provenance inserts are inlined, and 023's `ALTER` in the next
    commit is refused (`statement error`).
 2. `auto_compact` left true: a `CHECKPOINT` compacts an imported table. Without the rebuild, the next
    differential's positional deletes hit other rows and the oracle reports them. With the rebuild, 0.
@@ -794,7 +794,7 @@ Added by the consistency pass: DQ-05 (a phase-A lake carries no LOB maps until 0
 ## Follow-ups
 
 - **Views from backups (decided here: not a spec).** The text is captured in `__mssql_backup.views` and
-  versioned by 022. Translating a SELECT-only subset (brackets, TOP, ISNULL, CONVERT, `+` concatenation)
+  versioned by 023. Translating a SELECT-only subset (brackets, TOP, ISNULL, CONVERT, `+` concatenation)
   into DuckDB views is opt-in later, either per view or for the subset that parses. DuckLake stores only
   DuckDB SQL (`DL/storage/ducklake_transaction.cpp:1264`; `ducklake_view_entry.cpp:115-119`).
 - **Several source databases per lake** (`schema_prefix`, and per-database `__mssql_sys_<db>`).
@@ -817,7 +817,7 @@ Added by the consistency pass: DQ-05 (a phase-A lake carries no LOB maps until 0
 | 8 | Phase B export: the `ducklake_mssql_backup_export` wrapper (side connection, Parquet settings, per-unit manifests), external-worker manifests and their validation | 4 d |
 | 9 | Failure handling: resume, plan-id refusal, `if_applied`, `cleanup_runs`, the post-commit hook | 3 d |
 | 10 | Progress (`table_scan_progress`), logging, the summary rows | 1 d |
-| 11 | Compaction: `ducklake_mssql_backup_compact` (the option toggle), the page-map rebuild function (shared with 022), counterfactuals 2 and 3 | 4 d |
+| 11 | Compaction: `ducklake_mssql_backup_compact` (the option toggle), the page-map rebuild function (shared with 023), counterfactuals 2 and 3 | 4 d |
 | 12 | The commit: the 2,000-table measurement on the SQL Server catalog, strict-batch shapes added to spec 014's list, the lake-vs-lake check of phase A against B | 3 d |
 | 13 | A loaded full: `fuzzy` before 090; the pending set registered after 090 | 2 d |
 | 14 | The docs page (`website/docs/`), the README index row | 2 d |

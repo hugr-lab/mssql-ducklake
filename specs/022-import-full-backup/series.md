@@ -19,11 +19,11 @@ questions of both series are merged into one list, [decisions.md](https://github
 
 | spec | title | what it delivers | estimate |
 | --- | --- | --- | ---: |
-| [021](spec.md) | importing a full backup | a full `.bak` becomes one DuckLake snapshot: the pipeline (export first, one registering commit), parallel writers, the `__mssql_sys` mirror and page map, provenance, the partition and sort proposal at creation (then DuckLake's layout), inlining off, the compaction policy, retries and orphans, the SQL surface, progress | 7–9 wk |
-| [022](../022-incremental-import/spec.md) | applying a file on top of the lake | differentials and later fulls applied with only the lake and the one file: chain validation, page-map positional deletes, the LOB fragment map, schema evolution inside the commit, pending and stale pages, partition maintenance with E7's ownership rule (SWITCH by lake-side copy), columnstore deletes | 11–13 wk |
-| [023](../023-backup-retention-and-time-travel/spec.md) | retention and time travel | generations, `ducklake_mssql_backup_expire`, the automatic policy, the backup time → snapshot helper, and how retention interacts with compaction | 2–3.5 wk |
+| [022](spec.md) | importing a full backup | a full `.bak` becomes one DuckLake snapshot: the pipeline (export first, one registering commit), parallel writers, the `__mssql_sys` mirror and page map, provenance, the partition and sort proposal at creation (then DuckLake's layout), inlining off, the compaction policy, retries and orphans, the SQL surface, progress | 7–9 wk |
+| [023](../023-incremental-import/spec.md) | applying a file on top of the lake | differentials and later fulls applied with only the lake and the one file: chain validation, page-map positional deletes, the LOB fragment map, schema evolution inside the commit, pending and stale pages, partition maintenance with E7's ownership rule (SWITCH by lake-side copy), columnstore deletes | 11–13 wk |
+| [024](../024-backup-retention-and-time-travel/spec.md) | retention and time travel | generations, `ducklake_mssql_backup_expire`, the automatic policy, the backup time → snapshot helper, and how retention interacts with compaction | 2–3.5 wk |
 
-**Total: about 20–26 weeks of mssql-ducklake work** (021 45 d, 022 63 d, 023 17 d), gated on the mssql
+**Total: about 20–26 weeks of mssql-ducklake work** (022 45 d, 023 63 d, 024 17 d), gated on the mssql
 reader series (below). This is far
 above RESEARCH §8's phase 2 estimate ("3–4 wk"), which predates the owner's decisions. The decisions that
 added the work are the Parquet-first registration, the page map, the pending and stale lifecycle, schema
@@ -34,20 +34,20 @@ oracle harness that runs the E1 and E6 scenarios as tests.
 
 The owner's suggested split is kept, with one change: views are not a spec.
 
-- **021 and 022 stay apart**, although they share one pipeline. 021 is what a lake is born with: its tables,
-  service columns, side tables, page map, partitioning and sort, and the registering commit. 022 is the
-  apply algorithm, which reads all of that back. 022 depends on the incremental API (mssql 089) and, for
-  loaded files, on tail recovery (090). 021 does not, so it can ship first.
-- **Pending and stale pages stay in 022**, as the owner placed them, and are not a spec of their own. They
+- **022 and 023 stay apart**, although they share one pipeline. 022 is what a lake is born with: its tables,
+  service columns, side tables, page map, partitioning and sort, and the registering commit. 023 is the
+  apply algorithm, which reads all of that back. 023 depends on the incremental API (mssql 089) and, for
+  loaded files, on tail recovery (090). 022 does not, so it can ship first.
+- **Pending and stale pages stay in 023**, as the owner placed them, and are not a spec of their own. They
   slot into the middle of the apply order: pending images are resolved before the file's own redo, and
   stale pages are forced into the changed set. A separate spec would have to describe the apply twice.
-  022's task list gives them their own phase, gated on 090. The pending table is *created* by 021, since a
+  023's task list gives them their own phase, gated on 090. The pending table is *created* by 022, since a
   loaded full already produces pending pages.
 - **Views from backups are a follow-up, not a spec.** Capturing the T-SQL text costs a few rows per import
-  and needs no decision, so 021 stores it in `__mssql_backup.views` and 022 versions it. Translating
+  and needs no decision, so 022 stores it in `__mssql_backup.views` and 023 versions it. Translating
   T-SQL into DuckDB views has no owner decision yet: which subset, and whether it is opt-in per view. It
   does not affect import correctness. The stored text means it can be done later without re-reading old
-  backups. See 021 *Follow-ups*.
+  backups. See 022 *Follow-ups*.
 
 ## What the series consumes from mssql (085–090)
 
@@ -59,20 +59,20 @@ only as side inputs, which are plain relations or Parquet paths.
 
 | mssql surface (names tentative) | spec | used by | for |
 | --- | --- | --- | --- |
-| `mssql_backup_info(paths, position)` | 085 | 021, 022, 023 | header fields: kind, copy-only, GUIDs, the four LSNs, family and recovery-fork ids (the fork id still to locate), dates, family/stripes, compression, encryption thumbprint |
-| `mssql_backup_tables(file [, base])`, `mssql_backup_views(file)` | 085 / 089 | 021, 022 | the DDL plan, the `partitioning` a spec is proposed from (E7); view text; with `base`, a lone differential's tables |
-| `mssql_backup_catalog(file [, base_table] [, since_lsn, base])` | 085 / 089 | 021, 022 | with no base table, the allow-listed base tables a mirror holds; with one, its raw rows for `__mssql_sys` |
-| `mssql_backup_scan(file, schema, table [, since_lsn, base])` with `_mssql_rid`, `_mssql_page` (and 089's `_mssql_lob`) | 085 / 089 | 021 phase A, 022 fallback | rows (the v1 pipeline and the oracle) |
-| `mssql_backup_chain_check(file, …)` | 089 | 022 | the chain rules C1, C3–C5 from the file alone; W and `reflected_lsn` to record |
-| `mssql_backup_changed_pages(file [, schema, table], since_lsn, base)` | 089 (+090 kinds) | 022 | `changed`, `freed`, `dead_au`, `gone_au`, `au_moved` (E7's ownership rule), `dead_rowgroup`; with 090 `pending_*` and `stale` |
-| `mssql_backup_allocation(file)` | 089 | 021, 022 | the allocation images kept in `__mssql_sys.alloc_pages` |
-| `mssql_backup_export_plan(file, …)`, `mssql_backup_export(file, …)` | 089 | 021 phase B, 022 | the parallel writer: data files and page-run files `(page, page_lsn, first_pos, row_count)` in DuckLake's layout (`partition_by`, `order_by`, `target_file_size`, `parquet_options` from the lake). Side inputs under `base/`: the mirror, the allocation images, the old LOB values and maps, the pending set (089 D10); the stale set stays in the lake |
-| tail recovery: `recovery`, `loaded_diff`, `reflected_lsn` on the scan, the export and `changed_pages`; `mssql_backup_pending_pages` | 090 | 021 (loaded full), 022 | no dirt in the lake; the pending set kept between files |
+| `mssql_backup_info(paths, position)` | 085 | 022, 023, 024 | header fields: kind, copy-only, GUIDs, the four LSNs, family and recovery-fork ids (the fork id still to locate), dates, family/stripes, compression, encryption thumbprint |
+| `mssql_backup_tables(file [, base])`, `mssql_backup_views(file)` | 085 / 089 | 022, 023 | the DDL plan, the `partitioning` a spec is proposed from (E7); view text; with `base`, a lone differential's tables |
+| `mssql_backup_catalog(file [, base_table] [, since_lsn, base])` | 085 / 089 | 022, 023 | with no base table, the allow-listed base tables a mirror holds; with one, its raw rows for `__mssql_sys` |
+| `mssql_backup_scan(file, schema, table [, since_lsn, base])` with `_mssql_rid`, `_mssql_page` (and 089's `_mssql_lob`) | 085 / 089 | 022 phase A, 023 fallback | rows (the v1 pipeline and the oracle) |
+| `mssql_backup_chain_check(file, …)` | 089 | 023 | the chain rules C1, C3–C5 from the file alone; W and `reflected_lsn` to record |
+| `mssql_backup_changed_pages(file [, schema, table], since_lsn, base)` | 089 (+090 kinds) | 023 | `changed`, `freed`, `dead_au`, `gone_au`, `au_moved` (E7's ownership rule), `dead_rowgroup`; with 090 `pending_*` and `stale` |
+| `mssql_backup_allocation(file)` | 089 | 022, 023 | the allocation images kept in `__mssql_sys.alloc_pages` |
+| `mssql_backup_export_plan(file, …)`, `mssql_backup_export(file, …)` | 089 | 022 phase B, 023 | the parallel writer: data files and page-run files `(page, page_lsn, first_pos, row_count)` in DuckLake's layout (`partition_by`, `order_by`, `target_file_size`, `parquet_options` from the lake). Side inputs under `base/`: the mirror, the allocation images, the old LOB values and maps, the pending set (089 D10); the stale set stays in the lake |
+| tail recovery: `recovery`, `loaded_diff`, `reflected_lsn` on the scan, the export and `changed_pages`; `mssql_backup_pending_pages` | 090 | 022 (loaded full), 023 | no dirt in the lake; the pending set kept between files |
 | the `mssql_backup_key` secret (scope first, then thumbprint) | 087 | all | an encrypted backup or TDE (TDE refused until E10, 087 D9); the import passes no key material |
-| columnstore rows by rowgroup, delete bitmap entries, rowgroup states | 088 | 021, 022 | CCI tables |
+| columnstore rows by rowgroup, delete bitmap entries, rowgroup states | 088 | 022, 023 | CCI tables |
 | the opened-file cache (per instance, keyed by path + size/ETag + BackupSetGUID) | 085 | all | the import calls the file functions many times, on side connections too; it also keeps a file's recovery (090) |
 
-The exact contract the importer needs from 089 is stated in 021 §D4 and 022 §D2. 089's own draft is the
+The exact contract the importer needs from 089 is stated in 022 §D4 and 023 §D2. 089's own draft is the
 authority on names and shapes, and the two were reconciled with it on 2026-11-05 (option names
 `position`, `loaded_diff`, `reflected_lsn`, `base`; the LOB map's shape is still open, DQ-01 / DQ-02).
 
@@ -82,20 +82,20 @@ authority on names and shapes, and the two were reconciled with it on 2026-11-05
 mssql, track A (critical path):  085 ──► 089 PR 1 ──► 090
 mssql, track B (coverage):       085 ──► 086 PR 1-2 ──► 087 ──► 088 ──► 086 PR 3-6 ──► 089 PR 2
 
-mssql-ducklake:  I1  021 phase A   needs 085 (+086 for types)
-                 I2  023           after I1, beside I3
-                 I3  022 core      needs 089 PR 1; 021 phase B needs 089 PR 2
-                 I4  022 load      needs 090
-                 I5  022 CCI       needs 088 (+ E11)
+mssql-ducklake:  I1  022 phase A   needs 085 (+086 for types)
+                 I2  024           after I1, beside I3
+                 I3  023 core      needs 089 PR 1; 022 phase B needs 089 PR 2
+                 I4  023 load      needs 090
+                 I5  023 CCI       needs 088 (+ E11)
 ```
 
 | phase | needs | scope | estimate |
 | --- | --- | --- | ---: |
-| **I1** | 085 (+086 for types) | 021 phase A: the SQL pipeline (`COPY` from `mssql_backup_scan`, `ducklake_add_data_files`, page map from `file_row_number`), DDL, mirror, provenance, the partition and sort proposal, the oracle harness, quiet fulls only (an inconsistent full is refused; no user option imports it). Without 089's `_mssql_lob` these lakes carry no LOB maps (DQ-05) | 4–5 wk |
-| **I2** | I1 | 023: generations, expire, policy, snapshot helper. It can run alongside I3 | 2–3.5 wk |
-| **I3** | 089 (PR 1; PR 2 for 021 phase B) | 021 phase B (C++ registration through DuckLake's transaction, the parallel export, manifests, resume, compaction and page-map rebuild) and 022's core for quiet chains: chain validation, positional deletes, mirror and DDL, schema evolution, LOB map, SPLIT / MERGE / TRUNCATE / REBUILD PARTITION, and rowstore SWITCH by E7's ownership rule | 4 wk + 9 wk |
-| **I4** | 090 | 022's load phase: pending and stale tables and their lifecycle, skip-whole by default, the E6 load scenarios and counterfactuals | 2–3 wk |
-| **I5** | 088 (and E11) | 022: columnstore deletes and rowgroup transitions; a columnstore SWITCH by rowset | 1–1.5 wk |
+| **I1** | 085 (+086 for types) | 022 phase A: the SQL pipeline (`COPY` from `mssql_backup_scan`, `ducklake_add_data_files`, page map from `file_row_number`), DDL, mirror, provenance, the partition and sort proposal, the oracle harness, quiet fulls only (an inconsistent full is refused; no user option imports it). Without 089's `_mssql_lob` these lakes carry no LOB maps (DQ-05) | 4–5 wk |
+| **I2** | I1 | 024: generations, expire, policy, snapshot helper. It can run alongside I3 | 2–3.5 wk |
+| **I3** | 089 (PR 1; PR 2 for 022 phase B) | 022 phase B (C++ registration through DuckLake's transaction, the parallel export, manifests, resume, compaction and page-map rebuild) and 023's core for quiet chains: chain validation, positional deletes, mirror and DDL, schema evolution, LOB map, SPLIT / MERGE / TRUNCATE / REBUILD PARTITION, and rowstore SWITCH by E7's ownership rule | 4 wk + 9 wk |
+| **I4** | 090 | 023's load phase: pending and stale tables and their lifecycle, skip-whole by default, the E6 load scenarios and counterfactuals | 2–3 wk |
+| **I5** | 088 (and E11) | 023: columnstore deletes and rowgroup transitions; a columnstore SWITCH by rowset | 1–1.5 wk |
 
 087 adds no import code: encrypted and TDE samples join the I1 and I3 test matrices (about 0.5 wk). A TDE
 backup is refused by name until E10 reads its log tail (087 D9: its tables report `unknown`).

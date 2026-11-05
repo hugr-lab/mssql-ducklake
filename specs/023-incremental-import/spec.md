@@ -1,4 +1,4 @@
-# Spec 022: applying a differential or a later full on top of the lake
+# Spec 023: applying a differential or a later full on top of the lake
 
 - **Status**: draft (number tentative)
 - **Date**: 2026-11-05
@@ -6,14 +6,14 @@
 
 ## Summary
 
-After 021's first import, the lake is the base. Each later file is applied with nothing but the lake and
+After 022's first import, the lake is the base. Each later file is applied with nothing but the lake and
 that one file, never the old full and never an intermediate differential. A file can be:
 
 - a differential;
 - a periodic new full;
 - later, a log backup.
 
-Each applied file is one snapshot, registered by the same plan → export → register pipeline as 021. What
+Each applied file is one snapshot, registered by the same plan → export → register pipeline as 022. What
 this spec adds is the apply algorithm, which E1 proved on 21 states over 5 chains and E6 made exact under
 load:
 
@@ -30,7 +30,7 @@ load:
    handled in the same commit.
 
 Owner questions are cited as DQ-nn ([decisions.md](https://github.com/hugr-lab/mssql-extension/blob/main/specs/085-backup-reader-core/decisions.md)). The layout of every file the apply writes is
-DuckLake's (owner, 2026-11-05; 021 D5, DQ-10).
+DuckLake's (owner, 2026-11-05; 022 D5, DQ-10).
 
 ## Problem
 
@@ -60,13 +60,13 @@ Three ways of carrying them into DuckLake fall short:
 - DuckLake's `MERGE` allows one UPDATE/DELETE action (`DL/storage/ducklake_merge_into.cpp:11-23`).
 - A transaction per table breaks the one-snapshot rule.
 
-Paths as in 021: `DL/` = `ducklake/src/`, `DD/` = `duckdb/`, `MD/` = `src/`.
+Paths as in 022: `DL/` = `ducklake/src/`, `DD/` = `duckdb/`, `MD/` = `src/`.
 
 ## Design
 
 ### D1. The surface
 
-The same PRAGMA as 021 decides from the header which kind of file it holds. A strict form refuses
+The same PRAGMA as 022 decides from the header which kind of file it holds. A strict form refuses
 anything but a differential:
 
 ```sql
@@ -74,14 +74,14 @@ PRAGMA ducklake_import_mssql_backup('lake', 's3://bak/sales_full_2026-12-01.bak'
 PRAGMA ducklake_import_mssql_diff_backup('lake', 's3://bak/sales_diff_2026-11-05.bak');  -- a differential only
 ```
 
-These options are added to 021's:
+These options are added to 022's:
 
 | option | default | meaning |
 | --- | --- | --- |
 | `mode` | `'auto'` | `'incremental'` applies the changed pages (D3); `'rebase'` (fulls only) reads every page of the full whatever its LSN (D10) |
 | `loaded_diff` | `config`, else `'skip'` | for a loaded differential (with 090), passed to the reader's parameter of the same name (090 D4): `'skip'` skips whole every tail transaction that touches a page the file lacks (the owner's variant 1); `'partial'` redoes what it can (fewer stale keys, but interim duplicates and torn LOBs, E6 §3.4); whether to offer `'partial'` at all is DQ-17 |
 | `foreign_writes` | `'error'` | what to do when a table was written by a non-import snapshot since the last import (D12) |
-| `partitioning`, `sorting` | derived | as in 021, for tables this file creates |
+| `partitioning`, `sorting` | derived | as in 022, for tables this file creates |
 
 ### D2. Chain validation and ordering
 
@@ -93,10 +93,10 @@ last), C6 and C7.
 | # | rule | refusal names | source |
 | --- | --- | --- | --- |
 | C1 | same database: FamilyGUID equal (085's `family_guid`, `dbi_familyGUID`), and RecoveryForkID equal to the lake's current fork (085 `recovery_fork_id`: to locate; until it is, the fork is not checked and the import says so). FamilyGUID survives a restore, so a restored copy elsewhere passes it; the fork id is what tells the two lines apart | both GUIDs; "the database was restored or forked: apply a full with `mode := 'rebase'`" | RESEARCH §3 (FamilyGUID); after a fork the LSNs restart below the lake's, so the LSN filter would be wrong |
-| C2 | not yet applied: BackupSetGUID ∉ `imports` | `if_applied := 'skip'` returns that snapshot | 021 D9 |
+| C2 | not yet applied: BackupSetGUID ∉ `imports` | `if_applied := 'skip'` returns that snapshot | 022 D9 |
 | C3 | order by **CheckpointLSN**: f.CheckpointLSN > L.CheckpointLSN | both LSNs and L's snapshot | E6 §3.4: a transaction open across two files gives both the same FirstLSN, and E1's FirstLSN check refused a valid D5 |
 | C4 | a differential's base: f.DifferentialBaseGUID = B.guid and f.DifferentialBaseLSN = B.lsn | "differential base 63da… is not the lake's base c53c…; apply full 63da… first" when known | E1 rule 1; forcing D3 onto a lake that skipped F1 corrupted 3 tables |
-| C5 | a full is accepted after C1–C3; a **non-copy-only** full becomes the new base (B := f); a copy-only full changes neither the base nor the DCM. Which fulls start a generation is DQ-16 (023 D1 drafts: any full) | — | RESEARCH §6.2, E6 Q1 |
+| C5 | a full is accepted after C1–C3; a **non-copy-only** full becomes the new base (B := f); a copy-only full changes neither the base nor the DCM. Which fulls start a generation is DQ-16 (024 D1 drafts: any full) | — | RESEARCH §6.2, E6 Q1 |
 | C6 | a lake whose first import was a copy-only full: B := the base that file's header reports, if it reports the database's current diff base (**to verify** on the E1 corpus); otherwise B is unknown and differentials are refused until a non-copy-only full is applied | "no differential base yet" | DQ-15 |
 | C7 | a striped set is complete (FamilyCount files, one MediaSetId; the reader refuses otherwise) and the family is recorded | — | E2 R9 |
 
@@ -117,7 +117,7 @@ can follow an earlier one directly, as D2 followed F0 with D1 skipped (E1 chain 
 
 ### D3. The apply, in order, in one transaction
 
-The callback plans at S0 through a side connection, as in 021. A differential also needs the lake's
+The callback plans at S0 through a side connection, as in 022. A differential also needs the lake's
 mirror as its catalog: a diff does not carry the unchanged catalog pages. So the callback:
 
 1. writes the base side files of D2 except `lob.parquet` into `<run>/base/`, from `__mssql_sys` at S0;
@@ -146,13 +146,13 @@ The algorithm (the numbered steps are the order of effect; E1 §2, E6 §3.1, E7�
 
 0. **Page-map health.** Page-map rows that name files no longer live are stale after any compaction, the
    importer's or a foreign one. The callback rebuilds runs for each live file of an imported table that
-   has no page-map rows, from `filename, file_row_number, _mssql_page` at S0 (021 D6). The apply deletes
+   has no page-map rows, from `filename, file_row_number, _mssql_page` at S0 (022 D6). The apply deletes
    the stale rows and appends the rebuilt ones.
 1. **Pending pages first** (with 090; D7): the reader resolves each pending page against the file *before*
    its own redo, so a tail record on P finds its base. Applied images join the file's page store as if the
    file carried them.
 2. **Export**: the rows of every page in the changed set C are written as new data files with their runs,
-   in the lake table's current DuckLake layout (spec, sort order, file size; 021 D5). C is:
+   in the lake table's current DuckLake layout (spec, sort order, file size; 022 D5). C is:
    - pages with LSN > W;
    - applied pending images;
    - pages formatted in the tail (E6 §3.1).
@@ -188,7 +188,7 @@ The algorithm (the numbered steps are the order of effect; E1 §2, E6 §3.1, E7�
    - `stale_pages` := (old − healed) + new;
    - `alloc_pages`: changed allocation pages replaced.
 9. **Provenance and registry**: the `imports` row; `tables`, `columns` and `views` updated; the commit
-   message (021 D8).
+   message (022 D8).
 
 Page splits, moves, forwarding, rebuilds, shrinks, SPLIT / MERGE / TRUNCATE of partitions and pages
 reused across tables need nothing special: every page involved is in C, U or A, so its old rows go and its
@@ -206,7 +206,7 @@ diff before any row is decoded, through `mssql_backup_changed_pages(file, since_
 2. The result is grouped by `file_path`, giving each data file's new delete positions
    `first_pos .. first_pos + row_count − 1`.
 3. The positions are written to `<run>/deletes.parquet` (an importer-private file, not a reader input).
-4. The apply re-validates S1 against S0 (021 D2.3). A compaction of an affected file between S0 and S1
+4. The apply re-validates S1 against S0 (022 D2.3). A compaction of an affected file between S0 and S1
    is caught by the plan id, and failing that by DuckLake's own conflict check ("delete from file …
    compacted it", `DL/storage/ducklake_transaction_state.cpp:2480-2560`). The run is then planned again.
 
@@ -251,7 +251,7 @@ them (`DL/storage/ducklake_table_entry.cpp:785-810,1478`), and a DROP + ADD make
 
 | SQL Server change | seen as | lake action | rewrite |
 | --- | --- | --- | --- |
-| new table | new object, rowsets and AUs | `CREATE TABLE`, with 021 D5's spec and the `WITH` options | no |
+| new table | new object, rowsets and AUs | `CREATE TABLE`, with 022 D5's spec and the `WITH` options | no |
 | dropped table | object row gone; AUs gone or dead | `DROP TABLE`; its page-map rows deleted; registry status `dropped` | no |
 | dropped and re-created under the same name (new object_id) | old object gone, new one present | `DROP` + `CREATE`, copying the lake table's **current** partition and sort spec (manual changes win) | no |
 | table rename (object_id stable) | sysschobjs name | `ALTER TABLE … RENAME`, but only if the lake name is still the one the importer last set; a manually renamed lake table is left alone, with a notice (DQ-27) | no |
@@ -264,9 +264,9 @@ them (`DL/storage/ducklake_table_entry.cpp:785-810,1478`), and a DROP + ADD make
 | varchar / nvarchar length change (metadata-only) | syscolpars length | nothing: the lake has no length; the registry is updated | no |
 | other type changes: scale, int → varchar, … (size-of-data) | a new physical column | `ADD` under a temporary name, `DROP` the old, `RENAME`; the rows are re-inserted from the file because every page changed | no lake copy |
 | a type change DuckLake cannot express, where SQL Server did **not** rewrite the pages | the type changed, no new physical column | the table is rewritten from the lake by a lake-side export with the cast, into the new column | yes (lake copy) |
-| NULL ↔ NOT NULL | sysrscols 0x80 | nothing; lake columns are nullable (021 D3, DQ-23) | no |
+| NULL ↔ NOT NULL | sysrscols 0x80 | nothing; lake columns are nullable (022 D3, DQ-23) | no |
 | computed column | syscolpars computed flag | persisted: a plain column (size-of-data); not persisted: registry text only (DuckLake refuses generated columns) | no |
-| PK / clustered index created, dropped or rebuilt; heap REBUILD; a new partition scheme | new rowsets and in-row AUs; every in-row page new; the LOB_DATA AU kept (E2 R6) | nothing structural: old pages are in A, new pages in C. LOB values are reused by root bytes (D6). **Partitioning and sort order are not changed** (021 D5) | no lake copy |
+| PK / clustered index created, dropped or rebuilt; heap REBUILD; a new partition scheme | new rowsets and in-row AUs; every in-row page new; the LOB_DATA AU kept (E2 R6) | nothing structural: old pages are in A, new pages in C. LOB values are reused by root bytes (D6). **Partitioning and sort order are not changed** (022 D5) | no lake copy |
 | a SQL Server upgrade adds a base-table column | the mirror's schema differs | `ADD COLUMN` on the mirror table | no |
 
 A **lake-side export** reads the source rows from the lake at S0, in `filename, file_row_number` order:
@@ -275,14 +275,14 @@ A **lake-side export** reads the source rows from the lake at S0, in `filename, 
 COPY (SELECT … FROM lake.s.t AT (VERSION => S0) [WHERE …] ORDER BY filename, file_row_number) TO …
 ```
 
-It runs in the export phase (021 D2.2: a side connection, no lake transaction), writes new files with
+It runs in the export phase (022 D2.2: a side connection, no lake transaction), writes new files with
 their runs, and those are registered like any export. No native `INSERT … SELECT` runs inside the
 registering transaction, so the transaction stays short. A DuckLake ALTER that the table's partition or
 sort spec blocks resets the spec on that column first, and records the reset in the registry.
 
 ### D6. LOBs and the fragment map
 
-Every row re-inserted carries a new `_mssql_lob` (021 D3). The reader (089) decides each value's source:
+Every row re-inserted carries a new `_mssql_lob` (022 D3). The reader (089) decides each value's source:
 
 1. **The root is byte-identical to the lake's** (the same RID, or the same root bytes): the value and its
    map are copied from the lake. This also covers REBUILD, which keeps the LOB_DATA AU and does not rewrite
@@ -294,7 +294,7 @@ Every row re-inserted carries a new `_mssql_lob` (021 D3). The reader (089) deci
    - An absent node is looked up by node RID in the lake's maps.
    - A leaf takes its byte range from the old value's stored bytes, which come from the lake in the form
      DQ-01 chooses: stored bytes for every value (E1 rule 8), the lake value re-encoded and refused when
-     not exact (089 D6), or re-encoded with `raw` for the exceptions (021 D3).
+     not exact (089 D6), or re-encoded with `raw` for the exceptions (022 D3).
    - An internal node is expanded through its old children.
 
    This is exact because a page absent from a differential is unchanged since the base (E1 4.5; all six
@@ -319,7 +319,7 @@ The decisions are 090's, inside the reader. The storage and the lifecycle are th
 the sets, passes them back as side inputs, and records the outcomes.
 
 **Pending pages** come from any file whose tail had transactions open at LastLSN: pre-undo images plus the
-transaction ids (021 D11; E6 §6.2). At the next file, 090 applies the refined rule to each page P, in
+transaction ids (022 D11; E6 §6.2). At the next file, 090 applies the refined rule to each page P, in
 this order (E6 §4):
 
 1. **P is in the file**: P is processed normally and cleared.
@@ -366,11 +366,11 @@ already in the lake and is ignored. Rebuilding such a page from its FORMAT_PAGE 
 - a table the reader calls `unrecoverable` makes the file refused, naming it (090 D7).
 
 It is reported in the summary, in `imports`, and in `ducklake_mssql_backup_history`. Before 090, a loaded
-file is refused by default, as in 021 D11.
+file is refused by default, as in 022 D11.
 
 ### D8. Partition maintenance (E7)
 
-Incremental imports never change a table's partitioning or sort order (021 D5): after creation the layout
+Incremental imports never change a table's partitioning or sort order (022 D5): after creation the layout
 is DuckLake's (owner, 2026-11-05, DQ-10). New rows land under the lake table's current spec, so a SQL
 Server repartitioning only changes which DuckLake files the rewritten rows go to, and SQL Server's
 partition numbers are never stored with the rows (E7§5). A spec set at creation stays valid after SPLIT /
@@ -401,7 +401,7 @@ E7 replayed fifteen one-operation differentials with the rules below, exact in e
   through `sysallocunits.ownerid` → `sysrowsets`. When the (object, index) differs from the lake table the
   row is in, the row moves; when only `numpart` differs, nothing happens (SPLIT / MERGE renumbering). The
   reader reports the moved AUs as `au_moved` (089). This is why the page map records the AU per page, not
-  the table (021 D3).
+  the table (022 D3).
 - **The move is a lake-side copy plus positional deletes, never a file move.** The export phase reads the
   source rows of the moved AUs from the lake at S0 (`page_map.au_id` ∈ M, minus the pages of D, which the
   page rule re-reads), in `filename, file_row_number` order, and writes them as new files of the target
@@ -424,7 +424,7 @@ MERGE, an `ALL TO` scheme after a SPLIT, SWITCH … WITH TRUNCATE_TARGET, a part
 
 ### D9. Columnstore (with 088; E5)
 
-021 writes a clustered columnstore table's compressed rows as runs of surviving tuples (`page_map.kind = 1`,
+022 writes a clustered columnstore table's compressed rows as runs of surviving tuples (`page_map.kind = 1`,
 088 D3): tuple *t* of rowgroup *g* sits at `first_pos + (t − first_tuple)` of the run that holds it, and a
 tuple in no run was already deleted when it was exported. Delta-store rows are ordinary pages (`kind = 0`).
 
@@ -462,7 +462,7 @@ tuple in no run was already deleted when it was exported. Delta-store rows are o
   deleted and re-inserted. That costs a fresh import's writes, in the same lake, with history kept. It is
   for:
   - after a recovery fork (C1);
-  - after a change of the import filters (021 D1);
+  - after a change of the import filters (022 D1);
   - for a SWITCH in from outside the filters (D8);
   - for repair.
 
@@ -470,7 +470,7 @@ tuple in no run was already deleted when it was exported. Delta-store rows are o
 
 ### D11. The commit for a file
 
-**Calls** (021 D7, plus):
+**Calls** (022 D7, plus):
 
 - `AddDeletes`;
 - `DropFile`;
@@ -478,7 +478,7 @@ tuple in no run was already deleted when it was exported. Delta-store rows are o
 - `DuckLakeDeleteFilter::ScanDeleteFile`;
 - the DDL of D5, through the expansion's statements.
 
-**What DuckLake writes**, on top of 021's list:
+**What DuckLake writes**, on top of 022's list:
 
 - a `ducklake_delete_file` row per rewritten delete file, and the end of its predecessor;
 - `ducklake_files_scheduled_for_deletion` for superseded delete files and dropped data files;
@@ -494,7 +494,7 @@ Fx = files dropped, Tt = tables touched. A typical differential has 50 changed t
 delete files each, and 10 mirrors changed: about 8 k rows. That is a few `mssql_exec` round trips and the
 appender's bulk loads, under a second to a few seconds (estimate). A hot data file's cumulative delete file
 is rewritten at every import that touches it, so its size grows with the positions deleted. The
-compaction policy rewrites files past the delete threshold (021 D6, 023 §D5).
+compaction policy rewrites files past the delete threshold (022 D6, 024 §D5).
 
 **Conflicts.** The import's deletes conflict with a concurrent delete on, or compaction of, the same file,
 and with any concurrent insert into a table it deletes from
@@ -528,7 +528,7 @@ importer's own and its compactions, and checks what they touched:
 - **Side inputs and run files** (`base/catalog/`, `base/allocation.parquet`, `base/pending.parquet`,
   `base/lob.parquet`, `deletes.parquet`, the moved rows' copies) contain database
   data. They are written in the run directory under the lake's data path, with the lake's protection, and
-  deleted after the commit (021 D9).
+  deleted after the commit (022 D9).
 - **Trust in the reader.** Every decision about pages comes from the file plus the lake's own state, never
   from user input. The page map is checked against the files before it is used (step 0).
 - **Version mismatches.** A DuckLake bump re-audits the delete path, which mirrors `FlushDeleteWithSnapshots`.
@@ -537,7 +537,7 @@ importer's own and its compactions, and checks what they touched:
 
 ## Testing
 
-**The oracle** is 021's: at every snapshot, RESTORE of the same chain prefix against `AT (VERSION => n)`,
+**The oracle** is 022's: at every snapshot, RESTORE of the same chain prefix against `AT (VERSION => n)`,
 per table, multiset over canonical rows, plus locators. Every chain also runs twice, with positional
 deletes and with the native fallback (`MSSQL_DUCKLAKE_TEST_NATIVE_DELETE=1`), and the two lakes must
 agree row for row.
@@ -627,7 +627,7 @@ and in mssql-ducklake for the lake's), and the expected failure is the measured 
 | ignore tail records older than the previous LastLSN | 3 rows lost for good in skip mode | E6 §3.4 |
 | skip whole (partial instead) | interim duplicates and torn LOBs (27 rows twice and 12 LOBs at D2), healed later | E6 §3.2 |
 | no recovery at all (before 090) | 8,457 differing keys, 7,516 of them dirty | E6 §3.2 |
-| the page-map rebuild after a compaction | wrong rows deleted after a `CHECKPOINT` on an imported table | 021 D6 |
+| the page-map rebuild after a compaction | wrong rows deleted after a `CHECKPOINT` on an imported table | 022 D6 |
 | the ownership rule (D3 step 5) | the five SWITCH variants fail: rows stay in the old table (560 in `m_ci`; after SWITCH + one UPDATE, 263) | E7 §5 |
 | the dead-AU clause (A in D3 step 4) | a deferred `TRUNCATE … WITH (PARTITIONS)` keeps all 9,000 rows | E7 §5 |
 
@@ -665,7 +665,7 @@ All are in [decisions.md](https://github.com/hugr-lab/mssql-extension/blob/main/
 
 Added by the consistency pass: DQ-06 (a stale page the next file neither carries nor frees: error, as
 090 drafts, or report and proceed, as D7 drafts) and DQ-16 (which fulls start a generation; C5 against
-023 D1).
+024 D1).
 
 ## Follow-ups
 
@@ -675,7 +675,7 @@ Added by the consistency pass: DQ-06 (a stale page the next file neither carries
   `ducklake_table_changes` shows unchanged rows as delete + insert. Keeping unchanged rows (comparing by
   `_mssql_rid` and content) would make the change feed exact. It needs the old rows read back.
 - **Log backups** (RESEARCH phase 4): the same page apply, driven by redo of a log chain.
-- **External workers for differentials** (021 D4 already allows it; the side inputs must reach the
+- **External workers for differentials** (022 D4 already allows it; the side inputs must reach the
   workers).
 
 ## Tasks
@@ -687,7 +687,7 @@ Added by the consistency pass: DQ-06 (a stale page the next file neither carries
 | 3 | The `base/` side inputs (catalog, allocation, pending, LOB); the mirror apply; the catalog diff against the registry → the DDL decision list | 5 d |
 | 4 | Schema evolution: native ALTERs (D5), the manual-wins checks, lake-side exports for TRANSFER and inexpressible changes | 6 d |
 | 5 | Positional deletes: the `FlushDeleteWithSnapshots` path, `DropFile`, retries; the native fallback and its switch | 6 d |
-| 6 | Page-map maintenance: stale rows, new runs, the rebuild after a compaction (with 021 task 11) | 3 d |
+| 6 | Page-map maintenance: stale rows, new runs, the rebuild after a compaction (with 022 task 11) | 3 d |
 | 7 | LOBs: `base/lob.parquet`, reuse by root, REBUILD by root bytes, an unresolvable value kept with its map in a loaded file | 5 d |
 | 8 | Pending and stale tables and their lifecycle with 090: the outcomes, the skip default, the heal assertion, consistency reporting | 6 d |
 | 9 | Partition maintenance (E7): SPLIT, MERGE, TRUNCATE, REBUILD PARTITION by the general rules; SWITCH by the ownership rule (`au_moved` → lake-side copy into the target + positional deletes in the source); E7's fifteen chains and the two counterfactuals | 5 d |

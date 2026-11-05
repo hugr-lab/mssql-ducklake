@@ -1,4 +1,4 @@
-# Spec 023: backup retention and time travel
+# Spec 024: backup retention and time travel
 
 - **Status**: draft (number tentative)
 - **Date**: 2026-11-05
@@ -6,7 +6,7 @@
 
 ## Summary
 
-Every imported file is one snapshot (021, 022), so `AT (VERSION => n)` is the database at a backup. This
+Every imported file is one snapshot (022, 023), so `AT (VERSION => n)` is the database at a backup. This
 spec does three things with that history:
 
 - **It groups it into generations**: the snapshots from one applied full up to the next.
@@ -38,13 +38,13 @@ alone unless an option says otherwise.
   snapshot, which may be hours or days after the backup was taken, and meaningless after a bulk catch-up
   import.
 
-Paths as in 021.
+Paths as in 022.
 
 ## Design
 
 ### D1. Generations and tags
 
-Every import writes, in its own snapshot (021 D8):
+Every import writes, in its own snapshot (022 D8):
 
 - the `__mssql_backup.imports` row, which holds `import_seq`, `generation`, `backup_type`,
   `backup_set_guid`, `differential_base_guid`, `backup_start_date`, `backup_finish_date`, the LSNs and
@@ -55,7 +55,7 @@ The row's snapshot is its `snapshot_id` virtual column, which still answers afte
 **`imports` is the authority**: `ducklake_snapshots()` stops listing a snapshot once it expires.
 
 - `generation` = 1 at the first import.
-- It increments when the applied file is a full, copy-only included (as drafted; 022 C5 had said "a
+- It increments when the applied file is a full, copy-only included (as drafted; 023 C5 had said "a
   non-copy-only full starts a generation", so which fulls count is DQ-16 in [decisions.md](https://github.com/hugr-lab/mssql-extension/blob/main/specs/085-backup-reader-core/decisions.md)).
 - Differentials keep the generation they were applied in.
 
@@ -149,7 +149,7 @@ runs `CALL ducklake_mssql_backup_expire('lake')` with the stored policy on a sid
 
 ### D5. Retention and compaction
 
-The importer owns compaction (021 D6): imported tables are created with `auto_compact = false`, and
+The importer owns compaction (022 D6): imported tables are created with `auto_compact = false`, and
 `ducklake_mssql_backup_compact` runs DuckLake's merge and rewrite per table, then rebuilds the page map.
 
 - **Order: compact, then expire, then clean up.** A compaction makes new files at snapshot C. The files it
@@ -159,17 +159,17 @@ The importer owns compaction (021 D6): imported tables are created with `auto_co
   `auto_maintain` in config does so after an import instead of `auto_expire`.
 - **When to compact.** When a table has more than *k* files below `target_file_size / 8` (the small files
   differentials leave), or a file has more than `rewrite_delete_threshold` of its rows deleted (the hot
-  files whose cumulative delete files keep growing, 022 §D11). Both are config keys. Defaults are to be set
+  files whose cumulative delete files keep growing, 023 §D11). Both are config keys. Defaults are to be set
   from the bench (task 6).
 - **Compaction snapshots are not counted** (D2). Keeping them costs almost nothing: they reference the new
   files, which later imports reference too.
-- **The page map after a compaction** is stale until rebuilt (021 D6). Every import checks it first (022
+- **The page map after a compaction** is stale until rebuilt (022 D6). Every import checks it first (023
   step 0), so a maintenance run between imports is safe.
 - **DuckLake's own `expire_older_than`.** If a lake under a backup policy also has it set, `CHECKPOINT`
   expires by age underneath the policy. Every import warns when both are set, and the docs recommend
   leaving it unset, or above the policy's horizon. CHECKPOINT's compaction skips imported tables, and its
   cleanup only removes files past the grace, so neither does harm.
-- **`ducklake_delete_orphaned_files`** after the grace also removes an unfinished import run's files (021
+- **`ducklake_delete_orphaned_files`** after the grace also removes an unfinished import run's files (022
   D9). The maintenance run never calls it while a run directory is in state `exporting`.
 
 ### D6. Time travel by backup time
@@ -194,7 +194,7 @@ against `ducklake_snapshots`.
 
 - **With 090**: the database at the backup's LastLSN, with every committed transaction redone and the
   transactions open at LastLSN held back.
-- **Tables marked stale** at that import (a loaded differential, 022 D7) are older for the skipped work,
+- **Tables marked stale** at that import (a loaded differential, 023 D7) are older for the skipped work,
   but clean.
 - **Before 090** (quiet backups only), it is the CheckpointLSN state.
 - `AT (TIMESTAMP => …)` is still available and means the import's commit time.
@@ -206,7 +206,7 @@ against `ducklake_snapshots`.
 - **Only import snapshots are expired**, identified by `imports`, not by text in `extra_info`. A user's
   snapshot is untouched unless `include_other` is set.
 - **Concurrency with an import.**
-  - An import plans at S0 and reads the lake `AT (VERSION => S0)` during its export (022 D3). S0 is either
+  - An import plans at S0 and reads the lake `AT (VERSION => S0)` during its export (023 D3). S0 is either
     the latest import snapshot (always kept) or a later non-import snapshot (kept unless `include_other`).
     So an expiry running alongside an import cannot remove it.
   - With `include_other`, the expiry skips snapshots at or after the oldest S0 of any run directory in
@@ -224,7 +224,7 @@ against `ducklake_snapshots`.
   - the expected keep and expire sets asserted from the dry run, then after acting;
   - user and compaction snapshots untouched;
   - the latest snapshot kept.
-- **Time travel.** At every kept snapshot, the oracle (021) equals RESTORE of that chain prefix. At an
+- **Time travel.** At every kept snapshot, the oracle (022) equals RESTORE of that chain prefix. At an
   expired one, DuckLake's error, and the helper's `expired` row with its nearest neighbours.
 - **Files.** The files referenced only by expired snapshots are scheduled, still present within the grace,
   and gone after it (`ducklake_cleanup_old_files` with a short grace in the test). The lake still equals
@@ -261,7 +261,7 @@ All are in [decisions.md](https://github.com/hugr-lab/mssql-extension/blob/main/
 | # | question | DECISIONS |
 | --- | --- | --- |
 | 1 | what *n* counts: over all kept generations (as drafted) or per generation | DQ-30 |
-| 2 | do copy-only fulls start a generation (here yes; 022 C5 said no) | DQ-16 |
+| 2 | do copy-only fulls start a generation (here yes; 023 C5 said no) | DQ-16 |
 | 3 | `dry_run`'s default | DQ-31 |
 | 4 | `include_other` and the importer's own compaction snapshots | DQ-32 |
 | 5 | `auto_maintain` by default, or only expiry | DQ-33 |
@@ -277,7 +277,7 @@ All are in [decisions.md](https://github.com/hugr-lab/mssql-extension/blob/main/
 
 | # | task | estimate |
 | --- | --- | ---: |
-| 1 | The generation number in 021's `imports` row; `ducklake_mssql_backup_history` with the expiry anti-join | 2 d |
+| 1 | The generation number in 022's `imports` row; `ducklake_mssql_backup_history` with the expiry anti-join | 2 d |
 | 2 | The policy computation (D2) and `ducklake_mssql_backup_expire`: dry run, the side-connection calls, cleanup, the refusals | 3 d |
 | 3 | `ducklake_mssql_backup_configure`, the config keys, the post-commit hook for `auto_expire` / `auto_maintain`, warnings | 3 d |
 | 4 | `ducklake_mssql_backup_snapshot_at`, and checking that `AT (VERSION => getvariable(…))` binds | 1 d |
