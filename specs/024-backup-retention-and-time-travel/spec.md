@@ -17,17 +17,17 @@ spec does three things with that history:
   `ducklake_cleanup_old_files`.
 
 The policy can be stored in `__mssql_backup.config` and run after every successful import. A helper maps a
-backup time to its snapshot. The spec also states how retention and the importer's compaction work
-together. Only import snapshots are counted and expired; snapshots made by users or by compaction are left
-alone unless an option says otherwise.
+backup time to its snapshot. The spec also states how retention and DuckLake's standard compaction work
+together. Only import snapshots are counted and expired; the snapshots of other writers (users' commits,
+DuckLake's compaction) are left alone unless `include_other` says otherwise.
 
 ## Problem
 
 - **Snapshots pile up.** A lake fed daily differentials and weekly fulls gains about 365 snapshots a year.
-  Each one keeps its files alive: replaced data files, superseded delete files, old page-map runs, and
-  pending page images. Once a newer full is applied, the older generations are only history. The lake's
-  current state plus the new chain is all that future imports need (RESEARCH §6.2), so that history can go
-  when the owner says.
+  Each one keeps its files alive: replaced data files, superseded delete files, replaced mirror and
+  allocation-image files, and pending page images. Once a newer full is applied, the older generations
+  are only history. The lake's current state plus the new chain is all that future imports need
+  (RESEARCH §6.2), so that history can go when the owner says.
 - **DuckLake expires by age or by explicit ids** (`DL/functions/ducklake_expire_snapshots.cpp:63-81`). It
   cannot tell an import from a user's commit or a compaction. "Keep the last four fulls" is not expressible
   as an age.
@@ -55,8 +55,9 @@ The row's snapshot is its `snapshot_id` virtual column, which still answers afte
 **`imports` is the authority**: `ducklake_snapshots()` stops listing a snapshot once it expires.
 
 - `generation` = 1 at the first import.
-- It increments when the applied file is a full, copy-only included (as drafted; 023 C5 had said "a
-  non-copy-only full starts a generation", so which fulls count is DQ-16 in [decisions.md](https://github.com/hugr-lab/mssql-extension/blob/main/specs/085-backup-reader-core/decisions.md)).
+- It increments when the applied file is a non-copy-only full (023 C5; DQ-16 in [decisions.md](https://github.com/hugr-lab/mssql-extension/blob/main/specs/085-backup-reader-core/decisions.md)). A
+  copy-only full is outside the backup sequence and keeps the generation it was applied in, so ad hoc
+  copies do not make `keep_fulls` expire the scheduled history faster.
 - Differentials keep the generation they were applied in.
 
 The first snapshot of a generation is its **full snapshot**.
@@ -74,8 +75,9 @@ generations.
 4. **Never expired:**
    - the latest import snapshot, which is why *n* ≥ 1;
    - the lake's latest snapshot (DuckLake's own rule, `DL/functions/ducklake_expire_snapshots.cpp:63-65`).
-5. **Non-import snapshots** (user commits, compactions, the config changes of D4) are neither counted nor
-   expired. With `include_other := true`, those older than the oldest kept snapshot are expired too.
+5. **Non-import snapshots** (users' commits, DuckLake's compactions, the config changes of D4) are neither
+   counted nor expired. With `include_other := true`, those older than the oldest kept snapshot are
+   expired too.
 
 Example: daily differentials and a full every Sunday, with `keep_fulls := 4, keep_snapshots := 14`. That
 keeps the last four Sunday snapshots and the last fourteen days, and nothing older.
@@ -89,7 +91,7 @@ CALL ducklake_mssql_backup_expire('lake', keep_fulls := 4, keep_snapshots := 14,
 | option | default | meaning |
 | --- | --- | --- |
 | `keep_fulls`, `keep_snapshots` | the stored policy (D4), else required | D2 |
-| `dry_run` | `false` | list the decision without acting (DQ-31) |
+| `dry_run` | `true` | list the decision without acting; a call by hand acts only with `dry_run := false`, which the automatic policy passes (D4; DQ-31) |
 | `cleanup` | `true` | then run `ducklake_cleanup_old_files` |
 | `grace` | the lake's `delete_older_than`, else 2 days | files scheduled for deletion longer ago than this are removed |
 | `include_other` | `false` | D2 step 5 |
@@ -121,10 +123,10 @@ the same reason DuckLake's compaction releases its metadata transaction only in 
 
 - data files replaced by later imports;
 - superseded cumulative delete files;
-- page-map and mirror files of replaced runs;
+- mirror and allocation-image files replaced by later imports;
 - `pending_pages` images that were resolved, which is how uncommitted rows leave the lake for good
   (DQ-09);
-- the files the importer's compaction replaced (D5).
+- the files a DuckLake compaction replaced (D5).
 
 ### D4. The automatic policy
 
@@ -138,7 +140,8 @@ snapshot, which D2 does not count.
 
 With `auto_expire` on, every successful import registers a `ClientContextState`. Its `TransactionCommit`
 callback fires only after the commit succeeded (`DD/src/transaction/transaction_context.cpp:81-83`) and
-runs `CALL ducklake_mssql_backup_expire('lake')` with the stored policy on a side connection:
+runs `CALL ducklake_mssql_backup_expire('lake', dry_run := false)` with the stored policy on a side
+connection:
 
 - **It is not inside the import's transaction.** DuckLake's retry loop rolls back the metadata transaction
   between attempts (`DL/storage/ducklake_transaction_state.cpp:2697-2703`). Snapshot deletes executed in
@@ -147,30 +150,31 @@ runs `CALL ducklake_mssql_backup_expire('lake')` with the stored policy on a sid
   `mssql_ducklake`). The next import runs the policy again; nothing is lost but time.
 - **Inside an explicit transaction**, an import's hook fires at the user's COMMIT.
 
-### D5. Retention and compaction
+### D5. Retention and DuckLake's standard compaction
 
-The importer owns compaction (022 D6): imported tables are created with `auto_compact = false`, and
-`ducklake_mssql_backup_compact` runs DuckLake's merge and rewrite per table, then rebuilds the page map.
+Imported tables are compacted by DuckLake's standard compaction, like any table (022 D6): `CHECKPOINT`,
+`ducklake_merge_adjacent_files` and `ducklake_rewrite_data_files`, under the lake's or the table's own
+options. Nothing the importer keeps refers to a file or a position, so a compaction, whenever it runs and
+whoever starts it, needs nothing from the importer; the next import's deletes find the rows by
+`_mssql_page` (023 D4).
 
-- **Order: compact, then expire, then clean up.** A compaction makes new files at snapshot C. The files it
-  replaced stay referenced by the snapshots before C, and are freed only when those expire. Expiring first
-  frees nothing of the small files a compaction is about to replace.
-  `ducklake_mssql_backup_maintain(lake)` runs the three in that order, each as its own transaction.
-  `auto_maintain` in config does so after an import instead of `auto_expire`.
-- **When to compact.** When a table has more than *k* files below `target_file_size / 8` (the small files
-  differentials leave), or a file has more than `rewrite_delete_threshold` of its rows deleted (the hot
-  files whose cumulative delete files keep growing, 023 §D11). Both are config keys. Defaults are to be set
-  from the bench (task 6).
-- **Compaction snapshots are not counted** (D2). Keeping them costs almost nothing: they reference the new
-  files, which later imports reference too.
-- **The page map after a compaction** is stale until rebuilt (022 D6). Every import checks it first (023
-  step 0), so a maintenance run between imports is safe.
+- **Retention does not compact.** Retention is expiry and cleanup (D3), and the automatic policy runs
+  only them (DQ-33). When files are merged or rewritten is the lake's own choice, as for any table. The
+  order still matters to the owner of that choice: the files a compaction replaces stay referenced by
+  the snapshots before it and are freed only when those expire, so expiry after a compaction frees them,
+  and expiry before it does not.
+- **Only import snapshots are counted** (D2). A compaction's snapshot is another writer's, like a user's
+  commit: left by default, and expired with `include_other := true` only when older than the oldest kept
+  snapshot (DQ-32). Keeping them costs almost nothing: they reference the new files, which later imports
+  reference too.
 - **DuckLake's own `expire_older_than`.** If a lake under a backup policy also has it set, `CHECKPOINT`
   expires by age underneath the policy. Every import warns when both are set, and the docs recommend
-  leaving it unset, or above the policy's horizon. CHECKPOINT's compaction skips imported tables, and its
-  cleanup only removes files past the grace, so neither does harm.
+  leaving it unset, or above the policy's horizon. CHECKPOINT's compaction is DuckLake's standard one,
+  which the imports do not mind, and its cleanup only removes files past the grace, so neither does
+  harm.
 - **`ducklake_delete_orphaned_files`** after the grace also removes an unfinished import run's files (022
-  D9). The maintenance run never calls it while a run directory is in state `exporting`.
+  D9). `ducklake_mssql_backup_expire` never calls it. The docs warn that a user's own call removes the
+  files of a run still `exporting` once they are older than its `older_than`.
 
 ### D6. Time travel by backup time
 
@@ -235,8 +239,9 @@ against `ducklake_snapshots`.
   - the next import catches up;
   - inside an explicit transaction it fires at COMMIT.
 - **Compaction interplay**:
-  - `maintain` frees the replaced small files at the next run;
-  - the page map is rebuilt and a following differential matches RESTORE;
+  - a following differential matches RESTORE after a `CHECKPOINT`, a `ducklake_merge_adjacent_files`
+    and a `ducklake_rewrite_data_files`, with nothing done in between;
+  - an expiry after a compaction frees the files it replaced, past the grace;
   - `include_other := false` leaves the compaction snapshots;
   - with `expire_older_than` set, the import warns.
 - **Concurrency**: an expiry with `include_other` during an import's export phase does not remove S0, and
@@ -261,10 +266,10 @@ All are in [decisions.md](https://github.com/hugr-lab/mssql-extension/blob/main/
 | # | question | DECISIONS |
 | --- | --- | --- |
 | 1 | what *n* counts: over all kept generations (as drafted) or per generation | DQ-30 |
-| 2 | do copy-only fulls start a generation (here yes; 023 C5 said no) | DQ-16 |
+| 2 | do copy-only fulls start a generation (no: non-copy-only fulls only, as 023 C5) | DQ-16 |
 | 3 | `dry_run`'s default | DQ-31 |
-| 4 | `include_other` and the importer's own compaction snapshots | DQ-32 |
-| 5 | `auto_maintain` by default, or only expiry | DQ-33 |
+| 4 | `include_other` and other writers' snapshots (users' commits, DuckLake's compaction) | DQ-32 |
+| 5 | whether the automatic policy also compacts (no: expiry only) | DQ-33 |
 
 ## Follow-ups
 
@@ -279,9 +284,9 @@ All are in [decisions.md](https://github.com/hugr-lab/mssql-extension/blob/main/
 | --- | --- | ---: |
 | 1 | The generation number in 022's `imports` row; `ducklake_mssql_backup_history` with the expiry anti-join | 2 d |
 | 2 | The policy computation (D2) and `ducklake_mssql_backup_expire`: dry run, the side-connection calls, cleanup, the refusals | 3 d |
-| 3 | `ducklake_mssql_backup_configure`, the config keys, the post-commit hook for `auto_expire` / `auto_maintain`, warnings | 3 d |
+| 3 | `ducklake_mssql_backup_configure`, the config keys, the post-commit hook for `auto_expire`, warnings | 3 d |
 | 4 | `ducklake_mssql_backup_snapshot_at`, and checking that `AT (VERSION => getvariable(…))` binds | 1 d |
-| 5 | `ducklake_mssql_backup_maintain`, the `expire_older_than` warning, the run-directory guard | 2 d |
-| 6 | Tests: the policy matrix, time travel at kept and expired snapshots, files after the grace, the auto policy and its failure, compaction interplay, concurrency; compaction thresholds from the bench | 5 d |
+| 5 | The `expire_older_than` warning, the run-directory guard | 1 d |
+| 6 | Tests: the policy matrix, time travel at kept and expired snapshots, files after the grace, the auto policy and its failure, compaction interplay, concurrency | 5 d |
 | 7 | Docs page | 1 d |
-| | **total** | **17 d ≈ 3.5 wk** (2–3.5 with overlap) |
+| | **total** | **16 d ≈ 3 wk** (2–3 with overlap) |
