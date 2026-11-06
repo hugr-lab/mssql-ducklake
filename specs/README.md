@@ -56,3 +56,6 @@ specs are the shareable distillation of that work.
 | [018](018-bounded-strings/spec.md) | bounded string columns, chosen at ATTACH (`META_LIMITS`) | implemented |
 | [019](019-global-stats-cache/spec.md) | the global table stats, cached per catalog; deadlocked commits retried | implemented (branch `recon/global-stats-cache`) |
 | [020](020-catalog-load/spec.md) | the catalog load in one T-SQL statement; a mirror behind it, caught up by one query | draft |
+| [022](022-import-full-backup/spec.md) | importing a SQL Server full backup — Parquet first, one commit, one snapshot | draft (series: [022 series.md](022-import-full-backup/series.md); reader: mssql-extension 085–090) |
+| [023](023-incremental-import/spec.md) | incremental import — differentials and later fulls on top of the lake | draft |
+| [024](024-backup-retention-and-time-travel/spec.md) | backup generations, snapshot retention and time travel by backup time | draft |
