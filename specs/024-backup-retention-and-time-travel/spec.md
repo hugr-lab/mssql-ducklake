@@ -1,6 +1,6 @@
 # Spec 024: backup retention and time travel
 
-- **Status**: draft (number tentative)
+- **Status**: draft
 - **Date**: 2026-11-05
 - **Author**: vgsml, with Claude
 
@@ -55,9 +55,10 @@ The row's snapshot is its `snapshot_id` virtual column, which still answers afte
 **`imports` is the authority**: `ducklake_snapshots()` stops listing a snapshot once it expires.
 
 - `generation` = 1 at the first import.
-- It increments when the applied file is a non-copy-only full (023 C5; DQ-16 in [decisions.md](https://github.com/hugr-lab/mssql-extension/blob/main/specs/085-backup-reader-core/decisions.md)). A
-  copy-only full is outside the backup sequence and keeps the generation it was applied in, so ad hoc
-  copies do not make `keep_fulls` expire the scheduled history faster.
+- It increments when the applied file is a non-copy-only full (023 C5; DQ-16 in
+  [decisions.md](https://github.com/hugr-lab/mssql-extension/blob/main/specs/085-backup-reader-core/decisions.md)).
+  A copy-only full is outside the backup sequence and keeps the generation it was applied in, so ad
+  hoc copies do not make `keep_fulls` expire the scheduled history faster.
 - Differentials keep the generation they were applied in.
 
 The first snapshot of a generation is its **full snapshot**.
@@ -111,6 +112,7 @@ Then, unless it is a dry run, it runs two statements on a side connection:
 
 These are separate transactions on DuckLake's public functions, the way DuckLake's own `CHECKPOINT` runs
 them through a side `Connection` (`DL/storage/ducklake_checkpoint.cpp:15-30`). Neither creates a snapshot.
+Both are DuckLake's own statements, so they obey DuckDB's limits (022 D12).
 `ducklake_expire_snapshots` deletes the snapshot rows, and DuckLake schedules the files only they
 referenced. The cleanup removes files scheduled longer ago than the grace. That includes files scheduled by
 earlier runs, so space frees one run later than the expiry.
@@ -169,12 +171,19 @@ whoever starts it, needs nothing from the importer; the next import's deletes fi
   reference too.
 - **DuckLake's own `expire_older_than`.** If a lake under a backup policy also has it set, `CHECKPOINT`
   expires by age underneath the policy. Every import warns when both are set, and the docs recommend
-  leaving it unset, or above the policy's horizon. CHECKPOINT's compaction is DuckLake's standard one,
-  which the imports do not mind, and its cleanup only removes files past the grace, so neither does
-  harm.
-- **`ducklake_delete_orphaned_files`** after the grace also removes an unfinished import run's files (022
-  D9). `ducklake_mssql_backup_expire` never calls it. The docs warn that a user's own call removes the
-  files of a run still `exporting` once they are older than its `older_than`.
+  leaving it unset, or above the policy's horizon.
+- **The rest of `CHECKPOINT`** (`DL/storage/ducklake_checkpoint.cpp:21-24`). Its compaction is DuckLake's
+  standard one, which an import does not mind; run during an import's commit it can cost a retry (022
+  D1, 023 D11), so the docs recommend maintenance between imports. Its `ducklake_cleanup_old_files`
+  removes only files scheduled past the grace. Its `ducklake_delete_orphaned_files` removes every
+  unregistered `.parquet` / `.puffin` under DATA_PATH older than `delete_older_than` (2 days by default),
+  the one step that can harm an import, as 022 D9 says: the run's scratch lives outside DATA_PATH and is
+  safe, but an unfinished run's exported data files are in DATA_PATH and unregistered until its commit.
+  The importer warns when an export may outlive `delete_older_than`, and refuses to register when a file
+  its manifest names is gone (022 D9).
+- **`ducklake_mssql_backup_expire` never calls `ducklake_delete_orphaned_files`.** The docs warn that a
+  user's own call, or a `CHECKPOINT`, removes the exported files of a run still `exporting` once they
+  are older than its `older_than`.
 
 ### D6. Time travel by backup time
 
@@ -259,17 +268,18 @@ against `ducklake_snapshots`.
 - **Implementing expiry against DuckLake's internals** (`DeleteSnapshots`, `GetFilesForCleanup`): it works
   and needs no side connection, but it couples to internals that DuckLake's public functions already wrap.
 
-## Open questions for the owner
+## Decisions
 
-All are in [decisions.md](https://github.com/hugr-lab/mssql-extension/blob/main/specs/085-backup-reader-core/decisions.md), merged with the mssql series and ordered by impact:
+Each is decided or accepted, in the list merged with the mssql series:
+[decisions.md](https://github.com/hugr-lab/mssql-extension/blob/main/specs/085-backup-reader-core/decisions.md).
 
-| # | question | DECISIONS |
-| --- | --- | --- |
-| 1 | what *n* counts: over all kept generations (as drafted) or per generation | DQ-30 |
-| 2 | do copy-only fulls start a generation (no: non-copy-only fulls only, as 023 C5) | DQ-16 |
-| 3 | `dry_run`'s default | DQ-31 |
-| 4 | `include_other` and other writers' snapshots (users' commits, DuckLake's compaction) | DQ-32 |
-| 5 | whether the automatic policy also compacts (no: expiry only) | DQ-33 |
+| # | question | decision | DECISIONS |
+| --- | --- | --- | --- |
+| 1 | what *n* counts | the last *n* import snapshots over all kept generations (D2) | DQ-30 |
+| 2 | do copy-only fulls start a generation | no: non-copy-only fulls only, as 023 C5 (D1) | DQ-16 |
+| 3 | `dry_run`'s default | `true` for a call by hand; the automatic policy passes `false` (D3, D4) | DQ-31 |
+| 4 | `include_other` and other writers' snapshots (users' commits, DuckLake's compaction) | left by default; expired with `include_other := true` only when older than the oldest kept snapshot (D2, D5) | DQ-32 |
+| 5 | whether the automatic policy also compacts | no: expiry only; compaction is DuckLake's own (D5) | DQ-33 |
 
 ## Follow-ups
 
