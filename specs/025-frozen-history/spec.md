@@ -5,8 +5,8 @@
 - **Author**: vgsml, with Claude
 
 Builds on [022](../022-import-full-backup/spec.md) and [023](../023-incremental-import/spec.md)
-(PR #56) and changes their apply for opted-in tables. The one thing it needs from mssql-extension is a row
-filter on the export (§ What mssql-extension provides).
+(PR #56) and changes their apply for opted-in tables. It needs nothing new from mssql-extension: the
+boundary is a DuckDB filter over the reader's scan (§ What mssql-extension provides).
 
 ## Summary
 
@@ -133,7 +133,7 @@ SELECT * FROM ducklake_mssql_backup_apply('lake', '…', manifest := …, plan :
 The source still holds a frozen row until it trims it, and the row comes back whenever its page is in the
 changed set. An index rebuild sends every page; a full applied incrementally (023 D10) sends every page
 past W; a rebase sends all of them. So the export writes, for an opted-in table, only rows with
-`column > upto_f` or `column IS NULL` (§ What mssql-extension provides).
+`column > upto_f` or `column IS NULL`, filtered on our side (§ What mssql-extension provides).
 
 - **Each row is in the lake once.** At import k a row is either above the boundary, and then it is live
   and handled by page as in 023, or at or below it, and then its lake copy is frozen and the export drops
@@ -187,19 +187,33 @@ policy.
 
 ## What mssql-extension provides
 
-The export is mssql's `mssql_backup_export` (089, called through `ducklake_mssql_backup_export`, 022
-D2.2), which writes the data files itself. It needs one addition:
+**Nothing new** (owner, 2026-11-11): the import is this repository's, and the planned reader API is
+enough. `mssql_backup_export` (089) gets no filter. The boundary is applied here:
 
-- **`exclude_upto := MAP {object_id: {'column_id': …, 'upto': …}}`.** A decoded row of that object whose
-  column value is not NULL and is `<= upto` is not written.
-  - The comparison is the column's SQL Server ordering. `datetimeoffset` is compared as the instant.
-  - The manifest's row counts and column statistics describe the written rows only.
-  - The result gains `rows_excluded` per unit.
-  - External workers (022 D4) get the map from `plan.json` like every other argument.
-- **Already there**: `backup_finish_date` in `mssql_backup_info` (085). Still open: whether the backup
-  set carries the server's time zone or offset (mssql-extension is measuring it).
+- **The rows of an opted-in table come from `mssql_backup_scan(path, schema, table)`** (085 PR 2d). It
+  returns the table's rows typed as TYPE mssql reads them, plus the virtual `_mssql_page`, `_mssql_rid`
+  and `_mssql_page_lsn`.
+- **The export of such a table is ours**: `COPY (SELECT … FROM mssql_backup_scan(…) WHERE <changed set>
+  AND (col IS NULL OR col > :upto)) TO …`, in the table's DuckLake layout (partition expression, sort,
+  file size, as 022 D2.2 passes them to 089). That is 022's phase A path (D2.4), registered the same
+  way. The other tables keep 089's export. `rows_frozen_out` is the count the same scan gives with
+  the condition negated, in the same pass.
+- **`backup_finish_date`** comes from `mssql_backup_info(path)` (085): a TIMESTAMP in the source
+  server's local time, as RESTORE HEADERONLY prints it.
 
-Nothing else: the freeze, the boundary and the schema rules are this repository's.
+To verify against 085 PR 2d, before this is costed:
+
+- **the changed set.** For a differential, the scan must give only the rows of the pages in 023's
+  changed set C, either through `since_lsn` / `base` arguments like the export's, or through a pushed
+  filter on `_mssql_page_lsn > W` / `_mssql_page IN (…)`. A full scan of a big table per differential
+  is not acceptable.
+- **the writer contract** 022 D4 relies on: a page's rows together in a file, so `_mssql_page`
+  min/max stay narrow, and memory bounded by `max_memory`. A DuckDB COPY over the scan holds it only if
+  the scan emits in page order and the sort (when the table has one) is DuckDB's, spilling.
+- **whether the backup set records the server's time zone**: HEADERONLY has no such column
+  (mssql-extension is measuring it).
+
+The freeze, the boundary, the export filter and the schema rules are all this repository's.
 
 ## Enforcement & security
 
