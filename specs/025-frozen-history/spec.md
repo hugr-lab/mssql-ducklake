@@ -81,9 +81,12 @@ upto_f = max(upto_previous, max(column) over live rows - after) -- an integer co
 - **It never decreases.** A row frozen once stays frozen, and the export filter (D4) never readmits it.
 - **The backup's own time, not `now()`.** Catching up 30 differentials at once, or running an import
   again, gives each file the boundary its own time gives. `BackupFinishDate` is the time the file is
-  consistent at (023 D2: the reader recovers to the end). The header's times are the source server's
-  local time; the freeze column may hold UTC. The margin in `after` covers the offset; 085's header is to
-  be checked for the server's time zone (to verify).
+  consistent at (023 D2: the reader recovers to the end); 085 has it as
+  `mssql_backup_info(path).backup_finish_date`, a TIMESTAMP in the source server's local time, as
+  RESTORE HEADERONLY prints it. HEADERONLY has no time-zone column, and whether the backup set records
+  the server's offset elsewhere is not measured yet (mssql-extension is checking). Until then the time
+  is taken as server-local with no offset; the freeze column may hold UTC, and the margin in `after`
+  covers the difference.
 - **Computed in the plan, at S0** (023 D3), written into `plan.json`, and passed to the export (D4). The
   commit writes the new `upto` with the import, in the same transaction, so a retry or a resumed run uses
   the same boundary.
@@ -193,7 +196,8 @@ D2.2), which writes the data files itself. It needs one addition:
   - The manifest's row counts and column statistics describe the written rows only.
   - The result gains `rows_excluded` per unit.
   - External workers (022 D4) get the map from `plan.json` like every other argument.
-- **The header's `BackupFinishDate`**, and the server's time zone if the format carries it (085).
+- **Already there**: `backup_finish_date` in `mssql_backup_info` (085). Still open: whether the backup
+  set carries the server's time zone or offset (mssql-extension is measuring it).
 
 Nothing else: the freeze, the boundary and the schema rules are this repository's.
 
